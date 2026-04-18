@@ -32,3 +32,8 @@
 - Local repo has been initialized and prepared for first push.
 - Added `.gitignore` protections so local runtime state under `data/` is not committed.
 - A dedicated GitHub Projects board is still pending because the current GitHub token does not include project scopes.
+
+### Planning Update
+
+- Expanded `PLAN.md` from a short milestone list into a full execution plan.
+- Added phase goals, workstreams, acceptance criteria, risks, and a suggested two-week execution order.
