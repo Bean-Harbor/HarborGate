@@ -59,6 +59,14 @@ def _context_file(state_dir: str | Path, account_id: str) -> Path:
     return _account_dir(state_dir) / f"{_safe_slug(account_id)}.context_tokens.json"
 
 
+def _processed_file(state_dir: str | Path, account_id: str) -> Path:
+    return _account_dir(state_dir) / f"{_safe_slug(account_id)}.processed_messages.json"
+
+
+def extract_weixin_message_id(payload: dict[str, Any]) -> str:
+    return str(payload.get("msg_id") or payload.get("client_id") or "").strip()
+
+
 def save_weixin_account(
     state_dir: str | Path,
     *,
@@ -110,6 +118,38 @@ class ContextTokenStore:
     def _persist(self) -> None:
         self.path.write_text(
             json.dumps(self._cache, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+class ProcessedMessageStore:
+    def __init__(self, state_dir: str | Path, account_id: str, max_items: int = 500) -> None:
+        self.path = _processed_file(state_dir, account_id)
+        self.max_items = max_items
+        self._items: list[str] = []
+        self._restore()
+
+    def contains(self, message_id: str) -> bool:
+        return bool(message_id) and message_id in self._items
+
+    def add(self, message_id: str) -> None:
+        if not message_id or message_id in self._items:
+            return
+        self._items.append(message_id)
+        if self.max_items > 0:
+            self._items = self._items[-self.max_items :]
+        self._persist()
+
+    def _restore(self) -> None:
+        if not self.path.exists():
+            return
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            self._items = [str(item) for item in data if str(item).strip()]
+
+    def _persist(self) -> None:
+        self.path.write_text(
+            json.dumps(self._items, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -341,6 +381,7 @@ class WeixinAdapter(PlatformAdapter):
                 self.user_id = str(saved.get("user_id") or self.user_id).strip()
 
         self._context_tokens = ContextTokenStore(self.state_dir, self.account_id) if self.account_id else None
+        self._processed_messages = ProcessedMessageStore(self.state_dir, self.account_id) if self.account_id else None
 
     @property
     def configured(self) -> bool:
@@ -367,12 +408,23 @@ class WeixinAdapter(PlatformAdapter):
         messages = response.get("msgs") or []
         return [item for item in messages if isinstance(item, dict)]
 
+    def is_duplicate_update(self, payload: dict[str, Any]) -> bool:
+        message_id = extract_weixin_message_id(payload)
+        return bool(self._processed_messages and self._processed_messages.contains(message_id))
+
+    def mark_update_processed(self, payload: dict[str, Any]) -> None:
+        message_id = extract_weixin_message_id(payload)
+        if self._processed_messages:
+            self._processed_messages.add(message_id)
+
     def normalize_inbound(self, payload: dict[str, Any]) -> InboundMessage:
         sender_id = str(payload.get("from_user_id") or "").strip()
         room_id = str(payload.get("room_id") or "").strip()
         chat_id = room_id or sender_id
         text = extract_text_from_item_list(payload.get("item_list") or [])
+        message_id = extract_weixin_message_id(payload)
         context_token = str(payload.get("context_token") or "").strip()
+        route_key = str(payload.get("route_key") or "").strip()
 
         if room_id:
             raise ValueError("Weixin group chats are not supported yet in this starter")
@@ -389,6 +441,9 @@ class WeixinAdapter(PlatformAdapter):
             chat_id=chat_id,
             user_id=sender_id,
             text=text,
+            message_id=message_id,
+            chat_type="p2p",
+            route_key=route_key,
             raw_payload=payload,
         )
 

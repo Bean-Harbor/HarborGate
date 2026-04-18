@@ -29,8 +29,12 @@ def main() -> None:
         try:
             messages = adapter.poll_updates()
             for payload in messages:
+                if adapter.is_duplicate_update(payload):
+                    logger.info("Skipping duplicate Weixin update %s", payload.get("msg_id") or payload.get("client_id"))
+                    continue
                 try:
                     gateway.handle_inbound("weixin", payload)
+                    adapter.mark_update_processed(payload)
                 except ValueError as exc:
                     logger.info("Skipping unsupported Weixin update: %s", exc)
         except KeyboardInterrupt:

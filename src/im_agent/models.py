@@ -15,6 +15,13 @@ class InboundMessage:
     chat_id: str
     user_id: str
     text: str
+    message_id: str = ""
+    chat_type: str = "p2p"
+    route_key: str = ""
+    session_id: str = ""
+    mentions: list[dict[str, Any]] = field(default_factory=list)
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
     timestamp: str = field(default_factory=utc_now_iso)
     raw_payload: dict[str, Any] = field(default_factory=dict)
 

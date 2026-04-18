@@ -1,5 +1,8 @@
 import json
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from im_agent.models import OutboundMessage
 from im_agent.platforms.feishu import (
@@ -8,6 +11,103 @@ from im_agent.platforms.feishu import (
     build_feishu_text_payload,
     parse_feishu_message_content,
 )
+
+
+class FakeFeishuHandler(BaseHTTPRequestHandler):
+    auth_calls = 0
+    bot_info_calls = 0
+    send_calls = 0
+    last_path = ""
+    last_auth_body = {}
+    last_send_body = {}
+
+    def do_GET(self) -> None:  # noqa: N802
+        type(self).last_path = self.path
+        if self.path == "/open-apis/bot/v3/info":
+            type(self).bot_info_calls += 1
+            response = {
+                "code": 0,
+                "msg": "success",
+                "data": {
+                    "app_name": "Harbor Bot",
+                    "tenant_key": "tenant_key_123",
+                    "open_id": "ou_bot_123",
+                    "user_id": "bot_user_123",
+                },
+            }
+            encoded = json.dumps(response).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        content_length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(content_length).decode("utf-8")
+        payload = json.loads(body) if body else {}
+        type(self).last_path = self.path
+        if self.path.endswith("/open-apis/auth/v3/tenant_access_token/internal"):
+            type(self).auth_calls += 1
+            type(self).last_auth_body = payload
+            response = {
+                "code": 0,
+                "msg": "success",
+                "tenant_access_token": "tenant_token_123",
+                "expire": 7200,
+            }
+        elif self.path.startswith("/open-apis/im/v1/messages"):
+            type(self).send_calls += 1
+            type(self).last_send_body = payload
+            response = {
+                "code": 0,
+                "msg": "success",
+                "data": {"message_id": "om_sent_123"},
+            }
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        encoded = json.dumps(response).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A003
+        return
+
+
+class FakeWebsocketRuntime:
+    started = 0
+    stopped = 0
+    payload: dict | None = None
+
+    def __init__(self, *, settings, on_event, on_connected, on_disconnected) -> None:
+        self.settings = settings
+        self.on_event = on_event
+        self.on_connected = on_connected
+        self.on_disconnected = on_disconnected
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        type(self).started += 1
+        self.on_connected()
+        if type(self).payload is not None:
+            self.on_event(type(self).payload)
+        while not self._stop.wait(0.01):
+            continue
+        self.on_disconnected()
+
+    def stop(self, timeout_seconds: float = 5.0) -> None:
+        del timeout_seconds
+        type(self).stopped += 1
+        self._stop.set()
 
 
 class FeishuHelperTests(unittest.TestCase):
@@ -23,6 +123,11 @@ class FeishuHelperTests(unittest.TestCase):
 
 
 class FeishuAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        FakeWebsocketRuntime.started = 0
+        FakeWebsocketRuntime.stopped = 0
+        FakeWebsocketRuntime.payload = None
+
     def test_normalize_direct_message_from_raw_event(self) -> None:
         adapter = FeishuAdapter(
             FeishuSettings(
@@ -112,6 +217,7 @@ class FeishuAdapterTests(unittest.TestCase):
                 app_id="cli_xxx",
                 app_secret="secret_xxx",
                 connection_mode="websocket",
+                enable_live_send=False,
             )
         )
         payload = adapter.send_outbound(
@@ -121,6 +227,121 @@ class FeishuAdapterTests(unittest.TestCase):
         self.assertEqual(payload["delivery"], "feishu")
         self.assertFalse(payload["sent"])
         self.assertEqual(payload["request"]["receive_id"], "oc_chat_1")
+
+    def test_url_verification_response_echoes_challenge(self) -> None:
+        adapter = FeishuAdapter(
+            FeishuSettings(
+                app_id="cli_xxx",
+                app_secret="secret_xxx",
+                verification_token="verify_123",
+            )
+        )
+        response = adapter.build_url_verification_response(
+            {
+                "type": "url_verification",
+                "token": "verify_123",
+                "challenge": "challenge_abc",
+            }
+        )
+
+        self.assertEqual(response["challenge"], "challenge_abc")
+
+    def test_websocket_connect_starts_runtime_and_forwards_events(self) -> None:
+        received_payloads: list[dict] = []
+        FakeWebsocketRuntime.payload = {
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_user_1"}},
+                "message": {
+                    "chat_id": "oc_chat_1",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": '{"text":"hello from ws"}',
+                },
+            },
+        }
+        adapter = FeishuAdapter(
+            FeishuSettings(
+                app_id="cli_xxx",
+                app_secret="secret_xxx",
+                connection_mode="websocket",
+            ),
+            websocket_runtime_factory=FakeWebsocketRuntime,
+        )
+
+        adapter.connect(received_payloads.append)
+        time.sleep(0.05)
+
+        self.assertEqual(FakeWebsocketRuntime.started, 1)
+        self.assertEqual(len(received_payloads), 1)
+        self.assertTrue(adapter.transport_status()["connected"])
+
+        adapter.disconnect()
+        time.sleep(0.02)
+
+        self.assertGreaterEqual(FakeWebsocketRuntime.stopped, 1)
+        self.assertFalse(adapter.transport_status()["connected"])
+
+    def test_live_send_posts_to_feishu_open_platform(self) -> None:
+        FakeFeishuHandler.auth_calls = 0
+        FakeFeishuHandler.bot_info_calls = 0
+        FakeFeishuHandler.send_calls = 0
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeFeishuHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            adapter = FeishuAdapter(
+                FeishuSettings(
+                    app_id="cli_xxx",
+                    app_secret="secret_xxx",
+                    connection_mode="webhook",
+                    base_url=base_url,
+                    auth_base_url=base_url,
+                    enable_live_send=True,
+                )
+            )
+            payload = adapter.send_outbound(
+                OutboundMessage(platform="feishu", chat_id="oc_chat_1", text="reply")
+            )
+
+            self.assertTrue(payload["sent"])
+            self.assertEqual(payload["message_id"], "om_sent_123")
+            self.assertEqual(FakeFeishuHandler.auth_calls, 1)
+            self.assertEqual(FakeFeishuHandler.send_calls, 1)
+            self.assertEqual(FakeFeishuHandler.last_auth_body["app_id"], "cli_xxx")
+            self.assertEqual(FakeFeishuHandler.last_send_body["receive_id"], "oc_chat_1")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_fetch_bot_info_uses_validated_token(self) -> None:
+        FakeFeishuHandler.auth_calls = 0
+        FakeFeishuHandler.bot_info_calls = 0
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeFeishuHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            adapter = FeishuAdapter(
+                FeishuSettings(
+                    app_id="cli_xxx",
+                    app_secret="secret_xxx",
+                    base_url=base_url,
+                    auth_base_url=base_url,
+                )
+            )
+            bot_info = adapter.fetch_bot_info()
+
+            self.assertEqual(bot_info["app_name"], "Harbor Bot")
+            self.assertEqual(bot_info["open_id"], "ou_bot_123")
+            self.assertEqual(FakeFeishuHandler.auth_calls, 1)
+            self.assertEqual(FakeFeishuHandler.bot_info_calls, 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

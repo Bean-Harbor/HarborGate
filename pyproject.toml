@@ -8,15 +8,18 @@ version = "0.1.0"
 description = "Clean-room IM gateway starter inspired by Hermes gateway patterns"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [
   { name = "OpenAI Codex" },
 ]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
+]
+dependencies = [
+  "lark-oapi>=1.5.3",
+  "qrcodegen>=1.8",
 ]
 
 [project.scripts]

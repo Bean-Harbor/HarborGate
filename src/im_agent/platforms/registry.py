@@ -46,7 +46,7 @@ REGISTRATIONS: tuple[AdapterRegistration, ...] = (
         name="feishu",
         builder=FeishuAdapter,
         enabled=_feishu_enabled,
-        description="Feishu / Lark adapter skeleton",
+        description="Feishu / Lark adapter with websocket-first receive mode and live send",
     ),
 )
 

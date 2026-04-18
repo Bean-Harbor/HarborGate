@@ -20,6 +20,13 @@ class WebhookAdapter(PlatformAdapter):
         chat_id = str(payload.get("chat_id") or "").strip()
         user_id = str(payload.get("user_id") or "anonymous").strip()
         text = str(payload.get("text") or "").strip()
+        message_id = str(payload.get("message_id") or "").strip()
+        chat_type = str(payload.get("chat_type") or "p2p").strip().lower() or "p2p"
+        route_key = str(payload.get("route_key") or "").strip()
+        session_id = str(payload.get("session_id") or "").strip()
+        mentions = payload.get("mentions") or []
+        attachments = payload.get("attachments") or []
+        metadata = payload.get("metadata") or {}
 
         if not chat_id:
             raise ValueError("Payload must include chat_id")
@@ -31,6 +38,13 @@ class WebhookAdapter(PlatformAdapter):
             chat_id=chat_id,
             user_id=user_id,
             text=text,
+            message_id=message_id,
+            chat_type=chat_type,
+            route_key=route_key,
+            session_id=session_id,
+            mentions=[item for item in mentions if isinstance(item, dict)],
+            attachments=[item for item in attachments if isinstance(item, dict)],
+            metadata=dict(metadata) if isinstance(metadata, dict) else {},
             raw_payload=payload,
         )
 

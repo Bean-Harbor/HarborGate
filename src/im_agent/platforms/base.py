@@ -15,6 +15,12 @@ class PlatformAdapter(ABC):
     def normalize_inbound(self, payload: dict[str, Any]) -> InboundMessage:
         raise NotImplementedError
 
+    def connect(self, inbound_handler: Any) -> None:
+        """Start any optional live transport for inbound events."""
+
+    def disconnect(self) -> None:
+        """Stop any optional live transport for inbound events."""
+
     def build_delivery_payload(self, outbound: OutboundMessage) -> dict[str, Any]:
         return outbound.to_dict()
 
