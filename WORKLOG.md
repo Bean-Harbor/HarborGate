@@ -1,16 +1,16 @@
-# IM Gateway Work Log
+# HarborGate Work Log
 
 ## 2026-04-18
 
 ### Contract Baseline Locked
 
-- Froze [`HarborNAS-IM-Gateway-Agent-Contract-v1.5.md`](./HarborNAS-IM-Gateway-Agent-Contract-v1.5.md) as the working implementation guide for this repo.
+- Froze [`HarborBeacon-HarborGate-Agent-Contract-v1.5.md`](./HarborBeacon-HarborGate-Agent-Contract-v1.5.md) as the working implementation guide for this repo.
 - Aligned project governance so roadmap, execution plan, and work tracking all point to the same frozen contract.
 - Confirmed the project should follow a Hermes-style separation:
   - one unified gateway and agent flow
   - one adapter per IM platform
   - adapters own platform protocol translation
-  - HarborNAS stays business-owner through the contract boundary
+  - HarborBeacon stays business-owner through the contract boundary
 
 ### Key Decisions
 
@@ -40,8 +40,8 @@
 
 ### IM Contract Path Implementation
 
-- Added an IM-side HarborNAS task client for canonical `POST /api/tasks` requests.
-- Taught the gateway to switch between local brain mode and HarborNAS task-contract mode based on environment configuration.
+- Added an IM-side HarborBeacon task client for canonical `POST /api/tasks` requests.
+- Taught the gateway to switch between local brain mode and HarborBeacon task-contract mode based on environment configuration.
 - Added per-chat metadata persistence for `route_key`, `last_task_id`, `last_trace_id`, and `resume_token`.
 - Extended adapters so inbound messages can carry `message_id`, `chat_type`, `route_key`, and protocol metadata into the contract layer.
 - Added tests for contract request shape, local HTTP task posting, and resume-token reuse through the gateway.
@@ -66,16 +66,16 @@
 
 - Added a local setup portal that can be opened directly from a phone through `/setup`.
 - Added `/setup/qr` and `/setup/qr.svg` so the desktop host can present a QR code for mobile onboarding.
-- Ported the useful part of the old HarborNAS flow: mobile form fields for `app_id`, `app_secret`, and optional `verification_token`, plus server-side credential validation before saving.
+- Ported the useful part of the old HarborBeacon flow: mobile form fields for `app_id`, `app_secret`, and optional `verification_token`, plus server-side credential validation before saving.
 - Added runtime hot-apply for Feishu settings, so a running gateway can start using newly entered credentials without a manual edit on the host.
-- Added a local setup state file for session code and Feishu credential persistence on the IM Gateway machine.
+- Added a local setup state file for session code and Feishu credential persistence on the HarborGate machine.
 - Added tests for setup status, QR SVG generation, and end-to-end Feishu configure flow through the HTTP server.
 
 ### Feishu Long-Connection Pivot
 
 - Switched Feishu receive mode to websocket / long connection by default, matching the recommended Hermes and official Feishu approach for private or local deployments.
 - Added adapter lifecycle management to the unified `GatewayService`, so live IM transports can start and stop inside the same gateway process instead of relying on sidecar scripts.
-- Implemented a Feishu websocket runtime built on the official `lark-oapi` SDK, with inbound event forwarding back into the frozen HarborNAS contract path.
+- Implemented a Feishu websocket runtime built on the official `lark-oapi` SDK, with inbound event forwarding back into the frozen HarborBeacon contract path.
 - Kept webhook mode as an explicit fallback, but stopped using it as the default onboarding flow.
 - Updated the mobile setup portal to guide users through long-connection setup instead of showing a misleading internal webhook URL.
 - Added tests for Feishu websocket transport startup and event forwarding, and kept the optional webhook verification path covered.

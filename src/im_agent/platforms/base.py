@@ -24,6 +24,18 @@ class PlatformAdapter(ABC):
     def build_delivery_payload(self, outbound: OutboundMessage) -> dict[str, Any]:
         return outbound.to_dict()
 
+    def get_profile(self) -> dict[str, Any]:
+        return {
+            "adapter_name": self.name,
+            "surface_family": "generic",
+            "transport_mode": "normalized",
+            "supports_mentions": False,
+            "supports_attachments": True,
+            "supports_replies": True,
+            "supports_updates": False,
+            "supports_live_receive": False,
+        }
+
     def send_outbound(self, outbound: OutboundMessage) -> dict[str, Any]:
         """Deliver an outbound message.
 

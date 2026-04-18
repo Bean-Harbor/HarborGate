@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 from urllib import error, request
 
 from im_agent.brain import RuleBasedBrain
@@ -374,6 +375,159 @@ class NotificationServerTests(unittest.TestCase):
                 feishu_api_server.shutdown()
                 feishu_api_server.server_close()
                 feishu_thread.join(timeout=2)
+
+    def test_gateway_status_endpoint_returns_redacted_channel_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gateway = GatewayService(
+                store=FileSessionStore(tmp, max_turns=10),
+                brain=RuleBasedBrain(),
+            )
+            gateway.register_adapter(
+                FeishuAdapter(
+                    FeishuSettings(
+                        app_id="cli_status_123",
+                        app_secret="secret_status_456",
+                        bot_name="Status Bot",
+                        enable_live_send=True,
+                    )
+                )
+            )
+            feishu_adapter = gateway.get_adapter("feishu")
+            if feishu_adapter is not None:
+                feishu_adapter._set_transport_state(  # type: ignore[attr-defined]
+                    status="error",
+                    connected=False,
+                    last_error="app_secret=secret_status_456 authorization=Bearer token_status_789",
+                )
+            setup_portal = SetupPortalService(
+                gateway=gateway,
+                store=FileSetupPortalStore(tmp),
+                bind_host="127.0.0.1",
+                bind_port=0,
+            )
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(gateway, setup_portal))
+            setup_portal.bind_port = server.server_port
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with patch.dict(os.environ, {"IM_AGENT_SERVICE_TOKEN": "status-secret"}, clear=False):
+                    req = request.Request(
+                        f"http://127.0.0.1:{server.server_port}/api/gateway/status",
+                        headers={
+                            "X-Contract-Version": "1.5",
+                            "Authorization": "Bearer status-secret",
+                        },
+                        method="GET",
+                    )
+                    with request.urlopen(req, timeout=5) as response:
+                        data = json.loads(response.read().decode("utf-8"))
+
+                self.assertTrue(data["ok"])
+                self.assertEqual(data["gateway_version"], "0.1.0")
+                self.assertEqual(len(data["channels"]), 1)
+                channel = data["channels"][0]
+                self.assertEqual(channel["platform"], "feishu")
+                self.assertTrue(channel["enabled"])
+                self.assertFalse(channel["connected"])
+                self.assertEqual(channel["display_name"], "Status Bot")
+                self.assertTrue(channel["capabilities"]["reply"])
+                self.assertFalse(channel["capabilities"]["update"])
+                self.assertFalse(channel["capabilities"]["attachments"])
+                self.assertEqual(channel["transport"]["status"], "error")
+                self.assertIn("[REDACTED]", channel["transport"]["last_error"])
+                response_text = json.dumps(data, ensure_ascii=False)
+                self.assertNotIn("secret_status_456", response_text)
+                self.assertNotIn("cli_status_123", response_text)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_gateway_status_endpoint_requires_service_auth_when_token_is_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gateway = GatewayService(
+                store=FileSessionStore(tmp, max_turns=10),
+                brain=RuleBasedBrain(),
+            )
+            setup_portal = SetupPortalService(
+                gateway=gateway,
+                store=FileSetupPortalStore(tmp),
+                bind_host="127.0.0.1",
+                bind_port=0,
+            )
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(gateway, setup_portal))
+            setup_portal.bind_port = server.server_port
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with patch.dict(os.environ, {"IM_AGENT_SERVICE_TOKEN": "status-secret"}, clear=False):
+                    req = request.Request(
+                        f"http://127.0.0.1:{server.server_port}/api/gateway/status",
+                        headers={"X-Contract-Version": "1.5"},
+                        method="GET",
+                    )
+                    with self.assertRaises(error.HTTPError) as ctx:
+                        request.urlopen(req, timeout=5)
+                    data = json.loads(ctx.exception.read().decode("utf-8"))
+
+                self.assertEqual(ctx.exception.code, 401)
+                self.assertFalse(data["ok"])
+                self.assertEqual(data["error"]["code"], "SERVICE_AUTH_FAILED")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_gateway_status_endpoint_never_uses_app_id_as_display_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gateway = GatewayService(
+                store=FileSessionStore(tmp, max_turns=10),
+                brain=RuleBasedBrain(),
+            )
+            gateway.register_adapter(
+                FeishuAdapter(
+                    FeishuSettings(
+                        app_id="cli_status_123",
+                        app_secret="secret_status_456",
+                        bot_name="",
+                        enable_live_send=True,
+                    )
+                )
+            )
+            setup_portal = SetupPortalService(
+                gateway=gateway,
+                store=FileSetupPortalStore(tmp),
+                bind_host="127.0.0.1",
+                bind_port=0,
+            )
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(gateway, setup_portal))
+            setup_portal.bind_port = server.server_port
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with patch.dict(os.environ, {"IM_AGENT_SERVICE_TOKEN": "status-secret"}, clear=False):
+                    req = request.Request(
+                        f"http://127.0.0.1:{server.server_port}/api/gateway/status",
+                        headers={
+                            "X-Contract-Version": "1.5",
+                            "Authorization": "Bearer status-secret",
+                        },
+                        method="GET",
+                    )
+                    with request.urlopen(req, timeout=5) as response:
+                        data = json.loads(response.read().decode("utf-8"))
+
+                channel = data["channels"][0]
+                self.assertEqual(channel["display_name"], "Feishu")
+                response_text = json.dumps(data, ensure_ascii=False)
+                self.assertNotIn("cli_status_123", response_text)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 if __name__ == "__main__":

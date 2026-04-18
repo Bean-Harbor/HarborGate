@@ -1,17 +1,17 @@
-# IM Gateway Roadmap
+# HarborGate Roadmap
 
 ## Guiding Baseline
 
-- The frozen implementation guide for this project is [`HarborNAS-IM-Gateway-Agent-Contract-v1.5.md`](./HarborNAS-IM-Gateway-Agent-Contract-v1.5.md).
+- The frozen implementation guide for this project is [`HarborBeacon-HarborGate-Agent-Contract-v1.5.md`](./HarborBeacon-HarborGate-Agent-Contract-v1.5.md).
 - `v1.5` is the working cross-repo contract baseline unless both repos explicitly approve a newer version.
 - Roadmap decisions, delivery sequencing, and acceptance gates should be interpreted through the `v1.5` contract.
 
 ## Project Goal
 
-Build an independent IM Gateway that replaces the IM-facing layer in HarborNAS while preserving a clean boundary:
+Build an independent HarborGate that replaces the IM-facing layer in HarborBeacon while preserving a clean boundary:
 
-- IM Gateway owns platform adapters, ingress, outbound delivery, and route management.
-- HarborNAS owns business execution, resumable workflow state, approvals, artifacts, and audit.
+- HarborGate owns platform adapters, ingress, outbound delivery, and route management.
+- HarborBeacon owns business execution, resumable workflow state, approvals, artifacts, and audit.
 
 ## Phases
 
@@ -27,13 +27,13 @@ Status: done
 
 Status: next
 
-- Make IM Gateway send canonical `POST /api/tasks` requests.
+- Make HarborGate send canonical `POST /api/tasks` requests.
 - Ensure stable inbound idempotency with `task_id`, `trace_id`, `message.message_id`, and `source.route_key`.
-- Map HarborNAS `TaskResponse` back into user-visible IM replies without changing business meaning.
+- Map HarborBeacon `TaskResponse` back into user-visible IM replies without changing business meaning.
 
 Exit criteria:
 
-- Real IM inbound round-trip passes through `IM Gateway -> /api/tasks -> TaskResponse -> user reply`.
+- Real IM inbound round-trip passes through `HarborGate -> /api/tasks -> TaskResponse -> user reply`.
 - Same-message retry with the same `task_id` is proven idempotent.
 - Conflicting replay of the same `task_id` is rejected.
 
@@ -41,9 +41,9 @@ Exit criteria:
 
 Status: planned
 
-- Support HarborNAS `status=needs_input`.
+- Support HarborBeacon `status=needs_input`.
 - Persist and replay `resume_token` using a new `task_id` for the follow-up user message.
-- Keep resumed turns on the HarborNAS-owned business flow, not in IM Gateway session state.
+- Keep resumed turns on the HarborBeacon-owned business flow, not in HarborGate session state.
 
 Exit criteria:
 
@@ -53,13 +53,13 @@ Exit criteria:
 
 Status: planned
 
-- Implement `POST /api/notifications/deliveries` on IM Gateway.
+- Implement `POST /api/notifications/deliveries` on HarborGate.
 - Prefer `destination.route_key` over platform-native addressing.
 - Enforce outbound idempotency and delivery failure channel separation from `v1.5`.
 
 Exit criteria:
 
-- Real `HarborNAS -> IM Gateway -> platform delivery` notification succeeds.
+- Real `HarborBeacon -> HarborGate -> platform delivery` notification succeeds.
 - Conflicting replay of the same `delivery.idempotency_key` is rejected.
 
 ### Phase 4: Adapter Maturity
@@ -76,23 +76,23 @@ Priority order:
 2. Feishu websocket/text transport
 3. Additional IM platforms
 
-### Phase 5: HarborNAS Cutover
+### Phase 5: HarborBeacon Cutover
 
 Status: planned
 
-- Remove HarborNAS direct IM delivery.
-- Remove HarborNAS long-term ownership of IM platform credentials.
-- Use IM Gateway as the only IM-facing runtime.
+- Remove HarborBeacon direct IM delivery.
+- Remove HarborBeacon long-term ownership of IM platform credentials.
+- Use HarborGate as the only IM-facing runtime.
 
 Exit criteria:
 
-- HarborNAS no longer depends on direct platform credential validation for live IM delivery.
-- IM Gateway is the single owner of platform delivery and routing.
+- HarborBeacon no longer depends on direct platform credential validation for live IM delivery.
+- HarborGate is the single owner of platform delivery and routing.
 
 ## Working Principles
 
 - Contract-first before adapter-first.
 - Platform logic stays in adapters.
-- Business logic stays in HarborNAS.
+- Business logic stays in HarborBeacon.
 - No shared runtime state across repos.
 - Release only after the `v1.5` release gate is satisfied.

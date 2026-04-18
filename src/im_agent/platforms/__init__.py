@@ -1,4 +1,4 @@
-"""Platform adapters for the IM gateway starter."""
+"""Platform adapters for HarborGate."""
 
 from im_agent.platforms.feishu import FeishuAdapter
 from im_agent.platforms.webhook import WebhookAdapter

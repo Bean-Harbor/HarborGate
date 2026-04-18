@@ -1,6 +1,6 @@
-# IM Agent Starter
+# HarborGate
 
-This repository is a clean-room starter project for building our own IM-connected agent service.
+This repository is the HarborGate northbound transport gateway for HarborBeacon.
 
 It is inspired by the architecture of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), especially these ideas:
 
@@ -13,13 +13,14 @@ This project does not copy Hermes source code. It borrows the architecture direc
 
 ## Project governance
 
-The project is now pinned to [`HarborNAS-IM-Gateway-Agent-Contract-v1.5.md`](./HarborNAS-IM-Gateway-Agent-Contract-v1.5.md) as the working cross-repo implementation guide.
+The project is now pinned to [`HarborBeacon-HarborGate-Agent-Contract-v1.5.md`](./HarborBeacon-HarborGate-Agent-Contract-v1.5.md) as the working cross-repo implementation guide.
 
 Management documents:
 
 - [`ROADMAP.md`](./ROADMAP.md)
 - [`PLAN.md`](./PLAN.md)
 - [`WORKLOG.md`](./WORKLOG.md)
+- [`HarborBeacon-HarborGate-v1.5-Cutover-Checklist.md`](./HarborBeacon-HarborGate-v1.5-Cutover-Checklist.md)
 
 ## What is included
 
@@ -120,17 +121,17 @@ Supported contract:
 - `POST {LLM_BASE_URL}/chat/completions`
 - OpenAI-compatible JSON response shape
 
-## HarborNAS task API mode
+## HarborBeacon task API mode
 
-If `HARBORNAS_TASK_API_URL` is set, the gateway sends inbound turns to HarborNAS through the frozen `v1.5` task contract instead of using the local demo brain.
+If `HARBORBEACON_TASK_API_URL` is set, the gateway sends inbound turns to HarborBeacon through the frozen `v1.5` task contract instead of using the local demo brain.
 
 ```powershell
-$env:HARBORNAS_TASK_API_URL='http://127.0.0.1:9000'
-$env:HARBORNAS_TASK_API_TOKEN='replace-me'
-$env:HARBORNAS_CONTRACT_VERSION='1.5'
-$env:HARBORNAS_DEFAULT_DOMAIN='general'
-$env:HARBORNAS_DEFAULT_ACTION='message'
-$env:HARBORNAS_AUTONOMY_LEVEL='supervised'
+$env:HARBORBEACON_TASK_API_URL='http://127.0.0.1:9000'
+$env:HARBORBEACON_TASK_API_TOKEN='replace-me'
+$env:HARBORBEACON_CONTRACT_VERSION='1.5'
+$env:HARBORBEACON_DEFAULT_DOMAIN='general'
+$env:HARBORBEACON_DEFAULT_ACTION='message'
+$env:HARBORBEACON_AUTONOMY_LEVEL='supervised'
 ```
 
 Behavior in this mode:
@@ -139,9 +140,9 @@ Behavior in this mode:
 - stable `task_id` and `trace_id` are derived from inbound event identity
 - `route_key` and `session_id` are generated when the adapter does not provide them
 - `resume_token` is stored per chat and sent back on the next follow-up turn
-- HarborNAS `TaskResponse` content is mapped back into the adapter delivery path
+- HarborBeacon `TaskResponse` content is mapped back into the adapter delivery path
 
-If `HARBORNAS_TASK_API_URL` is unset, the gateway falls back to the local rule-based brain or the OpenAI-compatible backend.
+If `HARBORBEACON_TASK_API_URL` is unset, the gateway falls back to the local rule-based brain or the OpenAI-compatible backend.
 
 ## Notification delivery endpoint
 
@@ -156,6 +157,7 @@ Current behavior:
 - uses HTTP 200 delivery responses for accepted requests
 - enforces `delivery.mode` field combinations
 - stores outbound idempotency results by `delivery.idempotency_key`
+- optional redacted gateway status is available at `GET /api/gateway/status`
 
 Required request header:
 
@@ -221,7 +223,7 @@ Important notes:
 
 - `IM_AGENT_HOST=0.0.0.0` lets devices on the same LAN reach the gateway
 - `IM_AGENT_PUBLIC_ORIGIN` should be the exact URL your phone can open
-- Feishu credentials entered here are stored only on the IM Gateway machine
+- Feishu credentials entered here are stored only on the HarborGate machine
 
 Useful routes:
 
@@ -269,7 +271,7 @@ Not included yet:
 ### 1. Login once with QR
 
 ```powershell
-im-agent-weixin-login
+harborgate-weixin-login
 ```
 
 This stores the returned bot credentials under `data/weixin/accounts/`.
@@ -295,7 +297,7 @@ Normally you only need `WEIXIN_ACCOUNT_ID`, because the token and base URL can b
 ### 3. Start the WeChat runner
 
 ```powershell
-im-agent-weixin-runner
+harborgate-weixin-runner
 ```
 
 The runner will:

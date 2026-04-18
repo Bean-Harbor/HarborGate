@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,25 @@ InboundHandler = Callable[[dict[str, Any]], None]
 
 def _now_utc() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _redact_sensitive_text(value: str, *secrets: str) -> str:
+    redacted = str(value or "")
+    for secret in secrets:
+        secret_value = str(secret or "").strip()
+        if secret_value:
+            redacted = redacted.replace(secret_value, "[REDACTED]")
+    redacted = re.sub(r"(?i)Bearer\s+\S+", "Bearer [REDACTED]", redacted)
+
+    def _replace_assignment(match: re.Match[str]) -> str:
+        return f"{match.group(1)}=[REDACTED]"
+
+    redacted = re.sub(
+        r"(?i)\b(app_id|app_secret|access_token|tenant_access_token|bot_token|verification_token|encrypt_key|context_token|authorization)\s*[:=]\s*([^\s,;]+)",
+        _replace_assignment,
+        redacted,
+    )
+    return redacted
 
 
 @dataclass(slots=True)
@@ -335,6 +355,18 @@ class FeishuAdapter(PlatformAdapter):
     def configured(self) -> bool:
         return bool(self.settings.app_id and self.settings.app_secret)
 
+    def get_profile(self) -> dict[str, Any]:
+        return {
+            "adapter_name": self.name,
+            "surface_family": self.settings.domain or "feishu",
+            "transport_mode": self.settings.connection_mode,
+            "supports_mentions": True,
+            "supports_attachments": True,
+            "supports_replies": True,
+            "supports_updates": False,
+            "supports_live_receive": self.settings.connection_mode == "websocket",
+        }
+
     @property
     def webhook_path(self) -> str:
         return self.settings.webhook_path
@@ -362,7 +394,7 @@ class FeishuAdapter(PlatformAdapter):
                 target=self._run_websocket_transport,
                 args=(runtime,),
                 daemon=True,
-                name="im-agent-feishu-ws",
+                name="harborgate-feishu-ws",
             )
             self._websocket_runtime = runtime
             self._websocket_thread = thread
@@ -390,6 +422,14 @@ class FeishuAdapter(PlatformAdapter):
         with self._transport_lock:
             state = dict(self._transport_state)
             state["thread_alive"] = bool(self._websocket_thread and self._websocket_thread.is_alive())
+        state["last_error"] = _redact_sensitive_text(
+            str(state.get("last_error") or ""),
+            self.settings.app_id,
+            self.settings.app_secret,
+            self.settings.verification_token,
+            self.settings.encrypt_key,
+            self._tenant_access_token,
+        )
         return state
 
     def is_url_verification(self, payload: dict[str, Any]) -> bool:

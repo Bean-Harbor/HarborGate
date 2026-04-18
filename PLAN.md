@@ -1,34 +1,34 @@
-# IM Gateway Master Plan
+# HarborGate Master Plan
 
 ## Baseline
 
-- This plan is pinned to [`HarborNAS-IM-Gateway-Agent-Contract-v1.5.md`](./HarborNAS-IM-Gateway-Agent-Contract-v1.5.md).
+- This plan is pinned to [`HarborBeacon-HarborGate-Agent-Contract-v1.5.md`](./HarborBeacon-HarborGate-Agent-Contract-v1.5.md).
 - If implementation pressure conflicts with the contract, the team updates the plan first and code second.
 - `v1.5` remains the working cross-repo baseline unless both repos explicitly approve a newer version.
 
 ## Mission
 
-Build an independent IM Gateway that replaces the HarborNAS IM-facing layer while keeping a clean hard boundary:
+Build an independent HarborGate that replaces the HarborBeacon IM-facing layer while keeping a clean hard boundary:
 
-- IM Gateway owns IM platform adapters, ingress, route management, and outbound delivery.
-- HarborNAS owns business execution, resumable workflow state, approvals, artifacts, and audit.
+- HarborGate owns IM platform adapters, ingress, route management, and outbound delivery.
+- HarborBeacon owns business execution, resumable workflow state, approvals, artifacts, and audit.
 
 ## Success Criteria
 
 The project is successful when all of the following are true:
 
-- IM Gateway can receive a real IM message and send a canonical `POST /api/tasks` request to HarborNAS.
-- HarborNAS can return a user-renderable `TaskResponse` that IM Gateway sends back without changing business meaning.
-- HarborNAS can return `status=needs_input` and IM Gateway can continue the same business flow with `args.resume_token`.
-- HarborNAS can send notification intent to IM Gateway through `POST /api/notifications/deliveries`.
-- IM Gateway becomes the only long-term owner of IM delivery and IM platform credentials.
+- HarborGate can receive a real IM message and send a canonical `POST /api/tasks` request to HarborBeacon.
+- HarborBeacon can return a user-renderable `TaskResponse` that HarborGate sends back without changing business meaning.
+- HarborBeacon can return `status=needs_input` and HarborGate can continue the same business flow with `args.resume_token`.
+- HarborBeacon can send notification intent to HarborGate through `POST /api/notifications/deliveries`.
+- HarborGate becomes the only long-term owner of IM delivery and IM platform credentials.
 
 ## Scope Boundaries
 
 ### In Scope
 
 - Inbound IM message normalization
-- HarborNAS task-client wiring
+- HarborBeacon task-client wiring
 - Route-key-based outbound delivery
 - Resume flow support
 - Adapter maturation for Weixin and Feishu
@@ -37,7 +37,7 @@ The project is successful when all of the following are true:
 ### Out of Scope for This Delivery Wave
 
 - A second cross-repo contract beyond `v1.5`
-- Moving all intent parsing into HarborNAS
+- Moving all intent parsing into HarborBeacon
 - Multi-step async-only IM turns without an initial synchronous reply
 - Broad multi-platform expansion before the first contract path is stable
 
@@ -47,14 +47,14 @@ The project is successful when all of the following are true:
 
 - Contract-first before adapter-first
 - Platform logic stays in adapters
-- Business logic stays in HarborNAS
+- Business logic stays in HarborBeacon
 - No shared runtime state across repos
 - Idempotency behavior is a first-class feature, not a later patch
 - Real round-trips matter more than mock-only success
 
 ### Ownership Split
 
-#### IM Gateway Engineer
+#### HarborGate Engineer
 
 - gateway runtime
 - normalized transport models
@@ -63,9 +63,9 @@ The project is successful when all of the following are true:
 - platform delivery
 - delivery idempotency
 - IM platform credential handling
-- HarborNAS HTTP client integration
+- HarborBeacon HTTP client integration
 
-#### HarborNAS Engineer
+#### HarborBeacon Engineer
 
 - `assistant_task_api`
 - business state machine
@@ -96,39 +96,39 @@ Goals:
 
 Artifacts:
 
-- `HarborNAS-IM-Gateway-Agent-Contract-v1.5.md`
+- `HarborBeacon-HarborGate-Agent-Contract-v1.5.md`
 - `ROADMAP.md`
 - `PLAN.md`
 - `WORKLOG.md`
 - GitHub repo setup
 
-### Phase 1: Internal Alignment in IM Gateway
+### Phase 1: Internal Alignment in HarborGate
 
 Status: next
 
 Goals:
 
 - Align internal gateway models and flow with the contract boundary.
-- Prepare the codebase so HarborNAS integration plugs into a stable, platform-agnostic path.
+- Prepare the codebase so HarborBeacon integration plugs into a stable, platform-agnostic path.
 
 Tasks:
 
 1. Confirm one internal inbound message shape and one outbound message shape.
-2. Add a HarborNAS task client abstraction for `POST /api/tasks`.
-3. Define gateway-side mapping from internal inbound message to canonical HarborNAS task request.
+2. Add a HarborBeacon task client abstraction for `POST /api/tasks`.
+3. Define gateway-side mapping from internal inbound message to canonical HarborBeacon task request.
 4. Define gateway-side mapping from `TaskResponse` to outbound delivery requests.
 5. Make route key and message identity first-class in the gateway runtime.
 
 Deliverables:
 
 - internal request/response mapping layer
-- HarborNAS client configuration surface
+- HarborBeacon client configuration surface
 - clear separation between adapter payloads and contract payloads
 
 Acceptance:
 
-- A local simulated inbound event can be transformed into a contract-valid HarborNAS request.
-- A simulated HarborNAS response can be rendered back into adapter-facing outbound content.
+- A local simulated inbound event can be transformed into a contract-valid HarborBeacon request.
+- A simulated HarborBeacon response can be rendered back into adapter-facing outbound content.
 
 ### Phase 2: Inbound Task Contract Path
 
@@ -136,12 +136,12 @@ Status: planned
 
 Goals:
 
-- Make IM Gateway send real canonical `POST /api/tasks` requests.
-- Make HarborNAS accept and process those requests in the expected shape.
+- Make HarborGate send real canonical `POST /api/tasks` requests.
+- Make HarborBeacon accept and process those requests in the expected shape.
 
 Tasks:
 
-1. Implement actual HTTP task submission from IM Gateway to HarborNAS.
+1. Implement actual HTTP task submission from HarborGate to HarborBeacon.
 2. Populate `task_id`, `trace_id`, `source`, `intent`, `message`, `entity_refs`, `args`, and `autonomy` correctly.
 3. Ensure retry behavior reuses the same `task_id` for the same inbound event.
 4. Preserve `source.route_key` for later replies and follow-up notifications.
@@ -149,12 +149,12 @@ Tasks:
 
 Dependencies:
 
-- IM Gateway task client
-- HarborNAS request validation and idempotency logic
+- HarborGate task client
+- HarborBeacon request validation and idempotency logic
 
 Acceptance:
 
-- Real IM inbound round-trip passes through `IM Gateway -> /api/tasks -> TaskResponse -> user reply`.
+- Real IM inbound round-trip passes through `HarborGate -> /api/tasks -> TaskResponse -> user reply`.
 - Same-message retry with the same `task_id` is idempotent.
 - Conflicting replay of the same `task_id` is rejected with `409` and `IDEMPOTENCY_CONFLICT`.
 
@@ -164,21 +164,21 @@ Status: planned
 
 Goals:
 
-- Support HarborNAS resumable business flows from IM.
+- Support HarborBeacon resumable business flows from IM.
 
 Tasks:
 
 1. Support `status=needs_input`, `prompt`, and `resume_token`.
 2. Persist the minimum gateway state needed to continue the same conversation cleanly.
 3. Send the next user message as a new `task_id` with `args.resume_token`.
-4. Verify HarborNAS treats `resume_token` as business continuity, not idempotency identity.
+4. Verify HarborBeacon treats `resume_token` as business continuity, not idempotency identity.
 5. Add contract fixtures for resumed turns.
 
 Acceptance:
 
 - Real `needs_input -> resumed turn` flow passes end to end.
 - Retry of the same follow-up message stays idempotent.
-- Resume flow does not require IM Gateway to become the source of truth for workflow state.
+- Resume flow does not require HarborGate to become the source of truth for workflow state.
 
 ### Phase 4: Outbound Notification Delivery Contract
 
@@ -186,11 +186,11 @@ Status: planned
 
 Goals:
 
-- Move HarborNAS notification delivery behind IM Gateway.
+- Move HarborBeacon notification delivery behind HarborGate.
 
 Tasks:
 
-1. Implement `POST /api/notifications/deliveries` in IM Gateway.
+1. Implement `POST /api/notifications/deliveries` in HarborGate.
 2. Resolve routes primarily through `destination.route_key`.
 3. Enforce `delivery.mode` validation and outbound idempotency.
 4. Separate request-rejection failures from accepted-request delivery failures.
@@ -199,11 +199,11 @@ Tasks:
 Dependencies:
 
 - route registry persistence
-- HarborNAS notification producer
+- HarborBeacon notification producer
 
 Acceptance:
 
-- Real `HarborNAS -> IM Gateway -> platform delivery` round-trip succeeds.
+- Real `HarborBeacon -> HarborGate -> platform delivery` round-trip succeeds.
 - Same `delivery.idempotency_key` retry does not duplicate end-user delivery.
 - Conflicting replay of the same `delivery.idempotency_key` is rejected.
 - `ROUTE_NOT_FOUND` and `ROUTE_EXPIRED` return non-200 shared-envelope failures, not `200 ok=false`.
@@ -256,32 +256,32 @@ Status: planned
 
 Goals:
 
-- Make IM Gateway the only long-term IM delivery owner.
+- Make HarborGate the only long-term IM delivery owner.
 
 Tasks:
 
-1. Remove HarborNAS direct IM delivery from the live path.
-2. Remove HarborNAS long-term ownership of IM platform credentials.
-3. Add redacted status support if HarborNAS UI needs connection state.
+1. Remove HarborBeacon direct IM delivery from the live path.
+2. Remove HarborBeacon long-term ownership of IM platform credentials.
+3. Add redacted status support if HarborBeacon UI needs connection state.
 4. Run cutover validation and rollback-readiness checks.
 
 Acceptance:
 
-- HarborNAS no longer depends on direct platform credential validation for live IM delivery.
-- IM Gateway is the only runtime that talks to IM platforms for delivery.
+- HarborBeacon no longer depends on direct platform credential validation for live IM delivery.
+- HarborGate is the only runtime that talks to IM platforms for delivery.
 
 ## Workstreams
 
-### Stream A: Contract Implementation in IM Gateway
+### Stream A: Contract Implementation in HarborGate
 
 Priority:
 
-1. HarborNAS task client
+1. HarborBeacon task client
 2. request/response mapping
 3. route-key-aware outbound delivery
 4. notification delivery endpoint
 
-### Stream B: HarborNAS Contract Compliance
+### Stream B: HarborBeacon Contract Compliance
 
 Priority:
 
@@ -303,10 +303,10 @@ Priority:
 
 ### Immediate Sequence
 
-1. Implement IM Gateway HarborNAS task client and config.
+1. Implement HarborGate HarborBeacon task client and config.
 2. Wire canonical task request building from the internal inbound message model.
-3. Build reply mapping from HarborNAS `TaskResponse` into adapter-facing outbound content.
-4. Align HarborNAS with `task_id` replay and idempotency conflict behavior.
+3. Build reply mapping from HarborBeacon `TaskResponse` into adapter-facing outbound content.
+4. Align HarborBeacon with `task_id` replay and idempotency conflict behavior.
 5. Validate the first real inbound round-trip.
 6. Implement `needs_input` continuation path.
 7. Implement notification delivery endpoint and route-key resolution.
@@ -318,8 +318,8 @@ Priority:
 
 #### Week 1
 
-- Day 1-2: IM Gateway task client and request builder
-- Day 2-3: HarborNAS inbound contract alignment
+- Day 1-2: HarborGate task client and request builder
+- Day 2-3: HarborBeacon inbound contract alignment
 - Day 3-4: first end-to-end inbound round-trip
 - Day 4-5: retry and idempotency conflict validation
 
@@ -334,7 +334,7 @@ Priority:
 
 - frozen contract baseline documented
 - gateway request builder
-- HarborNAS task client
+- HarborBeacon task client
 - inbound contract fixtures
 - resumed-turn support
 - notification delivery endpoint
@@ -359,9 +359,9 @@ Priority:
 
 ### Integration Tests
 
-- simulated HarborNAS round-trip from IM Gateway
-- simulated notification round-trip into IM Gateway
-- adapter-to-gateway-to-HarborNAS smoke flow
+- simulated HarborBeacon round-trip from HarborGate
+- simulated notification round-trip into HarborGate
+- adapter-to-gateway-to-HarborBeacon smoke flow
 
 ### Real Environment Validation
 
@@ -378,7 +378,7 @@ Mitigation:
 - any contract-impacting change must be discussed before code lands
 - fields are not added ad hoc in only one repo
 
-### Risk: HarborNAS Still Leaks Platform Logic
+### Risk: HarborBeacon Still Leaks Platform Logic
 
 Mitigation:
 
@@ -392,12 +392,12 @@ Mitigation:
 - test same-message retries against the real adapter path
 - log `task_id`, `trace_id`, `message.message_id`, and `route_key`
 
-### Risk: IM Gateway Starts Owning Business State by Accident
+### Risk: HarborGate Starts Owning Business State by Accident
 
 Mitigation:
 
 - keep resume flow dependent on `resume_token`
-- keep workflow truth in HarborNAS only
+- keep workflow truth in HarborBeacon only
 
 ### Risk: Feishu Expansion Distracts from the Core Contract Path
 
@@ -412,4 +412,4 @@ The project is done for this delivery wave when:
 - the `v1.5` release gate is satisfied
 - the inbound path, resume path, and notification path each pass at least one real round-trip
 - retry and idempotency conflict behavior is proven in tests
-- HarborNAS no longer owns live IM delivery
+- HarborBeacon no longer owns live IM delivery

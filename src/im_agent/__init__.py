@@ -1,4 +1,4 @@
-"""IM agent starter package."""
+"""HarborGate IM transport gateway package."""
 
 __all__ = ["__version__"]
 

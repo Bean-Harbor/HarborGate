@@ -218,7 +218,7 @@ def build_send_message_payload(
         "msg": {
             "from_user_id": "",
             "to_user_id": to_user_id,
-            "client_id": client_id or f"im-agent-{uuid.uuid4().hex}",
+            "client_id": client_id or f"harborgate-{uuid.uuid4().hex}",
             "message_type": MSG_TYPE_BOT,
             "message_state": MSG_STATE_FINISH,
             "item_list": [{"type": ITEM_TEXT, "text_item": {"text": text}}],
@@ -387,10 +387,22 @@ class WeixinAdapter(PlatformAdapter):
     def configured(self) -> bool:
         return bool(self.account_id and self.token)
 
+    def get_profile(self) -> dict[str, Any]:
+        return {
+            "adapter_name": self.name,
+            "surface_family": "weixin",
+            "transport_mode": "polling",
+            "supports_mentions": False,
+            "supports_attachments": False,
+            "supports_replies": True,
+            "supports_updates": False,
+            "supports_live_receive": False,
+        }
+
     def assert_configured(self) -> None:
         if not self.configured:
             raise RuntimeError(
-                "Weixin adapter is not configured. Run im-agent-weixin-login first, then set WEIXIN_ACCOUNT_ID."
+                "Weixin adapter is not configured. Run harborgate-weixin-login first, then set WEIXIN_ACCOUNT_ID."
             )
 
     def poll_updates(self, timeout_ms: int = DEFAULT_POLL_TIMEOUT_MS) -> list[dict[str, Any]]:

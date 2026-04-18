@@ -13,4 +13,4 @@ def main() -> None:
 
     print("\n下一步请设置环境变量后再启动 runner：")
     print(f"$env:WEIXIN_ACCOUNT_ID='{result.account_id}'")
-    print("im-agent-weixin-runner")
+    print("harborgate-weixin-runner")

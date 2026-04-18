@@ -34,11 +34,11 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 HTTPStatus.OK,
                 {
-                    "name": "im-agent-starter",
+                    "name": "harborgate",
                     "message": (
                         "POST JSON to /messages/webhook to exercise the clean-room gateway. "
-                        "Set HARBORNAS_TASK_API_URL to route turns into HarborNAS, or use "
-                        "im-agent-weixin-login and im-agent-weixin-runner for personal WeChat. "
+                        "Set HARBORBEACON_TASK_API_URL to route turns into HarborBeacon, or use "
+                        "harborgate-weixin-login and harborgate-weixin-runner for personal WeChat. "
                         "Open /setup/qr to scan the Feishu setup page from mobile. "
                         "Feishu defaults to long-connection receive mode, so no public webhook is required."
                     ),
@@ -73,6 +73,16 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 self.setup_portal.build_status_payload(request_host=self.headers.get("Host", "")),
             )
+            return
+
+        if self.path == "/api/gateway/status":
+            try:
+                self._require_service_contract()
+                self._require_service_auth()
+            except GatewayContractError as exc:
+                self._send_json(HTTPStatus(exc.status_code), exc.to_response())
+                return
+            self._send_json(HTTPStatus.OK, self.setup_portal.build_gateway_status_payload())
             return
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
@@ -261,7 +271,7 @@ def main() -> None:
     gateway.start()
 
     server = ThreadingHTTPServer((host, port), build_handler(gateway, setup_portal))
-    logger.info("IM agent starter listening on http://%s:%s", host, port)
+    logger.info("HarborGate listening on http://%s:%s", host, port)
     logger.info("Feishu setup QR page available at http://%s:%s/setup/qr", host, port)
     try:
         server.serve_forever()

@@ -14,6 +14,7 @@ try:
 except ImportError:  # pragma: no cover - optional runtime dependency fallback
     QrCode = None  # type: ignore[assignment]
 
+from im_agent import __version__
 from im_agent.gateway import GatewayService
 from im_agent.platforms.feishu import FeishuAdapter, FeishuSettings
 
@@ -227,6 +228,56 @@ class SetupPortalService:
             },
         }
 
+    def build_gateway_status_payload(self) -> dict[str, Any]:
+        channels: list[dict[str, Any]] = []
+        for adapter_name, adapter in self.gateway._adapters.items():
+            transport = adapter.transport_status() if hasattr(adapter, "transport_status") else {}
+            transport = transport if isinstance(transport, dict) else {}
+            adapter_settings = getattr(adapter, "settings", None)
+            transport_mode = str(
+                transport.get("mode")
+                or getattr(adapter_settings, "connection_mode", "")
+                or ""
+            ).strip()
+            channel = {
+                "platform": str(getattr(adapter, "name", adapter_name) or adapter_name).strip(),
+                "enabled": bool(getattr(adapter, "configured", True)),
+                "connected": bool(transport.get("connected")),
+                "display_name": "",
+                "capabilities": {
+                    "reply": False,
+                    "update": False,
+                    "attachments": False,
+                },
+            }
+            channel["transport"] = {
+                "mode": transport_mode,
+                "status": str(transport.get("status") or "").strip(),
+                "connected": bool(transport.get("connected")),
+                "thread_alive": bool(transport.get("thread_alive")),
+                "last_connected_at": str(transport.get("last_connected_at") or "").strip(),
+                "last_event_at": str(transport.get("last_event_at") or "").strip(),
+                "last_error": str(transport.get("last_error") or "").strip(),
+            }
+            if isinstance(adapter, FeishuAdapter):
+                channel["display_name"] = str(adapter.settings.bot_name or "Feishu").strip()
+                channel["capabilities"] = {
+                    "reply": bool(adapter.configured and adapter.settings.enable_live_send),
+                    "update": False,
+                    "attachments": False,
+                }
+            elif adapter_name == "webhook":
+                channel["display_name"] = "Webhook"
+            else:
+                channel["display_name"] = str(getattr(adapter, "name", adapter_name) or adapter_name).strip().title()
+            channels.append(channel)
+
+        return {
+            "ok": True,
+            "gateway_version": __version__,
+            "channels": channels,
+        }
+
     def build_setup_page(self, *, request_host: str = "") -> str:
         status = self.build_status_payload(request_host=request_host)
         feishu = status["feishu"]
@@ -258,7 +309,7 @@ class SetupPortalService:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>IM Gateway Feishu 配置</title>
+  <title>HarborGate Feishu 配置</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
     .wrap {{ max-width: 620px; margin: 0 auto; padding: 24px 18px 48px; }}
@@ -281,9 +332,9 @@ class SetupPortalService:
 <body>
   <div class="wrap">
     <div class="card">
-      <div class="meta">IM Gateway · Feishu 手机配置页</div>
+      <div class="meta">HarborGate · Feishu 手机配置页</div>
       <h1>扫码后直接填飞书凭证</h1>
-      <p>这个页面会把 <code>app_id</code> 和 <code>app_secret</code> 保存在当前 IM Gateway 本机，并立即更新正在运行的 Feishu adapter，不需要用户手动登录到服务器。</p>
+      <p>这个页面会把 <code>app_id</code> 和 <code>app_secret</code> 保存在当前 HarborGate 本机，并立即更新正在运行的 Feishu adapter，不需要用户手动登录到服务器。</p>
       <img class="qr" src="{qr_path}" alt="setup qr" />
       <p class="hint">当前配置链接：<code>{setup_url}</code></p>
       {warning}
@@ -349,7 +400,7 @@ class SetupPortalService:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>IM Gateway Setup QR</title>
+  <title>HarborGate Setup QR</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
     .wrap {{ max-width: 520px; margin: 0 auto; padding: 28px 18px 48px; text-align: center; }}
@@ -362,7 +413,7 @@ class SetupPortalService:
   <div class="wrap">
     <div class="card">
       <h1>手机扫码配置 Feishu</h1>
-      <p>扫下面这个二维码，打开本机 IM Gateway 的 Feishu 配置页。</p>
+      <p>扫下面这个二维码，打开本机 HarborGate 的 Feishu 配置页。</p>
       <img src="/setup/qr.svg" alt="setup qr" />
       <p><code>{setup_url}</code></p>
     </div>

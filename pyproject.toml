@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "im-agent-starter"
+name = "harborgate"
 version = "0.1.0"
-description = "Clean-room IM gateway starter inspired by Hermes gateway patterns"
+description = "HarborGate northbound IM transport gateway for HarborBeacon"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -23,6 +23,9 @@ dependencies = [
 ]
 
 [project.scripts]
+harborgate = "im_agent.server:main"
+harborgate-weixin-login = "im_agent.weixin_login:main"
+harborgate-weixin-runner = "im_agent.weixin_runner:main"
 im-agent = "im_agent.server:main"
 im-agent-weixin-login = "im_agent.weixin_login:main"
 im-agent-weixin-runner = "im_agent.weixin_runner:main"

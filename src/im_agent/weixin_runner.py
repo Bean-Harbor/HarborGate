@@ -19,7 +19,7 @@ def main() -> None:
     adapter = gateway.get_adapter("weixin")
     if not isinstance(adapter, WeixinAdapter):
         raise SystemExit(
-            "Weixin adapter is not configured. Run im-agent-weixin-login first, then set WEIXIN_ACCOUNT_ID."
+            "Weixin adapter is not configured. Run harborgate-weixin-login first, then set WEIXIN_ACCOUNT_ID."
         )
 
     adapter.assert_configured()
