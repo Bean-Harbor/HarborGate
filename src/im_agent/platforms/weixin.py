@@ -563,6 +563,10 @@ def _build_native_image_message_item(uploaded: WeixinUploadedImage) -> dict[str,
     return {"type": ITEM_IMAGE, "image_item": image_item}
 
 
+def _build_text_message_item(text: str) -> dict[str, Any]:
+    return {"type": ITEM_TEXT, "text_item": {"text": text}}
+
+
 def _should_send_native_image_reply(outbound: OutboundMessage) -> bool:
     return str(outbound.metadata.get("source") or "").strip() == "harborbeacon" and bool(outbound.attachments)
 
@@ -962,7 +966,10 @@ class WeixinAdapter(PlatformAdapter):
         chunks = split_text_for_weixin(outbound.text) if not native_image_reply else []
         if not native_image_reply and not chunks:
             raise RuntimeError("Outbound Weixin message is empty")
-        send_unit_count = 1 if native_image_reply else len(chunks)
+        native_caption = outbound.text.strip()
+        send_unit_count = len(chunks)
+        if native_image_reply:
+            send_unit_count = 1 + (1 if native_caption else 0)
 
         observed_at = utc_now_iso()
         self._set_transport_state(
@@ -991,17 +998,21 @@ class WeixinAdapter(PlatformAdapter):
                     token=self.token,
                     cdn_base_url=self.cdn_base_url,
                 )
-                item_list: list[dict[str, Any]] = []
-                if outbound.text.strip():
-                    item_list.append({"type": ITEM_TEXT, "text_item": {"text": outbound.text.strip()}})
-                item_list.append(_build_native_image_message_item(uploaded_image))
-                payload = build_send_message_payload_items(
+                if native_caption:
+                    text_payload = build_send_message_payload_items(
+                        to_user_id=outbound.chat_id,
+                        item_list=[_build_text_message_item(native_caption)],
+                        context_token=context_token,
+                    )
+                    last_client_id = str((text_payload.get("msg") or {}).get("client_id") or "")
+                    post_json(self.base_url, EP_SEND_MESSAGE, text_payload, token=self.token)
+                image_payload = build_send_message_payload_items(
                     to_user_id=outbound.chat_id,
-                    item_list=item_list,
+                    item_list=[_build_native_image_message_item(uploaded_image)],
                     context_token=context_token,
                 )
-                last_client_id = str((payload.get("msg") or {}).get("client_id") or "")
-                post_json(self.base_url, EP_SEND_MESSAGE, payload, token=self.token)
+                last_client_id = str((image_payload.get("msg") or {}).get("client_id") or "")
+                post_json(self.base_url, EP_SEND_MESSAGE, image_payload, token=self.token)
             else:
                 for chunk in chunks:
                     payload = build_send_message_payload(

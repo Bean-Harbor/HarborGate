@@ -407,14 +407,18 @@ class WeixinAdapterTests(unittest.TestCase):
                     )
 
                 transport = adapter.transport_status()
-                send_payload = mocked_post.call_args.args[2]
+                first_payload = mocked_post.call_args_list[0].args[2]
+                second_payload = mocked_post.call_args_list[1].args[2]
                 self.assertTrue(response["sent"])
                 self.assertEqual(transport["last_send_status"], "sent")
                 self.assertEqual(transport["last_send_content_kind"], "text+image")
                 self.assertEqual(transport["last_send_attachment_count"], 1)
-                self.assertEqual(len(send_payload["msg"]["item_list"]), 2)
-                self.assertEqual(send_payload["msg"]["item_list"][0]["type"], 1)
-                self.assertEqual(send_payload["msg"]["item_list"][1]["type"], 2)
+                self.assertEqual(transport["last_send_chunk_count"], 2)
+                self.assertEqual(mocked_post.call_count, 2)
+                self.assertEqual(len(first_payload["msg"]["item_list"]), 1)
+                self.assertEqual(len(second_payload["msg"]["item_list"]), 1)
+                self.assertEqual(first_payload["msg"]["item_list"][0]["type"], 1)
+                self.assertEqual(second_payload["msg"]["item_list"][0]["type"], 2)
             finally:
                 image_path.close()
 
@@ -463,8 +467,9 @@ class WeixinAdapterTests(unittest.TestCase):
                         )
                     )
 
-                send_payload = mocked_post.call_args.args[2]
-                image_item = send_payload["msg"]["item_list"][1]["image_item"]
+                self.assertEqual(mocked_post.call_count, 2)
+                image_payload = mocked_post.call_args_list[1].args[2]
+                image_item = image_payload["msg"]["item_list"][0]["image_item"]
                 self.assertTrue(response["sent"])
                 self.assertEqual(image_item["mid_size"], 112)
                 self.assertNotIn("thumb_media", image_item)
