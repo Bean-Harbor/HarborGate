@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 from urllib import error, request
 
@@ -11,6 +12,11 @@ from im_agent.brain import RuleBasedBrain
 from im_agent.gateway import GatewayService
 from im_agent.platforms.feishu import FeishuAdapter, FeishuSettings
 from im_agent.platforms.webhook import WebhookAdapter
+from im_agent.platforms.weixin import (
+    WeixinAdapter,
+    save_weixin_account,
+    save_weixin_transport_state,
+)
 from im_agent.server import build_handler
 from im_agent.session_store import FileSessionStore
 from im_agent.setup_portal import FileSetupPortalStore, SetupPortalService
@@ -254,12 +260,85 @@ class NotificationServerTests(unittest.TestCase):
                 store=FileSessionStore(tmp, max_turns=10),
                 brain=RuleBasedBrain(),
             )
+            runtime_dir = Path(tmp) / "runtime"
+            (runtime_dir / "weixin-ingress-probe").mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "platform-live-gate").mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "weixin-ingress-probe" / "probe-1.json").write_text(
+                json.dumps(
+                    {
+                        "provider_private_text_seen": True,
+                        "provider_private_text_count": 1,
+                        "blocked_reason": "",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (runtime_dir / "platform-live-gate" / "gate-1.json").write_text(
+                json.dumps(
+                    {
+                        "decision": "dual_surface_ready",
+                        "decision_reason": "feishu_and_weixin_rehearsal_ready",
+                        "parity_ready": True,
+                        "weixin_blocker_category": "",
+                        "release_v1": {
+                            "delivery_policy": {
+                                "interactive_reply": "source_bound",
+                                "proactive_delivery": "user-default-configured",
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            weixin_state_dir = os.path.join(tmp, "weixin")
+            save_weixin_account(
+                weixin_state_dir,
+                account_id="wx-account-1",
+                token="wx-secret-1",
+                base_url="https://ilinkai.weixin.qq.com",
+                user_id="wx-user-1",
+            )
+            save_weixin_transport_state(
+                weixin_state_dir,
+                "wx-account-1",
+                {
+                    "mode": "polling",
+                    "status": "polling_idle",
+                    "connected": True,
+                    "last_error": "",
+                    "last_poll_outcome": "idle_timeout",
+                    "last_poll_at": "2026-04-20T09:30:00Z",
+                    "last_getupdates_at": "2026-04-20T09:30:00Z",
+                    "last_getupdates_buf": "cursor-1",
+                    "last_getupdates_count": 0,
+                    "last_private_text_message_count": 0,
+                    "last_getupdates_message_ids": [],
+                    "last_getupdates_private_message_ids": [],
+                    "last_getupdates_error": "",
+                    "last_context_token_at": "",
+                    "last_send_at": "",
+                    "last_send_chunk_count": 0,
+                    "last_send_status": "",
+                    "last_send_error": "",
+                    "last_send_retryable": False,
+                    "last_send_provider_message_id": "",
+                    "last_send_context_token_used": False,
+                    "last_inbound_at": "",
+                    "last_inbound_message_id": "",
+                    "last_inbound_chat_id": "",
+                },
+            )
             setup_portal = SetupPortalService(
                 gateway=gateway,
                 store=FileSetupPortalStore(tmp),
                 bind_host="0.0.0.0",
                 bind_port=0,
                 public_origin="http://192.168.3.10:8787",
+                runtime_root=runtime_dir,
             )
 
             server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(gateway, setup_portal))
@@ -273,6 +352,111 @@ class NotificationServerTests(unittest.TestCase):
                 self.assertIn("setup_url", data)
                 self.assertEqual(data["public_origin"], "http://192.168.3.10:8787")
                 self.assertFalse(data["feishu"]["configured"])
+                self.assertTrue(data["weixin"]["configured"])
+                self.assertEqual(data["weixin"]["blocker_category"], "context_token_send")
+                self.assertTrue(data["weixin"]["connected"])
+                self.assertEqual(data["weixin"]["status"], "polling_idle")
+                self.assertIn("ingress_observability", data["weixin"])
+                self.assertIn("delivery_observability", data["weixin"])
+                self.assertEqual(data["weixin"]["ingress_observability"]["last_getupdates_count"], 0)
+                self.assertEqual(data["weixin"]["delivery_observability"]["last_send_status"], "")
+                self.assertIn("gateway_status", data)
+                self.assertTrue(data["gateway_status"]["ok"])
+                self.assertIn("weixin", [channel["platform"] for channel in data["gateway_status"]["channels"]])
+                weixin_channel = next(
+                    channel for channel in data["gateway_status"]["channels"] if channel["platform"] == "weixin"
+                )
+                self.assertTrue(weixin_channel["connected"])
+                self.assertEqual(weixin_channel["transport"]["status"], "polling_idle")
+                self.assertIn("delivery_policy", data)
+                self.assertEqual(data["delivery_policy"]["interactive_reply"], "source_bound")
+                self.assertIn("release_v1", data)
+                self.assertEqual(data["release_v1"]["decision"], "dual_surface_ready")
+                self.assertTrue(data["release_v1"]["weixin_ingress_proof"]["provider_private_text_seen"])
+                self.assertEqual(
+                    data["gateway_status"]["delivery_policy"]["proactive_delivery"],
+                    "user-default-configured",
+                )
+                self.assertTrue(data["gateway_status"]["release_v1"]["dual_surface_ready"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_setup_status_uses_persisted_weixin_transport_state_when_runner_updates_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gateway = GatewayService(
+                store=FileSessionStore(tmp, max_turns=10),
+                brain=RuleBasedBrain(),
+            )
+            weixin_state_dir = os.path.join(tmp, "weixin")
+            save_weixin_account(
+                weixin_state_dir,
+                account_id="wx-account-runtime",
+                token="wx-secret-runtime",
+                base_url="https://ilinkai.weixin.qq.com",
+                user_id="wx-user-runtime",
+            )
+            gateway.register_adapter(WeixinAdapter(state_dir=weixin_state_dir, account_id="wx-account-runtime"))
+            save_weixin_transport_state(
+                weixin_state_dir,
+                "wx-account-runtime",
+                {
+                    "mode": "polling",
+                    "status": "polling_idle",
+                    "connected": True,
+                    "last_error": "",
+                    "last_poll_outcome": "empty",
+                    "last_poll_at": "2026-04-20T10:00:00Z",
+                    "last_getupdates_at": "2026-04-20T10:00:00Z",
+                    "last_getupdates_buf": "cursor-runtime",
+                    "last_getupdates_count": 0,
+                    "last_private_text_message_count": 0,
+                    "last_getupdates_message_ids": [],
+                    "last_getupdates_private_message_ids": [],
+                    "last_getupdates_error": "",
+                    "last_context_token_at": "",
+                    "last_send_at": "",
+                    "last_send_chunk_count": 0,
+                    "last_send_status": "",
+                    "last_send_error": "",
+                    "last_send_retryable": False,
+                    "last_send_provider_message_id": "",
+                    "last_send_context_token_used": False,
+                    "last_inbound_at": "",
+                    "last_inbound_message_id": "",
+                    "last_inbound_chat_id": "",
+                },
+            )
+            setup_portal = SetupPortalService(
+                gateway=gateway,
+                store=FileSetupPortalStore(tmp),
+                bind_host="127.0.0.1",
+                bind_port=0,
+                weixin_state_dir=weixin_state_dir,
+            )
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(gateway, setup_portal))
+            setup_portal.bind_port = server.server_port
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with request.urlopen(f"http://127.0.0.1:{server.server_port}/api/setup/status", timeout=5) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+
+                self.assertTrue(data["weixin"]["configured"])
+                self.assertTrue(data["weixin"]["connected"])
+                self.assertEqual(data["weixin"]["status"], "polling_idle")
+                self.assertEqual(data["weixin"]["blocker_category"], "getupdates")
+                self.assertEqual(
+                    data["weixin"]["ingress_observability"]["blocked_reason"],
+                    "waiting_for_private_text",
+                )
+                weixin_channel = next(
+                    channel for channel in data["gateway_status"]["channels"] if channel["platform"] == "weixin"
+                )
+                self.assertTrue(weixin_channel["connected"])
+                self.assertEqual(weixin_channel["transport"]["status"], "polling_idle")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -382,6 +566,14 @@ class NotificationServerTests(unittest.TestCase):
                 store=FileSessionStore(tmp, max_turns=10),
                 brain=RuleBasedBrain(),
             )
+            save_weixin_account(
+                tmp,
+                account_id="wx-account-2",
+                token="wx-secret-2",
+                base_url="https://ilinkai.weixin.qq.com",
+                user_id="wx-user-2",
+            )
+            gateway.register_adapter(WeixinAdapter(state_dir=tmp, account_id="wx-account-2"))
             gateway.register_adapter(
                 FeishuAdapter(
                     FeishuSettings(
@@ -399,6 +591,78 @@ class NotificationServerTests(unittest.TestCase):
                     connected=False,
                     last_error="app_secret=secret_status_456 authorization=Bearer token_status_789",
                 )
+            if isinstance(feishu_adapter, FeishuAdapter):
+                fake_delivery_response = {
+                    "platform": "feishu",
+                    "chat_id": "room-status",
+                    "text": "status reply",
+                    "timestamp": "2026-04-19T00:00:00Z",
+                    "sent": True,
+                    "message_id": "provider_msg_status",
+                    "provider_message_id": "provider_msg_status",
+                }
+                with patch.object(feishu_adapter, "send_outbound", return_value=fake_delivery_response):
+                    gateway.handle_inbound(
+                        "feishu",
+                        {
+                            "chat_id": "room-status",
+                            "user_id": "ou_status_user",
+                            "text": "hello status",
+                            "message_id": "msg-status-1",
+                            "chat_type": "p2p",
+                        },
+                    )
+                    route_key = str(gateway.store.load_metadata("feishu", "room-status")["route_key"])
+                    gateway.handle_notification_delivery(
+                        {
+                            "notification_id": "notif-status-1",
+                            "trace_id": "trace-status-1",
+                            "destination": {
+                                "kind": "conversation",
+                                "route_key": route_key,
+                            },
+                            "content": {
+                                "title": "Status",
+                                "body": "source bound",
+                                "payload_format": "plain_text",
+                                "structured_payload": {},
+                                "attachments": [],
+                            },
+                            "delivery": {
+                                "mode": "send",
+                                "reply_to_message_id": "",
+                                "update_message_id": "",
+                                "idempotency_key": "idem-status-source",
+                            },
+                        }
+                    )
+                    gateway.handle_notification_delivery(
+                        {
+                            "notification_id": "notif-status-2",
+                            "trace_id": "trace-status-2",
+                            "destination": {
+                                "kind": "conversation",
+                                "platform": "feishu",
+                                "recipient": {
+                                    "recipient_id": "oc_status_user",
+                                    "recipient_type": "open_id",
+                                },
+                            },
+                            "content": {
+                                "title": "Status",
+                                "body": "proactive",
+                                "payload_format": "plain_text",
+                                "structured_payload": {},
+                                "attachments": [],
+                            },
+                            "delivery": {
+                                "mode": "send",
+                                "reply_to_message_id": "",
+                                "update_message_id": "",
+                                "idempotency_key": "idem-status-proactive",
+                            },
+                        }
+                    )
             setup_portal = SetupPortalService(
                 gateway=gateway,
                 store=FileSetupPortalStore(tmp),
@@ -425,8 +689,16 @@ class NotificationServerTests(unittest.TestCase):
 
                 self.assertTrue(data["ok"])
                 self.assertEqual(data["gateway_version"], "0.1.0")
-                self.assertEqual(len(data["channels"]), 1)
-                channel = data["channels"][0]
+                self.assertEqual(
+                    data["gateway_base_url"],
+                    f"http://127.0.0.1:{server.server_port}",
+                )
+                self.assertEqual(
+                    data["manage_url"],
+                    f"http://127.0.0.1:{server.server_port}/admin/im",
+                )
+                self.assertEqual(len(data["channels"]), 2)
+                channel = next(item for item in data["channels"] if item["platform"] == "feishu")
                 self.assertEqual(channel["platform"], "feishu")
                 self.assertTrue(channel["enabled"])
                 self.assertFalse(channel["connected"])
@@ -436,9 +708,67 @@ class NotificationServerTests(unittest.TestCase):
                 self.assertFalse(channel["capabilities"]["attachments"])
                 self.assertEqual(channel["transport"]["status"], "error")
                 self.assertIn("[REDACTED]", channel["transport"]["last_error"])
+                weixin_channel = next(item for item in data["channels"] if item["platform"] == "weixin")
+                self.assertEqual(weixin_channel["display_name"], "Weixin")
+                delivery_observability = data["delivery_observability"]
+                self.assertEqual(delivery_observability["record_count"], 2)
+                self.assertEqual(delivery_observability["source_bound_count"], 1)
+                self.assertEqual(delivery_observability["proactive_count"], 1)
+                self.assertEqual(delivery_observability["sent_count"], 2)
+                self.assertEqual(delivery_observability["queue_state_counts"]["complete"], 2)
+                self.assertEqual(delivery_observability["route_mode_counts"]["source_bound"], 1)
+                self.assertEqual(delivery_observability["route_mode_counts"]["proactive"], 1)
+                self.assertEqual(
+                    delivery_observability["route_mode_breakdown"]["source_bound"]["queue_state_counts"]["complete"],
+                    1,
+                )
+                self.assertEqual(
+                    delivery_observability["route_mode_breakdown"]["proactive"]["queue_state_counts"]["complete"],
+                    1,
+                )
+                self.assertEqual(
+                    delivery_observability["route_mode_breakdown"]["source_bound"]["failure_class_counts"],
+                    {},
+                )
+                self.assertEqual(
+                    delivery_observability["route_mode_breakdown"]["proactive"]["failure_class_counts"],
+                    {},
+                )
                 response_text = json.dumps(data, ensure_ascii=False)
                 self.assertNotIn("secret_status_456", response_text)
                 self.assertNotIn("cli_status_123", response_text)
+                self.assertNotIn("wx-secret-2", response_text)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_admin_im_alias_renders_setup_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gateway = GatewayService(
+                store=FileSessionStore(tmp, max_turns=10),
+                brain=RuleBasedBrain(),
+            )
+            setup_portal = SetupPortalService(
+                gateway=gateway,
+                store=FileSetupPortalStore(tmp),
+                bind_host="127.0.0.1",
+                bind_port=0,
+            )
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(gateway, setup_portal))
+            setup_portal.bind_port = server.server_port
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/admin/im",
+                    timeout=5,
+                ) as response:
+                    body = response.read().decode("utf-8")
+
+                self.assertEqual(response.status, 200)
+                self.assertIn("Feishu 手机配置页", body)
             finally:
                 server.shutdown()
                 server.server_close()

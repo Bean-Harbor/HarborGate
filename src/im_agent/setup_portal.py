@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import socket
 import threading
@@ -17,6 +18,11 @@ except ImportError:  # pragma: no cover - optional runtime dependency fallback
 from im_agent import __version__
 from im_agent.gateway import GatewayService
 from im_agent.platforms.feishu import FeishuAdapter, FeishuSettings
+from im_agent.platforms.weixin import (
+    WeixinAdapter,
+    load_weixin_account,
+    load_weixin_transport_state,
+)
 
 
 def _now_utc() -> str:
@@ -139,12 +145,16 @@ class SetupPortalService:
         bind_host: str,
         bind_port: int,
         public_origin: str = "",
+        weixin_state_dir: str | Path | None = None,
+        runtime_root: str | Path | None = None,
     ) -> None:
         self.gateway = gateway
         self.store = store
         self.bind_host = bind_host
         self.bind_port = bind_port
         self.public_origin = public_origin.strip().rstrip("/")
+        self.weixin_state_dir = Path(weixin_state_dir or Path(store.root) / "weixin")
+        self.runtime_root = Path(runtime_root or Path(store.root) / "runtime")
 
     def bootstrap(self) -> None:
         feishu_state = self.store.load_state().get("feishu") or {}
@@ -167,6 +177,315 @@ class SetupPortalService:
             bot_user_id=str(feishu_state.get("bot_user_id") or "").strip(),
         )
         adapter.apply_settings(settings)
+        self._bootstrap_weixin_adapter()
+
+    def _bootstrap_weixin_adapter(self) -> None:
+        record = self._discover_weixin_account_state()
+        if not record:
+            return
+        account_id = str(record.get("account_id") or "").strip()
+        token = str(record.get("token") or "").strip()
+        if not (account_id and token):
+            return
+        base_url = str(record.get("base_url") or "").strip() or None
+        existing = self.gateway.get_adapter("weixin")
+        if isinstance(existing, WeixinAdapter) and existing.configured:
+            return
+        self.gateway.register_adapter(
+            WeixinAdapter(
+                state_dir=self.weixin_state_dir,
+                account_id=account_id,
+                token=token,
+                base_url=base_url,
+            )
+        )
+
+    def _discover_weixin_account_state(self) -> dict[str, Any]:
+        env_account_id = os.getenv("WEIXIN_ACCOUNT_ID", "").strip()
+        if env_account_id:
+            record = load_weixin_account(self.weixin_state_dir, env_account_id)
+            if isinstance(record, dict):
+                return record
+
+        accounts_dir = Path(self.weixin_state_dir) / "accounts"
+        if not accounts_dir.exists():
+            return {}
+
+        ignored_suffixes = (".sync.json", ".context_tokens.json", ".processed_messages.json", ".runtime.json")
+        for path in sorted(accounts_dir.glob("*.json")):
+            if any(path.name.endswith(suffix) for suffix in ignored_suffixes):
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return {}
+
+    def _discover_latest_json_report(self, report_path: Path) -> dict[str, Any]:
+        if not report_path.exists():
+            return {}
+        if report_path.is_file():
+            try:
+                payload = json.loads(report_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                return {}
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                payload["_report_path"] = str(report_path)
+                return payload
+            return {}
+        candidates = sorted(
+            (path for path in report_path.glob("*.json") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                payload["_report_path"] = str(path)
+                return payload
+        return {}
+
+    def _discover_latest_platform_live_gate_report(self) -> dict[str, Any]:
+        for candidate in (
+            self.runtime_root / "platform-live-gate",
+            self.store.root / "platform-live-gate",
+        ):
+            payload = self._discover_latest_json_report(candidate)
+            if payload:
+                return payload
+        return {}
+
+    def _discover_latest_weixin_ingress_probe(self) -> dict[str, Any]:
+        for candidate in (
+            self.runtime_root / "weixin-ingress-probe",
+            self.runtime_root / "weixin-ingress-probe-live.json",
+            self.store.root / "weixin-ingress-probe",
+            self.store.root / "weixin-ingress-probe-live.json",
+        ):
+            payload = self._discover_latest_json_report(candidate)
+            if payload:
+                return payload
+        return {}
+
+    def _effective_weixin_transport(
+        self,
+        *,
+        adapter: WeixinAdapter,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        transport = adapter.transport_status() if hasattr(adapter, "transport_status") else {}
+        transport = dict(transport) if isinstance(transport, dict) else {}
+        account_id = str(record.get("account_id") or getattr(adapter, "account_id", "") or "").strip()
+        if account_id:
+            persisted = load_weixin_transport_state(self.weixin_state_dir, account_id)
+            if isinstance(persisted, dict):
+                transport.update(persisted)
+                transport["mode"] = str(transport.get("mode") or "polling").strip() or "polling"
+
+        configured = bool(adapter.configured or record)
+        if configured and not bool(transport.get("connected")):
+            status = str(transport.get("status") or "").strip().lower()
+            last_poll_outcome = str(transport.get("last_poll_outcome") or "").strip().lower()
+            if last_poll_outcome in {"idle_timeout", "empty", "messages"}:
+                transport["connected"] = True
+                if not status or status == "polling":
+                    transport["status"] = "polling_idle"
+            elif status == "polling" and (
+                str(transport.get("last_poll_at") or "").strip()
+                or str(transport.get("last_getupdates_at") or "").strip()
+            ):
+                # Long-poll can legitimately stay "polling" while the transport is healthy.
+                transport["connected"] = True
+        return transport
+
+    @staticmethod
+    def _release_v1_delivery_policy() -> dict[str, str]:
+        return {
+            "interactive_reply": "source_bound",
+            "proactive_delivery": "user-default-configured",
+        }
+
+    def _summarize_release_v1_status(
+        self,
+        *,
+        feishu_ready: bool,
+        weixin_ready: bool,
+        parity_ready: bool,
+        decision: str,
+        decision_reason: str,
+        weixin_blocker_category: str,
+        delivery_health: dict[str, Any],
+        latest_live_gate_report: dict[str, Any],
+        ingress_proof: dict[str, Any],
+    ) -> dict[str, Any]:
+        source_bound_health = delivery_health.get("source_bound") if isinstance(delivery_health, dict) else {}
+        source_bound_health = source_bound_health if isinstance(source_bound_health, dict) else {}
+        proactive_health = delivery_health.get("proactive") if isinstance(delivery_health, dict) else {}
+        proactive_health = proactive_health if isinstance(proactive_health, dict) else {}
+        return {
+            "delivery_policy": self._release_v1_delivery_policy(),
+            "feishu_rehearsal_ready": bool(feishu_ready),
+            "weixin_rehearsal_ready": bool(weixin_ready),
+            "parity_ready": bool(parity_ready),
+            "dual_surface_ready": bool(parity_ready),
+            "decision": decision,
+            "decision_reason": decision_reason,
+            "weixin_blocker_category": weixin_blocker_category,
+            "delivery_health": dict(delivery_health),
+            "source_bound_delivery_health": dict(source_bound_health),
+            "proactive_delivery_health": dict(proactive_health),
+            "latest_platform_live_gate_report_path": str(latest_live_gate_report.get("_report_path") or ""),
+            "weixin_ingress_proof": dict(ingress_proof),
+            "release_v1_ready": bool(
+                parity_ready
+                and bool(source_bound_health.get("ready"))
+                and bool(proactive_health.get("ready"))
+            ),
+        }
+
+    def _build_weixin_status_payload(self, *, request_host: str = "") -> dict[str, Any]:
+        record = self._discover_weixin_account_state()
+        adapter = self.gateway.get_adapter("weixin")
+        if not isinstance(adapter, WeixinAdapter):
+            if record:
+                account_id = str(record.get("account_id") or "").strip()
+                token = str(record.get("token") or "").strip()
+                adapter = WeixinAdapter(
+                    state_dir=self.weixin_state_dir,
+                    account_id=account_id,
+                    token=token,
+                    base_url=str(record.get("base_url") or "").strip() or None,
+                )
+            else:
+                adapter = WeixinAdapter(state_dir=self.weixin_state_dir)
+
+        accounts_dir = Path(self.weixin_state_dir) / "accounts"
+        context_token_count = 0
+        if record:
+            account_id = str(record.get("account_id") or "").strip()
+            safe_account_id = account_id.replace("/", "_").replace("\\", "_")
+            context_path = accounts_dir / f"{safe_account_id}.context_tokens.json"
+            if context_path.exists():
+                try:
+                    context_data = json.loads(context_path.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    context_data = {}
+                if isinstance(context_data, dict):
+                    context_token_count = sum(1 for value in context_data.values() if str(value or "").strip())
+
+        transport = self._effective_weixin_transport(adapter=adapter, record=record)
+        configured = bool(adapter.configured or record)
+        account_id = str(record.get("account_id") or getattr(adapter, "account_id", "") or "").strip()
+        base_url = str(record.get("base_url") or getattr(adapter, "base_url", "") or "").strip()
+        user_id = str(record.get("user_id") or getattr(adapter, "user_id", "") or "").strip()
+        last_send_status = str(transport.get("last_send_status") or "").strip().lower()
+        ingress_proof = self._discover_latest_weixin_ingress_probe()
+        if not ingress_proof:
+            provider_private_text_count = int(transport.get("last_private_text_message_count") or 0)
+            provider_private_text_seen = bool(
+                provider_private_text_count > 0 or str(transport.get("last_inbound_message_id") or "").strip()
+            )
+            synthesized_blocked_reason = ""
+            if configured and not provider_private_text_seen:
+                synthesized_blocked_reason = "waiting_for_private_text"
+            ingress_proof = {
+                "provider_private_text_seen": provider_private_text_seen,
+                "provider_private_text_count": provider_private_text_count,
+                "blocked_reason": synthesized_blocked_reason,
+                "transport": {
+                    "status": str(transport.get("status") or "").strip(),
+                    "connected": bool(transport.get("connected")),
+                    "last_poll_outcome": str(transport.get("last_poll_outcome") or "").strip(),
+                    "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
+                "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
+            },
+        }
+        blocker_category = "account_restore"
+        if configured:
+            poll_status = str(transport.get("status") or "").strip().lower()
+            ingress_blocked_reason = str(ingress_proof.get("blocked_reason") or "").strip().lower()
+            provider_private_text_seen = bool(ingress_proof.get("provider_private_text_seen"))
+            if poll_status in {"error", "timeout"}:
+                blocker_category = "getupdates"
+            elif not bool(transport.get("connected")):
+                blocker_category = "getupdates"
+            elif ingress_blocked_reason == "waiting_for_private_text" or not provider_private_text_seen:
+                blocker_category = "getupdates"
+            elif context_token_count <= 0:
+                blocker_category = "context_token_send"
+            elif last_send_status in {"failed", "send_failed", "error"}:
+                blocker_category = "context_token_send"
+            else:
+                blocker_category = ""
+        ingress_observability = {
+            "poll_status": str(transport.get("status") or "").strip(),
+            "last_poll_outcome": str(transport.get("last_poll_outcome") or "").strip(),
+            "connected": bool(transport.get("connected")),
+            "last_poll_at": str(transport.get("last_poll_at") or "").strip(),
+            "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
+            "last_getupdates_buf": str(transport.get("last_getupdates_buf") or "").strip(),
+            "last_getupdates_count": int(transport.get("last_getupdates_count") or 0),
+            "last_private_text_message_count": int(transport.get("last_private_text_message_count") or 0),
+            "last_getupdates_message_ids": list(transport.get("last_getupdates_message_ids") or []),
+            "last_getupdates_private_message_ids": list(transport.get("last_getupdates_private_message_ids") or []),
+            "last_getupdates_error": str(transport.get("last_getupdates_error") or "").strip(),
+            "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
+            "last_inbound_message_id": str(transport.get("last_inbound_message_id") or "").strip(),
+            "last_inbound_chat_id": str(transport.get("last_inbound_chat_id") or "").strip(),
+            "provider_private_text_seen": bool(ingress_proof.get("provider_private_text_seen")),
+            "provider_private_text_count": int(ingress_proof.get("provider_private_text_count") or 0),
+            "blocked_reason": str(ingress_proof.get("blocked_reason") or "").strip(),
+            "report_path": str(ingress_proof.get("_report_path") or "").strip(),
+        }
+        outbound_observability = {
+            "last_send_at": str(transport.get("last_send_at") or "").strip(),
+            "last_send_status": last_send_status,
+            "last_send_chunk_count": int(transport.get("last_send_chunk_count") or 0),
+            "last_send_retryable": bool(transport.get("last_send_retryable")),
+            "last_send_provider_message_id": str(transport.get("last_send_provider_message_id") or "").strip(),
+            "last_send_context_token_used": bool(transport.get("last_send_context_token_used")),
+            "last_send_error": str(transport.get("last_send_error") or "").strip(),
+        }
+
+        return {
+            "configured": configured,
+            "account_id": account_id,
+            "account_id_masked": _mask_secret(account_id) if account_id else "",
+            "base_url": base_url,
+            "user_id": user_id,
+            "user_id_masked": _mask_secret(user_id) if user_id else "",
+            "status": str(transport.get("status") or ("waiting_for_credentials" if not configured else "polling_idle")).strip(),
+            "connected": bool(transport.get("connected")),
+            "blocker_category": blocker_category,
+            "poll": {
+                "status": str(transport.get("status") or "").strip(),
+                "outcome": str(transport.get("last_poll_outcome") or "").strip(),
+                "last_poll_at": str(transport.get("last_poll_at") or "").strip(),
+                "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
+                "last_getupdates_buf": str(transport.get("last_getupdates_buf") or "").strip(),
+                "last_getupdates_count": int(transport.get("last_getupdates_count") or 0),
+                "last_private_text_message_count": int(transport.get("last_private_text_message_count") or 0),
+            },
+            "context_token_count": context_token_count,
+            "last_context_token_at": str(transport.get("last_context_token_at") or "").strip(),
+            "last_send_at": str(transport.get("last_send_at") or "").strip(),
+            "last_send_chunk_count": int(transport.get("last_send_chunk_count") or 0),
+            "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
+            "last_inbound_message_id": str(transport.get("last_inbound_message_id") or "").strip(),
+            "last_inbound_chat_id": str(transport.get("last_inbound_chat_id") or "").strip(),
+            "last_error": str(transport.get("last_error") or "").strip(),
+            "ingress_proof": ingress_proof,
+            "ingress_observability": ingress_observability,
+            "delivery_observability": outbound_observability,
+            "transport_mode": "polling",
+        }
 
     def ensure_feishu_adapter(self) -> FeishuAdapter:
         adapter = self.gateway.get_adapter("feishu")
@@ -182,6 +501,31 @@ class SetupPortalService:
         feishu_state = state.get("feishu") or {}
         if not isinstance(feishu_state, dict):
             feishu_state = {}
+        self._bootstrap_weixin_adapter()
+        weixin = self._build_weixin_status_payload(request_host=request_host)
+        gateway_status = self.build_gateway_status_payload(request_host=request_host)
+        delivery_health = self.gateway.store.summarize_delivery_health()
+        live_gate_report = self._discover_latest_platform_live_gate_report()
+        release_v1 = self._summarize_release_v1_status(
+            feishu_ready=bool(
+                bool(feishu_state.get("app_id"))
+                and bool(feishu_state.get("app_secret") or adapter.settings.app_secret)
+                and bool(adapter.transport_status().get("connected"))
+            ),
+            weixin_ready=bool(weixin.get("configured")) and not bool(weixin.get("blocker_category")),
+            parity_ready=bool(gateway_status.get("release_v1", {}).get("parity_ready")),
+            decision=str(live_gate_report.get("decision") or gateway_status.get("release_v1", {}).get("decision") or "").strip(),
+            decision_reason=str(live_gate_report.get("decision_reason") or gateway_status.get("release_v1", {}).get("decision_reason") or "").strip(),
+            weixin_blocker_category=str(
+                weixin.get("ingress_blocker_category")
+                or weixin.get("blocker_category")
+                or weixin.get("blocked_reason")
+                or ""
+            ).strip(),
+            delivery_health=delivery_health,
+            latest_live_gate_report=live_gate_report,
+            ingress_proof=weixin.get("ingress_proof") if isinstance(weixin.get("ingress_proof"), dict) else {},
+        )
 
         origin = self.resolve_public_origin(request_host=request_host)
         session_code = str(state.get("session_code") or "")
@@ -226,30 +570,50 @@ class SetupPortalService:
                     str(feishu_state.get("verification_token") or adapter.settings.verification_token or "").strip()
                 ),
             },
+            "weixin": weixin,
+            "gateway_status": gateway_status,
+            "channels": gateway_status.get("channels", []),
+            "delivery_policy": self._release_v1_delivery_policy(),
+            "delivery_health": delivery_health,
+            "release_v1": release_v1,
         }
 
-    def build_gateway_status_payload(self) -> dict[str, Any]:
+    def build_gateway_status_payload(self, *, request_host: str = "") -> dict[str, Any]:
+        origin = self.resolve_public_origin(request_host=request_host)
         channels: list[dict[str, Any]] = []
+        weixin_record = self._discover_weixin_account_state()
         for adapter_name, adapter in self.gateway._adapters.items():
-            transport = adapter.transport_status() if hasattr(adapter, "transport_status") else {}
-            transport = transport if isinstance(transport, dict) else {}
+            if isinstance(adapter, WeixinAdapter):
+                transport = self._effective_weixin_transport(adapter=adapter, record=weixin_record)
+            else:
+                transport = adapter.transport_status() if hasattr(adapter, "transport_status") else {}
+                transport = transport if isinstance(transport, dict) else {}
+            profile = adapter.get_profile() if hasattr(adapter, "get_profile") else {}
+            profile = profile if isinstance(profile, dict) else {}
             adapter_settings = getattr(adapter, "settings", None)
             transport_mode = str(
                 transport.get("mode")
+                or profile.get("transport_mode")
                 or getattr(adapter_settings, "connection_mode", "")
                 or ""
             ).strip()
             channel = {
                 "platform": str(getattr(adapter, "name", adapter_name) or adapter_name).strip(),
-                "enabled": bool(getattr(adapter, "configured", True)),
+                "enabled": True,
                 "connected": bool(transport.get("connected")),
                 "display_name": "",
+                "surface_family": str(profile.get("surface_family") or "").strip(),
+                "placeholder": bool(profile.get("placeholder")),
                 "capabilities": {
-                    "reply": False,
-                    "update": False,
-                    "attachments": False,
+                    "reply": bool(profile.get("supports_replies")),
+                    "update": bool(profile.get("supports_updates")),
+                    "attachments": bool(profile.get("supports_attachments")),
                 },
             }
+            configured_attr = getattr(adapter, "configured", True)
+            channel["enabled"] = bool(configured_attr) or bool(
+                profile.get("placeholder")
+            )
             channel["transport"] = {
                 "mode": transport_mode,
                 "status": str(transport.get("status") or "").strip(),
@@ -269,18 +633,51 @@ class SetupPortalService:
             elif adapter_name == "webhook":
                 channel["display_name"] = "Webhook"
             else:
-                channel["display_name"] = str(getattr(adapter, "name", adapter_name) or adapter_name).strip().title()
+                channel["display_name"] = (
+                    str(profile.get("display_name") or "")
+                    or str(getattr(adapter, "name", adapter_name) or adapter_name).strip().title()
+                )
             channels.append(channel)
+
+        delivery_observability = self.gateway.store.summarize_delivery_records()
+        delivery_health = self.gateway.store.summarize_delivery_health()
+        live_gate_report = self._discover_latest_platform_live_gate_report()
+        release_v1 = self._summarize_release_v1_status(
+            feishu_ready=any(
+                bool(channel.get("connected")) and str(channel.get("platform") or "").lower() == "feishu"
+                for channel in channels
+            ),
+            weixin_ready=any(
+                bool(channel.get("connected")) and str(channel.get("platform") or "").lower() == "weixin"
+                for channel in channels
+            ),
+            parity_ready=bool(live_gate_report.get("parity_ready")),
+            decision=str(live_gate_report.get("decision") or "").strip(),
+            decision_reason=str(live_gate_report.get("decision_reason") or "").strip(),
+            weixin_blocker_category=str(live_gate_report.get("weixin_blocker_category") or "").strip(),
+            delivery_health=delivery_health,
+            latest_live_gate_report=live_gate_report,
+            ingress_proof=self._discover_latest_weixin_ingress_probe(),
+        )
 
         return {
             "ok": True,
             "gateway_version": __version__,
+            "gateway_base_url": origin,
+            "manage_url": f"{origin}/admin/im",
             "channels": channels,
+            "delivery_observability": delivery_observability,
+            "delivery_health": delivery_health,
+            "delivery_policy": self._release_v1_delivery_policy(),
+            "release_v1": release_v1,
         }
 
     def build_setup_page(self, *, request_host: str = "") -> str:
         status = self.build_status_payload(request_host=request_host)
         feishu = status["feishu"]
+        weixin = status["weixin"]
+        gateway_status = status["gateway_status"] if isinstance(status.get("gateway_status"), dict) else {}
+        gateway_channels = gateway_status.get("channels") if isinstance(gateway_status, dict) else []
         setup_url = _html_escape(str(status["setup_url"]))
         qr_path = _html_escape("/setup/qr.svg")
         session_code = _html_escape(str(status["session_code"]))
@@ -304,6 +701,30 @@ class SetupPortalService:
                 '<p class="hint err">当前二维码链接看起来仍然是本机回环地址。'
                 '如果手机扫不开，请用 IM_AGENT_HOST=0.0.0.0 启动，或设置 IM_AGENT_PUBLIC_ORIGIN。</p>'
             )
+        gateway_rows = ""
+        if isinstance(gateway_channels, list):
+            for channel in gateway_channels:
+                if not isinstance(channel, dict):
+                    continue
+                platform = _html_escape(str(channel.get("platform") or ""))
+                display_name = _html_escape(str(channel.get("display_name") or ""))
+                connected = "yes" if bool(channel.get("connected")) else "no"
+                transport = channel.get("transport") if isinstance(channel.get("transport"), dict) else {}
+                transport_status = _html_escape(str(transport.get("status") or ""))
+                surface_family = _html_escape(str(channel.get("surface_family") or ""))
+                gateway_rows += (
+                    f'<div><strong>{platform or "unknown"}</strong>'
+                    f' <span class="hint">({display_name or "未命名"} / {surface_family or "unknown"})</span>'
+                    f'<br /><span class="hint">connected={connected}, transport={transport_status or "unknown"}</span></div>'
+                )
+        gateway_version = _html_escape(str(gateway_status.get("gateway_version") or __version__))
+        release_v1 = status.get("release_v1") if isinstance(status.get("release_v1"), dict) else {}
+        release_decision = _html_escape(str(release_v1.get("decision") or ""))
+        release_reason = _html_escape(str(release_v1.get("decision_reason") or ""))
+        source_bound_health = release_v1.get("source_bound_delivery_health") if isinstance(release_v1.get("source_bound_delivery_health"), dict) else {}
+        proactive_health = release_v1.get("proactive_delivery_health") if isinstance(release_v1.get("proactive_delivery_health"), dict) else {}
+        source_bound_health_state = _html_escape(str(source_bound_health.get("health_state") or "unknown"))
+        proactive_health_state = _html_escape(str(proactive_health.get("health_state") or "unknown"))
         return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -357,6 +778,34 @@ class SetupPortalService:
       <button id="submit-btn">验证并应用 Feishu 配置</button>
       <p class="hint">当前 starter 会先验证凭证，再把配置写入本地状态文件，并默认启用 live send + 飞书长连接收消息。</p>
       <p id="result" class="hint"></p>
+    </div>
+    <div class="card" style="margin-top: 18px;">
+      <div class="meta">HarborGate · Weixin 状态</div>
+      <h2 style="margin: 0 0 8px; font-size: 20px;">Weixin parity / getupdates</h2>
+      <p>Weixin 仍然通过 QR 登录和 getupdates 长轮询运行。这个卡片只展示已脱敏状态，方便 HarborDesk 在同一页里看 setup、gateway 和 ingress 健康度。</p>
+      <div class="status">
+        <div><strong>连接状态：</strong>{_html_escape(str(weixin["status"]))}</div>
+        <div><strong>账号状态：</strong>{_html_escape(str(weixin["account_id_masked"] or "未配置"))}</div>
+        <div><strong>账号恢复：</strong>{_html_escape(str(weixin["blocker_category"] or "ready"))}</div>
+        <div><strong>最近 getupdates：</strong>{_html_escape(str(weixin["poll"]["last_getupdates_at"] or "暂无"))}</div>
+        <div><strong>私聊消息：</strong>{_html_escape(str(weixin["poll"]["last_private_text_message_count"]))}</div>
+        <div><strong>context_token：</strong>{_html_escape(str(weixin["context_token_count"]))}</div>
+        <div><strong>ingress_observability：</strong>{_html_escape(str(weixin["ingress_observability"]["last_getupdates_count"]))} / {_html_escape(str(weixin["ingress_observability"]["last_inbound_message_id"] or "暂无"))}</div>
+        <div><strong>outbound_observability：</strong>{_html_escape(str(weixin["delivery_observability"]["last_send_status"] or "idle"))} / {_html_escape(str(weixin["delivery_observability"]["last_send_error"] or "无错误"))}</div>
+      </div>
+      <p class="hint">登录入口：<code>harborgate-weixin-login</code>。收消息入口：<code>harborgate-weixin-runner</code>。排查 ingress 时用 <code>harborgate-weixin-ingress-probe</code>；长轮询空闲会表现为 <code>idle_timeout</code>，这不再视为故障。</p>
+    </div>
+    <div class="card" style="margin-top: 18px;">
+      <div class="meta">HarborGate · Gateway 状态</div>
+      <h2 style="margin: 0 0 8px; font-size: 20px;">Redacted channel snapshot</h2>
+      <div class="status">
+        <div><strong>gateway_version：</strong>{gateway_version}</div>
+        <div><strong>channels：</strong>{len(gateway_channels) if isinstance(gateway_channels, list) else 0}</div>
+        <div><strong>release_v1：</strong>{release_decision or "unknown"}<span class="hint"> / {release_reason or "n/a"}</span></div>
+        <div><strong>source_bound_health：</strong>{source_bound_health_state}</div>
+        <div><strong>proactive_health：</strong>{proactive_health_state}</div>
+        {gateway_rows or '<div class="hint">当前还没有注册到网关的通道。</div>'}
+      </div>
     </div>
   </div>
   <script>

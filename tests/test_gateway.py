@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from im_agent.brain import RuleBasedBrain
 from im_agent.errors import GatewayContractError
@@ -7,7 +8,12 @@ from im_agent.gateway import GatewayService
 from im_agent.harborbeacon import TaskTurnResult
 from im_agent.models import InboundMessage, OutboundMessage
 from im_agent.platforms.base import PlatformAdapter
+from im_agent.platforms.placeholder import (
+    PlaceholderPlatformSpec,
+    build_placeholder_adapter,
+)
 from im_agent.platforms.webhook import WebhookAdapter
+from im_agent.platforms.weixin import WeixinAdapter, save_weixin_account
 from im_agent.session_store import FileSessionStore
 
 
@@ -63,11 +69,133 @@ class FakeReplayTaskClient:
         )
 
 
+class FakeHarborOsTaskClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._call_count = 0
+
+    def submit_turn(self, incoming, *, session_metadata=None):  # type: ignore[no-untyped-def]
+        metadata = dict(session_metadata or {})
+        self.calls.append({"incoming": incoming, "session_metadata": metadata})
+        self._call_count += 1
+        if self._call_count == 1:
+            return TaskTurnResult(
+                text="ssh restart requires approval",
+                task_id="task_harbor_restart",
+                trace_id="trace_harbor_restart",
+                status="needs_input",
+                route_key="gw_route_room1",
+                resume_token="resume_harbor_restart",
+                response_payload={
+                    "task_id": "task_harbor_restart",
+                    "trace_id": "trace_harbor_restart",
+                    "status": "needs_input",
+                    "prompt": "ssh restart requires approval",
+                    "result": {
+                        "message": "ssh restart requires approval",
+                        "data": {
+                            "approval_ticket": {
+                                "approval_id": "approval_harbor_restart_1",
+                                "policy_ref": "service.restart",
+                            }
+                        },
+                        "next_actions": ["approval_token approval_harbor_restart_1"],
+                    },
+                    "resume_token": "resume_harbor_restart",
+                },
+            )
+        return TaskTurnResult(
+            text="ssh is running.",
+            task_id="task_harbor_status",
+            trace_id="trace_harbor_status",
+            status="completed",
+            route_key="gw_route_room1",
+            response_payload={
+                "task_id": "task_harbor_status",
+                "trace_id": "trace_harbor_status",
+                "status": "completed",
+                "result": {
+                    "message": "ssh is running.",
+                    "data": {
+                        "domain": "service",
+                        "operation": "status",
+                        "executor_used": "middleware_api",
+                    },
+                },
+            },
+        )
+
+
+class FakeReplayHarborOsTaskClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def submit_turn(self, incoming, *, session_metadata=None):  # type: ignore[no-untyped-def]
+        metadata = dict(session_metadata or {})
+        self.calls.append({"incoming": incoming, "session_metadata": metadata})
+        if incoming.message_id == "wx-msg-1":
+            return TaskTurnResult(
+                text="restart ssh requires approval",
+                task_id="task_weixin_restart",
+                trace_id="trace_weixin_restart",
+                status="needs_input",
+                route_key="gw_route_weixin_room1",
+                resume_token="resume_weixin_restart",
+                response_payload={
+                    "task_id": "task_weixin_restart",
+                    "trace_id": "trace_weixin_restart",
+                    "status": "needs_input",
+                    "prompt": "restart ssh requires approval",
+                    "result": {
+                        "message": "restart ssh requires approval",
+                        "data": {
+                            "approval_ticket": {
+                                "approval_id": "approval_weixin_restart_1",
+                                "policy_ref": "service.restart",
+                            }
+                        },
+                        "next_actions": ["approval_token approval_weixin_restart_1"],
+                    },
+                    "resume_token": "resume_weixin_restart",
+                },
+            )
+        return TaskTurnResult(
+            text="ssh is running.",
+            task_id="task_weixin_status",
+            trace_id="trace_weixin_status",
+            status="completed",
+            route_key="gw_route_weixin_room1",
+            response_payload={
+                "task_id": "task_weixin_status",
+                "trace_id": "trace_weixin_status",
+                "status": "completed",
+                "result": {
+                    "message": "ssh is running.",
+                    "data": {
+                        "domain": "service",
+                        "operation": "status",
+                        "executor_used": "middleware_api",
+                    },
+                },
+            },
+        )
+
+
 class FakeDeliveryAdapter(WebhookAdapter):
     def send_outbound(self, outbound):  # type: ignore[no-untyped-def]
         payload = dict(super().send_outbound(outbound))
         payload["message_id"] = "provider_msg_123"
         payload["provider_message_id"] = "provider_msg_123"
+        return payload
+
+
+class FakeFeishuDeliveryAdapter(WebhookAdapter):
+    name = "feishu"
+
+    def send_outbound(self, outbound):  # type: ignore[no-untyped-def]
+        payload = dict(super().send_outbound(outbound))
+        payload["message_id"] = "feishu_provider_msg_123"
+        payload["provider_message_id"] = "feishu_provider_msg_123"
         return payload
 
 
@@ -186,6 +314,47 @@ class FakeSecondSurfaceAdapter(PlatformAdapter):
             "message_id": "wechat-lite-message-1",
             "metadata": dict(outbound.metadata),
         }
+
+
+class FakeNotificationTargetClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def upsert_notification_target(
+        self,
+        *,
+        label: str,
+        route_key: str,
+        platform_hint: str,
+        is_default: bool = False,
+        target_id: str | None = None,
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "label": label,
+                "route_key": route_key,
+                "platform_hint": platform_hint,
+                "is_default": is_default,
+                "target_id": target_id,
+            }
+        )
+        return {
+            "targets": [
+                {
+                    "target_id": "target-1",
+                    "label": label,
+                    "route_key": route_key,
+                    "platform_hint": platform_hint,
+                    "is_default": True,
+                }
+            ]
+        }
+
+
+class FailingNotificationTargetClient:
+    def upsert_notification_target(self, **kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        raise RuntimeError("admin api unavailable")
 
 
 class GatewayServiceTests(unittest.TestCase):
@@ -349,6 +518,316 @@ class GatewayServiceTests(unittest.TestCase):
             self.assertEqual(metadata["message_task_ids"]["msg-1"], "task_first")
             self.assertEqual(metadata["message_task_ids"]["msg-2"], "task_second")
 
+    def test_harboros_service_turn_preserves_resume_and_route_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_client = FakeHarborOsTaskClient()
+            store = FileSessionStore(tmp, max_turns=10)
+            gateway = GatewayService(
+                store=store,
+                brain=RuleBasedBrain(),
+                task_client=task_client,
+            )
+            gateway.register_adapter(WebhookAdapter())
+
+            first = gateway.handle_inbound(
+                "webhook",
+                {
+                    "platform": "feishu",
+                    "chat_id": "room-harbor-1",
+                    "user_id": "alice",
+                    "text": "restart ssh",
+                    "message_id": "msg-harbor-1",
+                    "intent": {"domain": "service", "action": "restart"},
+                    "args": {"service_name": "ssh"},
+                },
+            )
+            second = gateway.handle_inbound(
+                "webhook",
+                {
+                    "platform": "feishu",
+                    "chat_id": "room-harbor-1",
+                    "user_id": "alice",
+                    "text": "approval_token approval_harbor_restart_1",
+                    "message_id": "msg-harbor-2",
+                    "intent": {"domain": "service", "action": "restart"},
+                    "args": {
+                        "service_name": "ssh",
+                        "approval_token": "approval_harbor_restart_1",
+                    },
+                },
+            )
+
+            metadata = store.load_metadata("feishu", "room-harbor-1")
+            first_incoming = task_client.calls[0]["incoming"]
+            second_incoming = task_client.calls[1]["incoming"]
+
+            self.assertEqual(first["metadata"]["task_id"], "task_harbor_restart")
+            self.assertEqual(first["metadata"]["trace_id"], "trace_harbor_restart")
+            self.assertEqual(first["metadata"]["resume_token"], "resume_harbor_restart")
+            self.assertEqual(second["metadata"]["task_id"], "task_harbor_status")
+            self.assertEqual(second["metadata"]["trace_id"], "trace_harbor_status")
+            self.assertEqual(
+                task_client.calls[1]["session_metadata"]["resume_token"],
+                "resume_harbor_restart",
+            )
+            self.assertEqual(first_incoming.raw_payload["intent"]["domain"], "service")
+            self.assertEqual(first_incoming.raw_payload["intent"]["action"], "restart")
+            self.assertEqual(second_incoming.raw_payload["args"]["approval_token"], "approval_harbor_restart_1")
+            self.assertEqual(metadata["route_key"], "gw_route_room1")
+            self.assertEqual(metadata["last_task_id"], "task_harbor_status")
+            self.assertEqual(metadata["last_trace_id"], "trace_harbor_status")
+            self.assertNotIn("resume_token", metadata)
+
+    def test_harboros_notification_delivery_reuses_registered_route_without_contract_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_client = FakeHarborOsTaskClient()
+            store = FileSessionStore(tmp, max_turns=10)
+            gateway = GatewayService(
+                store=store,
+                brain=RuleBasedBrain(),
+                task_client=task_client,
+            )
+            gateway.register_adapter(FakeDeliveryAdapter())
+
+            first = gateway.handle_inbound(
+                "webhook",
+                {
+                    "platform": "feishu",
+                    "chat_id": "room-harbor-notify",
+                    "user_id": "alice",
+                    "text": "restart ssh",
+                    "message_id": "msg-harbor-notify-1",
+                    "intent": {"domain": "service", "action": "restart"},
+                    "args": {"service_name": "ssh"},
+                },
+            )
+            route_key = str(store.load_metadata("feishu", "room-harbor-notify")["route_key"])
+
+            payload = self._notification_payload(
+                route_key,
+                idempotency_key="idem-harbor-notify-1",
+                body="ssh restart completed",
+            )
+            payload["trace_id"] = "trace_harbor_notify"
+            delivery = gateway.handle_notification_delivery(payload)
+
+            self.assertEqual(first["metadata"]["route_key"], route_key)
+            self.assertTrue(delivery["ok"])
+            self.assertEqual(delivery["status"], "sent")
+            self.assertEqual(delivery["platform"], "feishu")
+            self.assertEqual(delivery["trace_id"], "trace_harbor_notify")
+            self.assertEqual(delivery["provider_message_id"], "provider_msg_123")
+            self.assertEqual(
+                store.load_metadata("feishu", "room-harbor-notify")["route_key"],
+                route_key,
+            )
+
+    def test_notification_delivery_supports_proactive_platform_and_recipient_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FileSessionStore(tmp, max_turns=10)
+            gateway = GatewayService(
+                store=store,
+                brain=RuleBasedBrain(),
+            )
+            gateway.register_adapter(FakeFeishuDeliveryAdapter())
+
+            payload = {
+                "notification_id": "notif-proactive-1",
+                "trace_id": "trace-proactive-1",
+                "destination": {
+                    "kind": "conversation",
+                    "platform": "feishu",
+                    "recipient": {
+                        "recipient_id": "oc_proactive_chat",
+                        "recipient_type": "open_id",
+                    },
+                },
+                "content": {
+                    "title": "Proactive",
+                    "body": "Fallback delivery",
+                    "payload_format": "plain_text",
+                    "structured_payload": {},
+                    "attachments": [],
+                },
+                "delivery": {
+                    "mode": "send",
+                    "reply_to_message_id": "",
+                    "update_message_id": "",
+                    "idempotency_key": "idem-proactive-1",
+                },
+            }
+
+            with self.assertLogs("im_agent.gateway", level="INFO") as logs:
+                delivery = gateway.handle_notification_delivery(payload)
+
+            summary = store.summarize_delivery_records()
+            joined = "\n".join(logs.output)
+            self.assertTrue(delivery["ok"])
+            self.assertEqual(delivery["platform"], "feishu")
+            self.assertEqual(delivery["provider_message_id"], "feishu_provider_msg_123")
+            self.assertIn('"route_mode": "proactive"', joined)
+            self.assertIn('"route_source": "recipient"', joined)
+            self.assertIn('"queue_state": "complete"', joined)
+            self.assertEqual(summary["record_count"], 1)
+            self.assertEqual(summary["proactive_count"], 1)
+            self.assertEqual(summary["source_bound_count"], 0)
+            self.assertEqual(summary["sent_count"], 1)
+            self.assertEqual(summary["queue_state_counts"]["complete"], 1)
+            self.assertEqual(summary["recent_deliveries"][0]["route_mode"], "proactive")
+            self.assertEqual(summary["recent_deliveries"][0]["queue_state"], "complete")
+            self.assertEqual(summary["route_mode_breakdown"]["proactive"]["queue_state_counts"]["complete"], 1)
+            self.assertEqual(summary["route_mode_breakdown"]["proactive"]["failure_class_counts"], {})
+
+    def test_weixin_private_dm_parity_track_preserves_resume_replay_and_route_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="wx-bot-1",
+                token="wx-secret",
+                base_url="https://example.com",
+                user_id="wx-self-1",
+            )
+            task_client = FakeReplayHarborOsTaskClient()
+            store = FileSessionStore(tmp, max_turns=10)
+            gateway = GatewayService(
+                store=store,
+                brain=RuleBasedBrain(),
+                task_client=task_client,
+            )
+            gateway.register_adapter(WeixinAdapter(state_dir=tmp, account_id="wx-bot-1"))
+
+            with patch("im_agent.platforms.weixin.post_json", return_value={}):
+                first = gateway.handle_inbound(
+                    "weixin",
+                    {
+                        "from_user_id": "wx-user-1",
+                "context_token": "ctx-weixin-parity",
+                        "msg_id": "wx-msg-1",
+                        "item_list": [{"type": 1, "text_item": {"text": "restart ssh"}}],
+                        "intent": {"domain": "service", "action": "restart"},
+                        "args": {"service_name": "ssh"},
+                    },
+                )
+                second = gateway.handle_inbound(
+                    "weixin",
+                    {
+                        "from_user_id": "wx-user-1",
+                "context_token": "ctx-weixin-parity",
+                        "msg_id": "wx-msg-2",
+                        "item_list": [
+                            {
+                                "type": 1,
+                                "text_item": {"text": "approval_token approval_weixin_restart_1"},
+                            }
+                        ],
+                        "intent": {"domain": "service", "action": "restart"},
+                        "args": {
+                            "service_name": "ssh",
+                            "approval_token": "approval_weixin_restart_1",
+                        },
+                    },
+                )
+                replay = gateway.handle_inbound(
+                    "weixin",
+                    {
+                        "from_user_id": "wx-user-1",
+                "context_token": "ctx-weixin-parity",
+                        "msg_id": "wx-msg-1",
+                        "item_list": [{"type": 1, "text_item": {"text": "restart ssh"}}],
+                        "intent": {"domain": "service", "action": "restart"},
+                        "args": {"service_name": "ssh"},
+                    },
+                )
+
+            metadata = store.load_metadata("weixin", "wx-user-1")
+
+            self.assertEqual(first["platform"], "weixin")
+            self.assertEqual(first["metadata"]["task_id"], "task_weixin_restart")
+            self.assertEqual(first["metadata"]["resume_token"], "resume_weixin_restart")
+            self.assertEqual(first["metadata"]["adapter_profile"]["surface_family"], "weixin")
+            self.assertEqual(first["metadata"]["adapter_profile"]["transport_mode"], "polling")
+            self.assertEqual(second["metadata"]["task_id"], "task_weixin_status")
+            self.assertEqual(second["metadata"]["trace_id"], "trace_weixin_status")
+            self.assertEqual(
+                task_client.calls[1]["session_metadata"]["resume_token"],
+                "resume_weixin_restart",
+            )
+            self.assertEqual(replay["metadata"]["task_id"], "task_weixin_restart")
+            self.assertEqual(replay["metadata"]["resume_token"], "resume_weixin_restart")
+            self.assertEqual(metadata["route_key"], "gw_route_weixin_room1")
+            self.assertEqual(metadata["last_task_id"], "task_weixin_status")
+            self.assertEqual(metadata["last_trace_id"], "trace_weixin_status")
+            self.assertEqual(metadata["last_message_id"], "wx-msg-2")
+            self.assertNotIn("resume_token", metadata)
+            self.assertEqual(metadata["message_task_ids"]["wx-msg-1"], "task_weixin_restart")
+            self.assertEqual(metadata["message_task_ids"]["wx-msg-2"], "task_weixin_status")
+
+    def test_weixin_notification_delivery_uses_cached_context_token_and_replays_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="wx-bot-1",
+                token="wx-secret",
+                base_url="https://example.com",
+                user_id="wx-self-1",
+            )
+            store = FileSessionStore(tmp, max_turns=10)
+            gateway = GatewayService(
+                store=store,
+                brain=RuleBasedBrain(),
+                task_client=FakeReplayHarborOsTaskClient(),
+            )
+            gateway.register_adapter(WeixinAdapter(state_dir=tmp, account_id="wx-bot-1"))
+
+            with patch("im_agent.platforms.weixin.post_json", return_value={}) as mocked_send:
+                gateway.handle_inbound(
+                    "weixin",
+                    {
+                        "from_user_id": "wx-user-1",
+                        "context_token": "ctx-weixin-notify",
+                        "msg_id": "wx-msg-1",
+                        "item_list": [{"type": 1, "text_item": {"text": "restart ssh"}}],
+                        "intent": {"domain": "service", "action": "restart"},
+                        "args": {"service_name": "ssh"},
+                    },
+                )
+                route_key = str(store.load_metadata("weixin", "wx-user-1")["route_key"])
+
+                payload = self._notification_payload(
+                    route_key,
+                    idempotency_key="idem-weixin-notify-1",
+                    body="ssh restart completed",
+                )
+                payload["trace_id"] = "trace-weixin-notify"
+                first_delivery = gateway.handle_notification_delivery(payload)
+                replay_delivery = gateway.handle_notification_delivery(payload)
+
+            self.assertEqual(mocked_send.call_count, 2)
+            first_send_payload = mocked_send.call_args_list[0].args[2]
+            notification_send_payload = mocked_send.call_args_list[1].args[2]
+            self.assertEqual(
+                first_send_payload["msg"]["context_token"],
+                "ctx-weixin-notify",
+            )
+            self.assertEqual(
+                notification_send_payload["msg"]["context_token"],
+                "ctx-weixin-notify",
+            )
+            self.assertEqual(
+                notification_send_payload["msg"]["to_user_id"],
+                "wx-user-1",
+            )
+            self.assertIn("ssh restart completed", notification_send_payload["msg"]["item_list"][0]["text_item"]["text"])
+            self.assertTrue(first_delivery["ok"])
+            self.assertEqual(first_delivery["status"], "sent")
+            self.assertEqual(first_delivery["platform"], "weixin")
+            self.assertIsNotNone(first_delivery["provider_message_id"])
+            self.assertEqual(first_delivery, replay_delivery)
+            transport = gateway.get_adapter("weixin").transport_status()
+            self.assertEqual(transport["last_send_status"], "sent")
+            self.assertTrue(transport["last_send_context_token_used"])
+            self.assertEqual(transport["last_send_error"], "")
+
     def test_notification_delivery_uses_registered_route_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = FileSessionStore(tmp, max_turns=10)
@@ -376,6 +855,81 @@ class GatewayServiceTests(unittest.TestCase):
             self.assertEqual(first["status"], "sent")
             self.assertEqual(first["platform"], "feishu")
             self.assertEqual(first, second)
+
+    def test_real_p2p_route_syncs_once_into_harborbeacon_notification_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FileSessionStore(tmp, max_turns=10)
+            target_client = FakeNotificationTargetClient()
+            gateway = GatewayService(
+                store=store,
+                brain=RuleBasedBrain(),
+                notification_target_client=target_client,
+            )
+            gateway.register_adapter(FakeFeishuDeliveryAdapter())
+
+            gateway.handle_inbound(
+                "feishu",
+                {
+                    "platform": "feishu",
+                    "chat_id": "oc_chat_1",
+                    "user_id": "ou_user_1",
+                    "text": "hello there",
+                    "message_id": "msg-target-1",
+                    "chat_type": "p2p",
+                },
+            )
+            gateway.handle_inbound(
+                "feishu",
+                {
+                    "platform": "feishu",
+                    "chat_id": "oc_chat_1",
+                    "user_id": "ou_user_1",
+                    "text": "still there?",
+                    "message_id": "msg-target-2",
+                    "chat_type": "p2p",
+                },
+            )
+
+            metadata = store.load_metadata("feishu", "oc_chat_1")
+            route_key = str(metadata["route_key"])
+            expected_label = f"Feishu DM {route_key[-6:]}"
+
+            self.assertEqual(len(target_client.calls), 1)
+            self.assertEqual(target_client.calls[0]["route_key"], route_key)
+            self.assertEqual(target_client.calls[0]["platform_hint"], "feishu")
+            self.assertEqual(target_client.calls[0]["label"], expected_label)
+            self.assertEqual(metadata["notification_target_synced_route_key"], route_key)
+            self.assertEqual(metadata["notification_target_label"], expected_label)
+
+    def test_notification_target_sync_failure_does_not_break_inbound_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FileSessionStore(tmp, max_turns=10)
+            gateway = GatewayService(
+                store=store,
+                brain=RuleBasedBrain(),
+                notification_target_client=FailingNotificationTargetClient(),
+            )
+            gateway.register_adapter(FakeFeishuDeliveryAdapter())
+
+            with self.assertLogs("im_agent.gateway", level="INFO") as logs:
+                response = gateway.handle_inbound(
+                    "feishu",
+                    {
+                        "platform": "feishu",
+                        "chat_id": "oc_chat_2",
+                        "user_id": "ou_user_2",
+                        "text": "hello failure path",
+                        "message_id": "msg-target-fail-1",
+                        "chat_type": "p2p",
+                    },
+                )
+
+            metadata = store.load_metadata("feishu", "oc_chat_2")
+            joined = "\n".join(logs.output)
+            self.assertEqual(response["chat_id"], "oc_chat_2")
+            self.assertNotIn("notification_target_synced_route_key", metadata)
+            self.assertIn('"event": "notification_target_sync_failed"', joined)
+            self.assertIn("admin api unavailable", joined)
 
     def test_notification_conflicting_idempotency_key_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -454,6 +1008,8 @@ class GatewayServiceTests(unittest.TestCase):
             self.assertIn('"notification_id": "notif-1"', joined)
             self.assertIn('"delivery.idempotency_key": "idem-logs"', joined)
             self.assertIn('"provider_message_id": "provider_msg_123"', joined)
+            self.assertIn('"route_mode": "source_bound"', joined)
+            self.assertIn('"queue_state": "complete"', joined)
 
     def test_retrieval_ingress_logs_attachment_summary_without_leaking_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -748,6 +1304,76 @@ class GatewayServiceTests(unittest.TestCase):
             self.assertEqual(response["metadata"]["retrieval_render"]["content_kind"], "retrieval_reply")
             self.assertIn("检索结果（3 条引用，2 个附件）", response["text"])
             self.assertIn("diagram.png (image/png)", response["text"])
+
+    def test_placeholder_adapter_normalizes_inbound_without_live_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gateway = GatewayService(
+                store=FileSessionStore(tmp, max_turns=10),
+                brain=RuleBasedBrain(),
+            )
+            gateway.register_adapter(
+                build_placeholder_adapter(
+                    PlaceholderPlatformSpec(
+                        name="telegram",
+                        display_name="Telegram",
+                        surface_family="telegram",
+                        credential_envs=("TELEGRAM_BOT_TOKEN",),
+                    )
+                )
+            )
+
+            response = gateway.handle_inbound(
+                "telegram",
+                {
+                    "chat_id": "tg-room-1",
+                    "user_id": "alice",
+                    "text": "hello placeholder",
+                    "message_id": "msg-placeholder-1",
+                },
+            )
+
+            self.assertEqual(response["platform"], "telegram")
+            self.assertEqual(response["chat_id"], "tg-room-1")
+            self.assertEqual(
+                response["metadata"]["adapter_profile"]["transport_mode"], "placeholder"
+            )
+
+    def test_placeholder_delivery_returns_not_configured_status_without_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FileSessionStore(tmp, max_turns=10)
+            gateway = GatewayService(store=store, brain=RuleBasedBrain())
+            gateway.register_adapter(
+                build_placeholder_adapter(
+                    PlaceholderPlatformSpec(
+                        name="telegram",
+                        display_name="Telegram",
+                        surface_family="telegram",
+                        credential_envs=("TELEGRAM_BOT_TOKEN",),
+                    )
+                )
+            )
+
+            gateway.handle_inbound(
+                "telegram",
+                {
+                    "chat_id": "tg-room-1",
+                    "user_id": "alice",
+                    "text": "hello placeholder",
+                    "message_id": "msg-placeholder-1",
+                },
+            )
+            route_key = str(store.load_metadata("telegram", "tg-room-1")["route_key"])
+
+            delivery = gateway.handle_notification_delivery(
+                self._notification_payload(
+                    route_key, idempotency_key="idem-placeholder-1", body="placeholder body"
+                )
+            )
+
+            self.assertTrue(delivery["ok"])
+            self.assertEqual(delivery["status"], "not_configured")
+            self.assertEqual(delivery["platform"], "telegram")
+            self.assertTrue(delivery["placeholder"])
 
 
 if __name__ == "__main__":

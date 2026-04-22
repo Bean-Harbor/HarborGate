@@ -2,13 +2,13 @@ import json
 import os
 import threading
 import unittest
-import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from im_agent.harborbeacon import (
+    HarborBeaconAdminClient,
     HarborBeaconTaskClient,
+    build_harborbeacon_admin_client_from_env,
     build_harborbeacon_client_from_env,
-    build_harbornas_client_from_env,
     build_task_request,
 )
 from im_agent.models import InboundMessage
@@ -111,6 +111,59 @@ class HarborBeaconContractTests(unittest.TestCase):
         self.assertEqual(first_payload["step_id"], first_replay_payload["step_id"])
         self.assertNotEqual(first_payload["step_id"], second_payload["step_id"])
 
+    def test_build_task_request_preserves_harboros_service_restart_shape(self) -> None:
+        inbound = InboundMessage(
+            platform="feishu",
+            chat_id="oc_harboros_chat",
+            user_id="ou_harboros_user",
+            text="restart ssh",
+            message_id="om_harboros_restart",
+            chat_type="group",
+            raw_payload={
+                "intent": {"domain": "service", "action": "restart"},
+                "args": {"service_name": "ssh"},
+                "entity_refs": {"resource": {"service_name": "ssh"}},
+            },
+        )
+
+        payload = build_task_request(inbound, resume_token="resume_harboros_restart")
+
+        self.assertEqual(payload["intent"]["domain"], "service")
+        self.assertEqual(payload["intent"]["action"], "restart")
+        self.assertEqual(payload["args"]["service_name"], "ssh")
+        self.assertEqual(payload["args"]["resume_token"], "resume_harboros_restart")
+        self.assertEqual(payload["entity_refs"]["resource"]["service_name"], "ssh")
+
+    def test_build_task_request_uses_same_v15_shape_for_weixin_private_dm(self) -> None:
+        inbound = InboundMessage(
+            platform="weixin",
+            chat_id="wx-user-1",
+            user_id="wx-user-1",
+            text="status ssh",
+            message_id="wx-msg-1",
+            chat_type="p2p",
+            raw_payload={
+                "context_token": "ctx-opaque-weixin",
+                "intent": {"domain": "service", "action": "status"},
+                "args": {"service_name": "ssh"},
+            },
+        )
+
+        payload = build_task_request(inbound)
+
+        self.assertEqual(payload["source"]["channel"], "weixin")
+        self.assertEqual(payload["source"]["surface"], "harborgate")
+        self.assertTrue(payload["source"]["route_key"].startswith("gw_route_"))
+        self.assertTrue(payload["source"]["session_id"].startswith("gw_sess_"))
+        self.assertEqual(payload["intent"]["domain"], "service")
+        self.assertEqual(payload["intent"]["action"], "status")
+        self.assertEqual(payload["args"]["service_name"], "ssh")
+        self.assertEqual(payload["message"]["message_id"], "wx-msg-1")
+        self.assertEqual(payload["message"]["chat_type"], "p2p")
+        self.assertNotIn("context_token", payload["source"])
+        self.assertNotIn("context_token", payload["args"])
+        self.assertNotIn("context_token", payload["message"])
+
     def test_build_task_request_preserves_opaque_attachment_metadata(self) -> None:
         inbound = InboundMessage(
             platform="webhook",
@@ -183,48 +236,149 @@ class HarborBeaconContractTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
-    def test_legacy_env_alias_builds_client_with_warning(self) -> None:
-        self.addCleanup(warnings.resetwarnings)
-        warnings.simplefilter("always")
-        previous = {
-            "HARBORBEACON_TASK_API_URL": None,
-            "HARBORNAS_TASK_API_URL": None,
-            "HARBORBEACON_SOURCE_SURFACE": None,
-            "HARBORNAS_SOURCE_SURFACE": None,
+    def test_task_client_maps_harboros_restart_needs_input_without_schema_changes(self) -> None:
+        previous_response = dict(CaptureHandler.response_payload)
+        CaptureHandler.response_payload = {
+            "task_id": "task_harbor_restart",
+            "trace_id": "trace_harbor_restart",
+            "status": "needs_input",
+            "prompt": "restart requires approval",
+            "result": {
+                "message": "restart requires approval",
+                "data": {
+                    "approval_ticket": {
+                        "approval_id": "approval_harbor_restart_1",
+                        "policy_ref": "service.restart",
+                    }
+                },
+                "artifacts": [],
+                "events": [],
+                "next_actions": ["approval_token approval_harbor_restart_1"],
+            },
+            "resume_token": "resume_harbor_restart",
+            "error": None,
         }
-        for key in previous:
-            previous[key] = os.environ.get(key)
-            os.environ.pop(key, None)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = HarborBeaconTaskClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                api_token="secret-token",
+            )
+            inbound = InboundMessage(
+                platform="webhook",
+                chat_id="room-harbor-restart",
+                user_id="alice",
+                text="restart ssh",
+                message_id="msg-harbor-restart",
+                raw_payload={
+                    "intent": {"domain": "service", "action": "restart"},
+                    "args": {"service_name": "ssh"},
+                },
+            )
+
+            result = client.submit_turn(
+                inbound,
+                session_metadata={"resume_token": "resume_prior_turn"},
+            )
+
+            self.assertEqual(CaptureHandler.request_payload["intent"]["domain"], "service")
+            self.assertEqual(CaptureHandler.request_payload["intent"]["action"], "restart")
+            self.assertEqual(CaptureHandler.request_payload["args"]["service_name"], "ssh")
+            self.assertEqual(
+                CaptureHandler.request_payload["args"]["resume_token"],
+                "resume_prior_turn",
+            )
+            self.assertEqual(result.status, "needs_input")
+            self.assertEqual(result.resume_token, "resume_harbor_restart")
+            self.assertEqual(result.text, "restart requires approval")
+            self.assertEqual(
+                result.next_actions,
+                ["approval_token approval_harbor_restart_1"],
+            )
+        finally:
+            CaptureHandler.response_payload = previous_response
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_env_builder_reads_harborbeacon_settings_only(self) -> None:
+        previous = {
+            "HARBORBEACON_TASK_API_URL": os.environ.get("HARBORBEACON_TASK_API_URL"),
+            "HARBORBEACON_SOURCE_SURFACE": os.environ.get("HARBORBEACON_SOURCE_SURFACE"),
+        }
+        os.environ["HARBORBEACON_TASK_API_URL"] = "http://127.0.0.1:4175"
+        os.environ["HARBORBEACON_SOURCE_SURFACE"] = "im_gateway"
         self.addCleanup(self._restore_env, previous)
 
-        os.environ["HARBORNAS_TASK_API_URL"] = "http://127.0.0.1:4175"
-        os.environ["HARBORNAS_SOURCE_SURFACE"] = "im_gateway"
-
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            client = build_harborbeacon_client_from_env()
-
+        client = build_harborbeacon_client_from_env()
         self.assertIsNotNone(client)
         assert client is not None
         self.assertEqual(client.base_url, "http://127.0.0.1:4175")
         self.assertEqual(client.source_surface, "im_gateway")
-        self.assertTrue(any("deprecated" in str(item.message).lower() for item in caught))
 
-    def test_deprecated_builder_alias_warns_and_delegates(self) -> None:
-        self.addCleanup(warnings.resetwarnings)
-        warnings.simplefilter("always")
+    def test_admin_client_posts_notification_target_with_service_auth(self) -> None:
+        previous_response = dict(CaptureHandler.response_payload)
+        CaptureHandler.response_payload = {
+            "targets": [
+                {
+                    "target_id": "target_001",
+                    "label": "Weixin DM abc123",
+                    "route_key": "gw_route_abc123",
+                    "platform_hint": "weixin",
+                    "is_default": True,
+                }
+            ]
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = HarborBeaconAdminClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                api_token="service-token",
+            )
+
+            result = client.upsert_notification_target(
+                label="Weixin DM abc123",
+                route_key="gw_route_abc123",
+                platform_hint="weixin",
+            )
+
+            self.assertEqual(CaptureHandler.request_path, "/api/admin/notification-targets")
+            self.assertEqual(CaptureHandler.request_headers["X-Contract-Version"], "1.5")
+            self.assertEqual(CaptureHandler.request_headers["Authorization"], "Bearer service-token")
+            self.assertEqual(CaptureHandler.request_payload["label"], "Weixin DM abc123")
+            self.assertEqual(CaptureHandler.request_payload["route_key"], "gw_route_abc123")
+            self.assertEqual(CaptureHandler.request_payload["platform_hint"], "weixin")
+            self.assertEqual(result["targets"][0]["route_key"], "gw_route_abc123")
+        finally:
+            CaptureHandler.response_payload = previous_response
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_admin_env_builder_falls_back_to_task_api_url_and_token(self) -> None:
         previous = {
             "HARBORBEACON_TASK_API_URL": os.environ.get("HARBORBEACON_TASK_API_URL"),
+            "HARBORBEACON_TASK_API_TOKEN": os.environ.get("HARBORBEACON_TASK_API_TOKEN"),
+            "HARBORBEACON_ADMIN_API_URL": os.environ.get("HARBORBEACON_ADMIN_API_URL"),
+            "HARBORBEACON_ADMIN_API_TOKEN": os.environ.get("HARBORBEACON_ADMIN_API_TOKEN"),
+            "IM_AGENT_SERVICE_TOKEN": os.environ.get("IM_AGENT_SERVICE_TOKEN"),
         }
-        os.environ["HARBORBEACON_TASK_API_URL"] = "http://127.0.0.1:4175"
+        os.environ["HARBORBEACON_TASK_API_URL"] = "http://127.0.0.1:4175/api/tasks"
+        os.environ["HARBORBEACON_TASK_API_TOKEN"] = "task-token"
+        os.environ.pop("HARBORBEACON_ADMIN_API_URL", None)
+        os.environ.pop("HARBORBEACON_ADMIN_API_TOKEN", None)
+        os.environ.pop("IM_AGENT_SERVICE_TOKEN", None)
         self.addCleanup(self._restore_env, previous)
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            client = build_harbornas_client_from_env()
-
+        client = build_harborbeacon_admin_client_from_env()
         self.assertIsNotNone(client)
-        self.assertTrue(any("deprecated" in str(item.message).lower() for item in caught))
+        assert client is not None
+        self.assertEqual(client.base_url, "http://127.0.0.1:4175")
+        self.assertEqual(client.api_token, "task-token")
 
     @staticmethod
     def _restore_env(previous: dict[str, str | None]) -> None:

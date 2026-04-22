@@ -41,6 +41,25 @@ def _safe_slug(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text)
 
 
+def _redact_sensitive_text(value: str, *secrets: str) -> str:
+    redacted = str(value or "")
+    for secret in secrets:
+        secret_value = str(secret or "").strip()
+        if secret_value:
+            redacted = redacted.replace(secret_value, "[REDACTED]")
+    redacted = redacted.replace("Bearer ", "Bearer [REDACTED] ")
+    return redacted
+
+
+def _poll_status_for_error(error_text: str) -> str:
+    normalized = error_text.lower()
+    if "read operation timed out" in normalized:
+        return "idle_timeout"
+    if "timed out" in normalized or "timeout" in normalized:
+        return "timeout"
+    return "error"
+
+
 def _account_dir(state_dir: str | Path) -> Path:
     path = Path(state_dir) / "accounts"
     path.mkdir(parents=True, exist_ok=True)
@@ -61,6 +80,10 @@ def _context_file(state_dir: str | Path, account_id: str) -> Path:
 
 def _processed_file(state_dir: str | Path, account_id: str) -> Path:
     return _account_dir(state_dir) / f"{_safe_slug(account_id)}.processed_messages.json"
+
+
+def _transport_state_file(state_dir: str | Path, account_id: str) -> Path:
+    return _account_dir(state_dir) / f"{_safe_slug(account_id)}.runtime.json"
 
 
 def extract_weixin_message_id(payload: dict[str, Any]) -> str:
@@ -91,6 +114,19 @@ def load_weixin_account(state_dir: str | Path, account_id: str) -> dict[str, Any
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_weixin_transport_state(state_dir: str | Path, account_id: str) -> dict[str, Any] | None:
+    path = _transport_state_file(state_dir, account_id)
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else None
+
+
+def save_weixin_transport_state(state_dir: str | Path, account_id: str, payload: dict[str, Any]) -> None:
+    path = _transport_state_file(state_dir, account_id)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 class ContextTokenStore:
@@ -372,6 +408,32 @@ class WeixinAdapter(PlatformAdapter):
         self.token = (token or os.getenv("WEIXIN_BOT_TOKEN", "")).strip()
         self.base_url = (base_url or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip() or ILINK_BASE_URL
         self.user_id = os.getenv("WEIXIN_USER_ID", "").strip()
+        self._transport_state: dict[str, Any] = {
+            "mode": "polling",
+            "status": "waiting_for_credentials" if not self.configured else "polling_idle",
+            "connected": False,
+            "last_error": "",
+            "last_poll_outcome": "never_polled" if self.configured else "waiting_for_credentials",
+            "last_poll_at": "",
+            "last_getupdates_at": "",
+            "last_getupdates_buf": "",
+            "last_getupdates_count": 0,
+            "last_private_text_message_count": 0,
+            "last_getupdates_message_ids": [],
+            "last_getupdates_private_message_ids": [],
+            "last_getupdates_error": "",
+            "last_context_token_at": "",
+            "last_send_at": "",
+            "last_send_chunk_count": 0,
+            "last_send_status": "",
+            "last_send_error": "",
+            "last_send_retryable": False,
+            "last_send_provider_message_id": "",
+            "last_send_context_token_used": False,
+            "last_inbound_at": "",
+            "last_inbound_message_id": "",
+            "last_inbound_chat_id": "",
+        }
 
         if self.account_id and not self.token:
             saved = load_weixin_account(self.state_dir, self.account_id)
@@ -382,6 +444,11 @@ class WeixinAdapter(PlatformAdapter):
 
         self._context_tokens = ContextTokenStore(self.state_dir, self.account_id) if self.account_id else None
         self._processed_messages = ProcessedMessageStore(self.state_dir, self.account_id) if self.account_id else None
+        if self.account_id:
+            persisted_transport = load_weixin_transport_state(self.state_dir, self.account_id)
+            if isinstance(persisted_transport, dict):
+                self._transport_state.update(persisted_transport)
+                self._transport_state["mode"] = "polling"
 
     @property
     def configured(self) -> bool:
@@ -399,6 +466,21 @@ class WeixinAdapter(PlatformAdapter):
             "supports_live_receive": False,
         }
 
+    def transport_status(self) -> dict[str, Any]:
+        state = dict(self._transport_state)
+        state["last_error"] = _redact_sensitive_text(state.get("last_error", ""), self.account_id, self.token)
+        state["last_getupdates_error"] = _redact_sensitive_text(
+            state.get("last_getupdates_error", ""),
+            self.account_id,
+            self.token,
+        )
+        state["last_send_error"] = _redact_sensitive_text(
+            state.get("last_send_error", ""),
+            self.account_id,
+            self.token,
+        )
+        return state
+
     def assert_configured(self) -> None:
         if not self.configured:
             raise RuntimeError(
@@ -407,17 +489,90 @@ class WeixinAdapter(PlatformAdapter):
 
     def poll_updates(self, timeout_ms: int = DEFAULT_POLL_TIMEOUT_MS) -> list[dict[str, Any]]:
         self.assert_configured()
-        sync_buf = load_sync_buf(self.state_dir, self.account_id)
-        response = post_json(
-            self.base_url,
-            EP_GET_UPDATES,
-            {"get_updates_buf": sync_buf},
-            token=self.token,
-            timeout_seconds=max(1, int(timeout_ms / 1000) + 10),
+        self._set_transport_state(
+            status="polling",
+            connected=False,
+            last_error="",
+            last_poll_outcome="polling",
+            last_poll_at=utc_now_iso(),
+            last_getupdates_error="",
+            last_getupdates_message_ids=[],
+            last_getupdates_private_message_ids=[],
         )
+        sync_buf = load_sync_buf(self.state_dir, self.account_id)
+        try:
+            response = post_json(
+                self.base_url,
+                EP_GET_UPDATES,
+                {"get_updates_buf": sync_buf},
+                token=self.token,
+                timeout_seconds=max(1, int(timeout_ms / 1000) + 10),
+            )
+        except Exception as exc:
+            error_text = _redact_sensitive_text(str(exc), self.account_id, self.token)
+            poll_status = _poll_status_for_error(error_text)
+            observed_at = utc_now_iso()
+            if poll_status == "idle_timeout":
+                self._set_transport_state(
+                    status="polling_idle",
+                    connected=True,
+                    last_error="",
+                    last_poll_outcome="idle_timeout",
+                    last_poll_at=observed_at,
+                    last_getupdates_at=observed_at,
+                    last_getupdates_buf=sync_buf,
+                    last_getupdates_error="",
+                    last_getupdates_count=0,
+                    last_private_text_message_count=0,
+                    last_getupdates_message_ids=[],
+                    last_getupdates_private_message_ids=[],
+                )
+                return []
+            self._set_transport_state(
+                status=poll_status,
+                connected=False,
+                last_error=error_text,
+                last_poll_outcome="error",
+                last_poll_at=observed_at,
+                last_getupdates_at=observed_at,
+                last_getupdates_error=error_text,
+                last_getupdates_count=0,
+                last_private_text_message_count=0,
+                last_getupdates_message_ids=[],
+                last_getupdates_private_message_ids=[],
+            )
+            raise
         next_sync = str(response.get("get_updates_buf") or sync_buf)
         save_sync_buf(self.state_dir, self.account_id, next_sync)
         messages = response.get("msgs") or []
+        private_messages = [
+            item
+            for item in messages
+            if isinstance(item, dict) and not str(item.get("room_id") or "").strip()
+        ]
+        message_ids = [
+            extract_weixin_message_id(item)
+            for item in messages
+            if isinstance(item, dict) and extract_weixin_message_id(item)
+        ]
+        private_message_ids = [
+            extract_weixin_message_id(item)
+            for item in private_messages
+            if isinstance(item, dict) and extract_weixin_message_id(item)
+        ]
+        self._set_transport_state(
+            status="polling_idle",
+            connected=True,
+            last_error="",
+            last_poll_outcome="messages" if messages else "empty",
+            last_getupdates_at=utc_now_iso(),
+            last_getupdates_buf=next_sync,
+            last_getupdates_count=len([item for item in messages if isinstance(item, dict)]),
+            last_private_text_message_count=len(private_messages),
+            last_getupdates_message_ids=message_ids,
+            last_getupdates_private_message_ids=private_message_ids,
+            last_getupdates_error="",
+        )
         return [item for item in messages if isinstance(item, dict)]
 
     def is_duplicate_update(self, payload: dict[str, Any]) -> bool:
@@ -445,8 +600,18 @@ class WeixinAdapter(PlatformAdapter):
         if not text:
             raise ValueError("Weixin payload does not contain a text message")
 
+        observed_at = utc_now_iso()
+        self._set_transport_state(
+            connected=True,
+            last_inbound_at=observed_at,
+            last_inbound_message_id=message_id,
+            last_inbound_chat_id=chat_id,
+        )
         if context_token and self._context_tokens:
             self._context_tokens.set(chat_id, context_token)
+            self._set_transport_state(
+                last_context_token_at=observed_at,
+            )
 
         return InboundMessage(
             platform="weixin",
@@ -475,16 +640,56 @@ class WeixinAdapter(PlatformAdapter):
         if not chunks:
             raise RuntimeError("Outbound Weixin message is empty")
 
+        observed_at = utc_now_iso()
+        self._set_transport_state(
+            status="sending",
+            connected=True,
+            last_error="",
+            last_send_at=observed_at,
+            last_send_chunk_count=len(chunks),
+            last_inbound_chat_id=outbound.chat_id,
+            last_send_status="sending",
+            last_send_error="",
+            last_send_retryable=False,
+            last_send_provider_message_id="",
+            last_send_context_token_used=True,
+        )
         last_client_id = ""
-        for chunk in chunks:
-            payload = build_send_message_payload(
-                to_user_id=outbound.chat_id,
-                text=chunk,
-                context_token=context_token,
+        try:
+            for chunk in chunks:
+                payload = build_send_message_payload(
+                    to_user_id=outbound.chat_id,
+                    text=chunk,
+                    context_token=context_token,
+                )
+                last_client_id = str((payload.get("msg") or {}).get("client_id") or "")
+                post_json(self.base_url, EP_SEND_MESSAGE, payload, token=self.token)
+        except Exception as exc:
+            error_text = _redact_sensitive_text(str(exc), self.account_id, self.token, context_token)
+            self._set_transport_state(
+                status="send_failed",
+                connected=True,
+                last_send_at=utc_now_iso(),
+                last_error=error_text,
+                last_send_status="failed",
+                last_send_error=error_text,
+                last_send_retryable=True,
+                last_send_provider_message_id=last_client_id,
+                last_send_context_token_used=True,
             )
-            last_client_id = str((payload.get("msg") or {}).get("client_id") or "")
-            post_json(self.base_url, EP_SEND_MESSAGE, payload, token=self.token)
+            raise
 
+        self._set_transport_state(
+            status="polling_idle",
+            connected=True,
+            last_send_at=utc_now_iso(),
+            last_error="",
+            last_send_status="sent",
+            last_send_error="",
+            last_send_retryable=False,
+            last_send_provider_message_id=last_client_id,
+            last_send_context_token_used=True,
+        )
         return {
             "platform": "weixin",
             "chat_id": outbound.chat_id,
@@ -493,9 +698,16 @@ class WeixinAdapter(PlatformAdapter):
             "delivery": "weixin",
             "sent": True,
             "message_id": last_client_id,
+            "provider_message_id": last_client_id,
             "metadata": {
                 **outbound.metadata,
                 "context_token_used": True,
                 "chunk_count": len(chunks),
             },
         }
+
+    def _set_transport_state(self, **updates: Any) -> None:
+        self._transport_state.update(updates)
+        self._transport_state["mode"] = "polling"
+        if self.account_id:
+            save_weixin_transport_state(self.state_dir, self.account_id, self._transport_state)

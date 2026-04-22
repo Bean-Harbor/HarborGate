@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+from unittest.mock import patch
+from urllib.error import URLError
 
 from im_agent.models import OutboundMessage
 from im_agent.platforms.weixin import (
@@ -9,6 +11,8 @@ from im_agent.platforms.weixin import (
     build_send_message_payload,
     extract_weixin_message_id,
     extract_text_from_item_list,
+    load_sync_buf,
+    load_weixin_transport_state,
     save_weixin_account,
     split_text_for_weixin,
 )
@@ -60,6 +64,98 @@ class WeixinHelpersTests(unittest.TestCase):
 
 
 class WeixinAdapterTests(unittest.TestCase):
+    def test_adapter_restores_saved_account_and_poll_updates_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+                user_id="self-1",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+
+            self.assertTrue(adapter.configured)
+            self.assertEqual(adapter.base_url, "https://example.com")
+            self.assertEqual(adapter.user_id, "self-1")
+
+            with patch(
+                "im_agent.platforms.weixin.post_json",
+                return_value={
+                    "get_updates_buf": "cursor-next",
+                    "msgs": [
+                        {
+                            "msg_id": "wx-msg-1",
+                            "from_user_id": "wx-user-1",
+                            "item_list": [{"type": 1, "text_item": {"text": "hello"}}],
+                        }
+                    ],
+                },
+            ) as mocked_post:
+                messages = adapter.poll_updates(timeout_ms=1000)
+
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0]["msg_id"], "wx-msg-1")
+            self.assertEqual(load_sync_buf(tmp, "bot-1"), "cursor-next")
+            transport = adapter.transport_status()
+            self.assertEqual(transport["status"], "polling_idle")
+            self.assertTrue(transport["connected"])
+            self.assertEqual(transport["last_getupdates_buf"], "cursor-next")
+            self.assertEqual(transport["last_getupdates_count"], 1)
+            self.assertEqual(transport["last_getupdates_message_ids"], ["wx-msg-1"])
+            self.assertEqual(transport["last_getupdates_error"], "")
+            mocked_post.assert_called_once()
+
+    def test_poll_updates_treats_idle_read_timeout_as_healthy_empty_poll(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+                user_id="self-1",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+
+            with patch(
+                "im_agent.platforms.weixin.post_json",
+                side_effect=TimeoutError("The read operation timed out"),
+            ):
+                messages = adapter.poll_updates(timeout_ms=1000)
+
+            self.assertEqual(messages, [])
+            transport = adapter.transport_status()
+            self.assertEqual(transport["status"], "polling_idle")
+            self.assertTrue(transport["connected"])
+            self.assertEqual(transport["last_poll_outcome"], "idle_timeout")
+            self.assertEqual(transport["last_getupdates_error"], "")
+            self.assertEqual(transport["last_getupdates_count"], 0)
+            self.assertEqual(transport["last_private_text_message_count"], 0)
+
+    def test_poll_updates_preserves_real_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+                user_id="self-1",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+
+            with patch(
+                "im_agent.platforms.weixin.post_json",
+                side_effect=URLError("network down"),
+            ):
+                with self.assertRaises(URLError):
+                    adapter.poll_updates(timeout_ms=1000)
+
+            transport = adapter.transport_status()
+            self.assertEqual(transport["status"], "error")
+            self.assertFalse(transport["connected"])
+            self.assertEqual(transport["last_poll_outcome"], "error")
+            self.assertIn("network down", transport["last_getupdates_error"])
+
     def test_normalize_inbound_stores_context_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             save_weixin_account(
@@ -82,6 +178,10 @@ class WeixinAdapterTests(unittest.TestCase):
             self.assertEqual(message.text, "你好")
             token_store = ContextTokenStore(tmp, "bot-1")
             self.assertEqual(token_store.get("wx-user-1"), "ctx-001")
+            transport = adapter.transport_status()
+            self.assertEqual(transport["last_inbound_chat_id"], "wx-user-1")
+            self.assertEqual(transport["last_inbound_message_id"], "")
+            self.assertTrue(transport["last_inbound_at"])
 
     def test_normalize_inbound_rejects_groups_for_now(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -115,6 +215,31 @@ class WeixinAdapterTests(unittest.TestCase):
                     OutboundMessage(platform="weixin", chat_id="wx-user-1", text="reply")
                 )
 
+    def test_send_outbound_records_successful_delivery_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+            assert adapter._context_tokens is not None
+            adapter._context_tokens.set("wx-user-1", "ctx-123")
+            with patch("im_agent.platforms.weixin.post_json", return_value={}) as mocked_post:
+                response = adapter.send_outbound(
+                    OutboundMessage(platform="weixin", chat_id="wx-user-1", text="reply")
+                )
+
+            transport = adapter.transport_status()
+            self.assertTrue(response["sent"])
+            self.assertEqual(response["provider_message_id"], response["message_id"])
+            self.assertEqual(transport["last_send_status"], "sent")
+            self.assertEqual(transport["last_send_context_token_used"], True)
+            self.assertEqual(transport["last_send_error"], "")
+            self.assertTrue(transport["last_send_provider_message_id"])
+            self.assertEqual(mocked_post.call_count, 1)
+
     def test_duplicate_update_tracking_is_persistent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             save_weixin_account(
@@ -136,6 +261,32 @@ class WeixinAdapterTests(unittest.TestCase):
 
             restored = WeixinAdapter(state_dir=tmp, account_id="bot-1")
             self.assertTrue(restored.is_duplicate_update(payload))
+
+    def test_transport_state_is_persisted_and_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+
+            with patch(
+                "im_agent.platforms.weixin.post_json",
+                side_effect=TimeoutError("The read operation timed out"),
+            ):
+                adapter.poll_updates(timeout_ms=1000)
+
+            persisted = load_weixin_transport_state(tmp, "bot-1")
+            assert isinstance(persisted, dict)
+            self.assertEqual(persisted["last_poll_outcome"], "idle_timeout")
+            self.assertTrue(persisted["connected"])
+
+            restored = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+            restored_transport = restored.transport_status()
+            self.assertEqual(restored_transport["last_poll_outcome"], "idle_timeout")
+            self.assertTrue(restored_transport["connected"])
 
 
 if __name__ == "__main__":

@@ -7,7 +7,9 @@ import logging
 from im_agent.brain import Brain, build_brain_from_env
 from im_agent.errors import GatewayContractError
 from im_agent.harborbeacon import (
+    HarborBeaconAdminClient,
     HarborBeaconTaskClient,
+    build_harborbeacon_admin_client_from_env,
     build_harborbeacon_client_from_env,
     derive_route_key,
     derive_session_id,
@@ -18,6 +20,12 @@ from im_agent.platforms.registry import build_enabled_adapters
 from im_agent.session_store import FileSessionStore
 
 logger = logging.getLogger(__name__)
+
+SYNCABLE_NOTIFICATION_TARGET_PLATFORMS = frozenset({"feishu", "weixin"})
+PLATFORM_DISPLAY_NAMES = {
+    "feishu": "Feishu",
+    "weixin": "Weixin",
+}
 
 
 def _log_observation(event: str, fields: dict[str, object]) -> None:
@@ -218,10 +226,12 @@ class GatewayService:
         store: FileSessionStore,
         brain: Brain,
         task_client: HarborBeaconTaskClient | None = None,
+        notification_target_client: HarborBeaconAdminClient | None = None,
     ) -> None:
         self.store = store
         self.brain = brain
         self.task_client = task_client
+        self.notification_target_client = notification_target_client
         self._adapters: dict[str, PlatformAdapter] = {}
         self._started = False
 
@@ -429,7 +439,114 @@ class GatewayService:
             text=reply_text,
             metadata=outbound_metadata,
         )
-        return adapter.send_outbound(outbound)
+        adapter_response = adapter.send_outbound(outbound)
+        self._sync_notification_target_if_needed(
+            adapter=adapter,
+            inbound=inbound,
+            route_key=resolved_route_key,
+            session_metadata=session_metadata,
+        )
+        return adapter_response
+
+    def _sync_notification_target_if_needed(
+        self,
+        *,
+        adapter: PlatformAdapter,
+        inbound: InboundMessage,
+        route_key: str,
+        session_metadata: dict[str, object],
+    ) -> None:
+        registration = self._notification_target_registration(
+            adapter=adapter,
+            inbound=inbound,
+            route_key=route_key,
+            session_metadata=session_metadata,
+        )
+        if registration is None or self.notification_target_client is None:
+            return
+
+        try:
+            response_payload = self.notification_target_client.upsert_notification_target(
+                label=registration["label"],
+                route_key=registration["route_key"],
+                platform_hint=registration["platform_hint"],
+            )
+            next_metadata = self.store.load_metadata(inbound.platform, inbound.chat_id)
+            next_metadata["notification_target_synced_route_key"] = registration["route_key"]
+            next_metadata["notification_target_label"] = registration["label"]
+            self.store.set_metadata(inbound.platform, inbound.chat_id, next_metadata)
+            targets = response_payload.get("targets")
+            target_count = len(targets) if isinstance(targets, list) else 0
+            _log_observation(
+                "notification_target_synced",
+                {
+                    "platform": inbound.platform,
+                    "chat_id": inbound.chat_id,
+                    "route_key": registration["route_key"],
+                    "platform_hint": registration["platform_hint"],
+                    "label": registration["label"],
+                    "target_count": target_count,
+                },
+            )
+        except Exception as exc:
+            _log_observation(
+                "notification_target_sync_failed",
+                {
+                    "platform": inbound.platform,
+                    "chat_id": inbound.chat_id,
+                    "route_key": registration["route_key"],
+                    "platform_hint": registration["platform_hint"],
+                    "label": registration["label"],
+                    "error": str(exc),
+                },
+            )
+
+    def _notification_target_registration(
+        self,
+        *,
+        adapter: PlatformAdapter,
+        inbound: InboundMessage,
+        route_key: str,
+        session_metadata: dict[str, object],
+    ) -> dict[str, str] | None:
+        if self.notification_target_client is None:
+            return None
+
+        normalized_route_key = route_key.strip()
+        if not normalized_route_key:
+            return None
+        if str(inbound.chat_type or "").strip().lower() != "p2p":
+            return None
+        if (
+            str(session_metadata.get("notification_target_synced_route_key") or "").strip()
+            == normalized_route_key
+        ):
+            return None
+
+        raw_profile = adapter.get_profile() if hasattr(adapter, "get_profile") else {}
+        raw_profile = raw_profile if isinstance(raw_profile, dict) else {}
+        if bool(raw_profile.get("placeholder")):
+            return None
+
+        platform_hint = str(
+            inbound.platform
+            or raw_profile.get("surface_family")
+            or getattr(adapter, "name", "")
+        ).strip().lower()
+        if platform_hint not in SYNCABLE_NOTIFICATION_TARGET_PLATFORMS:
+            return None
+
+        platform_display = str(
+            raw_profile.get("display_name")
+            or PLATFORM_DISPLAY_NAMES.get(platform_hint)
+            or platform_hint.title()
+        ).strip()
+        label_suffix = normalized_route_key[-6:] if len(normalized_route_key) > 6 else normalized_route_key
+        return {
+            "label": f"{platform_display} DM {label_suffix}",
+            "route_key": normalized_route_key,
+            "platform_hint": platform_hint,
+        }
 
     def handle_notification_delivery(self, payload: dict) -> dict:
         trace_id = str(payload.get("trace_id") or "").strip()
@@ -501,16 +618,22 @@ class GatewayService:
                 )
             response_payload = record.get("response_payload")
             if isinstance(response_payload, dict):
+                classification = record.get("classification")
+                classification = classification if isinstance(classification, dict) else {}
                 _log_observation(
                     "delivery_replayed",
                     {
                         "notification_id": notification_id,
                         "trace_id": trace_id,
                         "route_key": route_key,
+                        "route_mode": str(classification.get("route_mode") or "unknown"),
+                        "route_source": str(classification.get("route_source") or "unknown"),
                         "delivery.idempotency_key": idempotency_key,
                         "platform": str(response_payload.get("platform") or route.get("platform") or adapter_name),
                         "status": str(response_payload.get("status") or ""),
                         "provider_message_id": response_payload.get("provider_message_id"),
+                        "failure_class": str(classification.get("failure_class") or ""),
+                        "queue_state": str(classification.get("queue_state") or ""),
                     },
                 )
                 return dict(response_payload)
@@ -526,6 +649,8 @@ class GatewayService:
                 "trace_id": trace_id,
                 "delivery_mode": mode,
                 "route_key": route_key,
+                "route_mode": str(route.get("route_mode") or "unknown"),
+                "route_source": str(route.get("route_source") or "unknown"),
                 "reply_to_message_id": reply_to_message_id,
                 "update_message_id": update_message_id,
                 "payload_format": str(content.get("payload_format") or "plain_text").strip() or "plain_text",
@@ -542,17 +667,22 @@ class GatewayService:
                 or adapter_response.get("provider_message_id")
                 or ""
             ).strip() or None
+            placeholder_status = str(
+                adapter_response.get("placeholder_status") or ""
+            ).strip()
             response_payload: dict[str, object] = {
                 "delivery_id": delivery_id,
                 "notification_id": notification_id,
                 "trace_id": trace_id,
                 "ok": True,
-                "status": "sent",
+                "status": placeholder_status or "sent",
                 "platform": str(route.get("platform") or adapter_name),
                 "provider_message_id": provider_message_id,
                 "retryable": False,
                 "error": None,
             }
+            if adapter_response.get("placeholder"):
+                response_payload["placeholder"] = True
         except Exception as exc:
             error_code, retryable = self._map_delivery_failure(exc)
             response_payload = {
@@ -570,10 +700,15 @@ class GatewayService:
                 },
             }
 
+        classification = self._classify_delivery_attempt(
+            route=route,
+            response_payload=response_payload,
+        )
         self.store.save_delivery_record(
             idempotency_key,
             request_fingerprint=request_fingerprint,
             response_payload=response_payload,
+            classification=classification,
         )
         _log_observation(
             "delivery_attempted",
@@ -581,12 +716,16 @@ class GatewayService:
                 "notification_id": notification_id,
                 "trace_id": trace_id,
                 "route_key": route_key,
+                "route_mode": classification["route_mode"],
+                "route_source": classification["route_source"],
                 "delivery.idempotency_key": idempotency_key,
                 "platform": str(route.get("platform") or adapter_name),
                 "status": str(response_payload.get("status") or ""),
                 "provider_message_id": response_payload.get("provider_message_id"),
                 "retryable": response_payload.get("retryable"),
                 "ok": response_payload.get("ok"),
+                "failure_class": classification["failure_class"],
+                "queue_state": classification["queue_state"],
             },
         )
         return response_payload
@@ -636,15 +775,27 @@ class GatewayService:
                 raise GatewayContractError(404, "ROUTE_NOT_FOUND", f"route_key not found: {route_key}", trace_id)
             if str(route.get("status") or "active").strip().lower() == "expired":
                 raise GatewayContractError(410, "ROUTE_EXPIRED", f"route_key expired: {route_key}", trace_id)
+            route = dict(route)
+            route["route_mode"] = "source_bound"
+            route["route_source"] = "route_key"
+            route.setdefault("adapter_name", str(route.get("platform") or "").strip())
+            route.setdefault("platform", str(route.get("platform") or "").strip())
+            route.setdefault("chat_id", str(route.get("chat_id") or "").strip())
             return route
 
         platform = str(destination.get("platform") or "").strip()
         chat_id = str(destination.get("id") or "").strip()
+        recipient = destination.get("recipient")
+        recipient = recipient if isinstance(recipient, dict) else {}
+        if not chat_id:
+            chat_id = str(recipient.get("recipient_id") or "").strip()
+        if not platform:
+            platform = str(recipient.get("platform") or "").strip()
         if not platform or not chat_id:
             raise GatewayContractError(
                 422,
                 "VALIDATION_ERROR",
-                "destination.route_key is preferred; otherwise destination.platform and destination.id are required",
+                "destination.route_key is preferred; otherwise destination.platform with destination.id or destination.recipient is required",
                 trace_id,
             )
         return {
@@ -652,6 +803,8 @@ class GatewayService:
             "chat_id": chat_id,
             "adapter_name": platform,
             "status": "active",
+            "route_mode": "proactive",
+            "route_source": "platform_id" if str(destination.get("id") or "").strip() else "recipient",
         }
 
     @staticmethod
@@ -672,6 +825,31 @@ class GatewayService:
         if "unsupported" in message:
             return ("UNSUPPORTED_CONTENT", False)
         return ("PLATFORM_UNAVAILABLE", True)
+
+    @staticmethod
+    def _classify_delivery_attempt(
+        *,
+        route: dict[str, object],
+        response_payload: dict[str, object],
+    ) -> dict[str, object]:
+        route_mode = str(route.get("route_mode") or "unknown").strip().lower() or "unknown"
+        route_source = str(route.get("route_source") or "unknown").strip().lower() or "unknown"
+        ok = bool(response_payload.get("ok"))
+        retryable = bool(response_payload.get("retryable"))
+        error_block = response_payload.get("error")
+        error_block = error_block if isinstance(error_block, dict) else {}
+        failure_class = ""
+        if not ok:
+            failure_class = str(error_block.get("code") or "").strip() or "INTERNAL_ERROR"
+        queue_state = "complete" if ok else ("retry_queue" if retryable else "terminal_failure")
+        return {
+            "route_mode": route_mode,
+            "route_source": route_source,
+            "outcome": "sent" if ok else "failed",
+            "failure_class": failure_class,
+            "queue_state": queue_state,
+            "retryable": retryable,
+        }
 
     @staticmethod
     def _fingerprint_payload(payload: dict) -> str:
@@ -706,6 +884,7 @@ def build_default_gateway(data_root: str = "data/sessions") -> GatewayService:
         store=store,
         brain=build_brain_from_env(),
         task_client=build_harborbeacon_client_from_env(),
+        notification_target_client=build_harborbeacon_admin_client_from_env(),
     )
     for adapter in build_enabled_adapters():
         gateway.register_adapter(adapter)

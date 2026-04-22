@@ -43,3 +43,7 @@ def main() -> None:
         except Exception as exc:
             logger.exception("Weixin runner loop failed: %s", exc)
             time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()

@@ -14,9 +14,61 @@ This repo is the IM-side evidence bundle for the frozen HarborBeacon seam in
 - route lookup and expiry handling for `destination.route_key`
 - redacted optional `GET /api/gateway/status`
 
-## Feishu Smoke Pack
+## Current Prelaunch Scope
 
-Use this path first when validating a canary because it exercises the most complete adapter surface in this repo.
+- Feishu is the current baseline rehearsal surface and is ready on the frozen seam.
+- Weixin `1:1` text is the parity-track surface until the same rehearsal matrix passes cleanly, and the only fixed blocker classes are `account_restore`, `qr_recovery`, `getupdates`, and `context_token_send`.
+- Group chats stay out of scope; do not widen HarborBeacon semantics to support them.
+- Both surfaces must keep the same HarborBeacon `v1.5` request and notification shape.
+
+Current reproducible live-gate collector:
+
+- `python .\tools\run_platform_live_gate.py`
+- optional HarborBeacon-backed rehearsal:
+  `python .\tools\run_platform_live_gate.py --task-api-url http://127.0.0.1:4175 --task-api-token <shared-token>`
+
+Decision rule from the generated JSON report:
+
+- `dual_surface_ready`: Feishu baseline and Weixin parity track both passed the rehearsal matrix
+- `feishu_baseline_with_weixin_parity_track`: keep Feishu as the stable baseline while Weixin continues parity work
+- `blocked`: stop cutover rehearsal until at least one live surface is healthy
+
+## Known Pending
+
+- `account_restore`: the saved Weixin account is missing or cannot be restored.
+- `qr_recovery`: QR recovery or login refresh is still required before the account is usable.
+- `getupdates`: the long-poll `getupdates` path is not stable or is timing out.
+- `context_token_send`: inbound recovery works, but the follow-up context-token-backed send still fails.
+- Anything outside those four classes should be treated as a separate regression, not a new Weixin cutover category.
+
+## Weixin 1:1 Parity Pack
+
+Use this path to decide whether Weixin has reached the same rehearsal level as Feishu.
+
+1. Restore or create one Weixin account and confirm the gateway can recover it:
+   - `WEIXIN_ACCOUNT_ID` points at a saved account
+   - QR login can produce a valid account if restore is missing
+   - `harborgate-weixin-runner` can long-poll `getupdates`
+2. Confirm one private DM can enter the task-client path and emit:
+   - `task_id`
+   - `trace_id`
+   - `route_key`
+   - `message_id`
+   - `status`
+3. Run a HarborOS `service.restart` turn and confirm `needs_input -> resume` reuses:
+   - the same `route_key`
+   - the previous `resume_token`
+   - a stable `message_task_ids` pointer for replay
+4. Send one HarborBeacon notification delivery twice and confirm:
+   - the cached `context_token` is reused
+   - `delivery.idempotency_key` prevents a second platform send
+   - `provider_message_id` stays stable on replay
+5. Replay the original DM and confirm session pointers do not rewind.
+6. Confirm one group message still fails fast as out of scope instead of widening the contract.
+
+## Feishu Baseline Smoke Pack
+
+Use this path as the stable baseline while Weixin is still working through parity gaps.
 
 1. Start HarborGate with Feishu enabled and `IM_AGENT_CONTRACT_VERSION=1.5`.
 2. Open `GET /api/gateway/status` and confirm:
@@ -38,6 +90,7 @@ Use this path first when validating a canary because it exercises the most compl
    - `provider_message_id` when the platform returns one
    - `retryable` and `status`
 7. Replay the original inbound message and confirm session pointers do not rewind.
+8. Confirm the same HarborBeacon `service.status`, `service.restart`, and `files.list` scenarios can rerun without changing contract shape.
 
 ## Retrieval & Attachment Ingress Pack
 
@@ -116,6 +169,8 @@ Use this when you want a repeatable IM-side evidence path for retrieval traffic.
 - gateway logs include the main canary observability fields where available
 - retrieval-style ingress logs include opaque attachment summaries without leaking attachment values
 - gateway outbound metadata now includes a safe adapter profile so non-Feishu surfaces can be added without changing HarborBeacon semantics
+- Weixin `1:1` gateway tests cover private-DM ingress, `needs_input -> resume`, notification replay idempotency, and replay-stable session pointers
+- Feishu remains the rollback-safe adapter surface on the same frozen seam
 
 ## Cutover gate
 
@@ -124,6 +179,7 @@ Use this when you want a repeatable IM-side evidence path for retrieval traffic.
 - The adapter-specific smoke pack should be runnable without revealing raw platform credentials in status output.
 - If the external platform adapter changes, keep the frozen request and
   response shapes stable and update the checklist with the new evidence.
+- If Weixin requires group-chat semantics to keep moving, stop and roll back to Feishu instead of widening the seam.
 
 ## Canary Note
 

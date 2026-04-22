@@ -39,7 +39,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                         "POST JSON to /messages/webhook to exercise the clean-room gateway. "
                         "Set HARBORBEACON_TASK_API_URL to route turns into HarborBeacon, or use "
                         "harborgate-weixin-login and harborgate-weixin-runner for personal WeChat. "
-                        "Open /setup/qr to scan the Feishu setup page from mobile. "
+                        "Open /setup to see Feishu setup, Weixin ingress status, and the redacted gateway snapshot. "
                         "Feishu defaults to long-connection receive mode, so no public webhook is required."
                     ),
                     "setup": self.setup_portal.build_status_payload(request_host=self.headers.get("Host", "")),
@@ -68,6 +68,13 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path == "/admin/im":
+            self._send_html(
+                HTTPStatus.OK,
+                self.setup_portal.build_setup_page(request_host=self.headers.get("Host", "")),
+            )
+            return
+
         if self.path == "/api/setup/status":
             self._send_json(
                 HTTPStatus.OK,
@@ -82,7 +89,12 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             except GatewayContractError as exc:
                 self._send_json(HTTPStatus(exc.status_code), exc.to_response())
                 return
-            self._send_json(HTTPStatus.OK, self.setup_portal.build_gateway_status_payload())
+            self._send_json(
+                HTTPStatus.OK,
+                self.setup_portal.build_gateway_status_payload(
+                    request_host=self.headers.get("Host", "")
+                ),
+            )
             return
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
@@ -266,6 +278,7 @@ def main() -> None:
         bind_host=host,
         bind_port=port,
         public_origin=os.getenv("IM_AGENT_PUBLIC_ORIGIN", ""),
+        runtime_root=state_root,
     )
     setup_portal.bootstrap()
     gateway.start()

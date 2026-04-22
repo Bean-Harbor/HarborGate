@@ -35,6 +35,35 @@ Management documents:
 - an optional OpenAI-compatible backend through environment variables
 - a tiny HTTP server using the Python standard library
 
+## Hermes-style platform coverage
+
+HarborGate now keeps Feishu and Weixin as the current live paths, while exposing a broader Hermes-style adapter skeleton for the rest of the IM surface.
+
+Current live adapters:
+
+- `feishu`
+- `weixin`
+- `webhook`
+
+Current placeholder adapters:
+
+- `telegram`
+- `discord`
+- `slack`
+- `whatsapp`
+- `signal`
+- `email`
+- `wecom`
+
+What the placeholder layer means today:
+
+- each platform is registered through the same adapter registry and gateway server flow
+- `POST /messages/<platform>` can already normalize a canonical inbound payload
+- `/api/gateway/status` reports each platform as `not_configured`, `configured_placeholder`, or `live`
+- placeholder outbound delivery returns a stable simulated delivery payload instead of raising random transport errors
+
+This keeps the HarborBeacon `v1.5` seam stable while giving us a near-usable skeleton for future live transports.
+
 ## Layout
 
 ```text
@@ -144,6 +173,45 @@ Behavior in this mode:
 
 If `HARBORBEACON_TASK_API_URL` is unset, the gateway falls back to the local rule-based brain or the OpenAI-compatible backend.
 
+## Current prelaunch scope
+
+This repo currently treats the cross-repo prelaunch rehearsal like this:
+
+- Feishu is the stable baseline surface on the same HarborBeacon `v1.5` seam
+- Weixin `1:1` text is on a parity track with the same fixed blocker taxonomy: `account_restore`, `qr_recovery`, `getupdates`, and `context_token_send`
+- only when both surfaces pass the same rehearsal matrix do we call the result `dual-surface ready`
+- HarborBeacon still only sees `POST /api/tasks` and `POST /api/notifications/deliveries`
+- Weixin group chats remain explicitly out of scope for this round
+
+Recommended live-gate collector:
+
+```powershell
+python .\tools\run_platform_live_gate.py
+```
+
+Optional HarborBeacon-backed rehearsal, when a task API endpoint is already running:
+
+```powershell
+python .\tools\run_platform_live_gate.py `
+  --task-api-url http://127.0.0.1:4175 `
+  --task-api-token your-shared-token
+```
+
+The script writes a JSON report under `data/runtime/platform-live-gate/` and
+returns one of three decisions:
+
+- `dual_surface_ready`
+- `feishu_baseline_with_weixin_parity_track`
+- `blocked`
+
+Use the generated report like this:
+
+- `feishu.rehearsal_ready` tells you whether the Feishu baseline surface passed the full rehearsal matrix
+- `weixin.rehearsal_ready` tells you whether Weixin passed the same matrix
+- `notification_replay` and `proactive_notification_replay` show source-bound versus proactive delivery outcomes
+- `parity_ready=true` means both surfaces are ready and the system is `dual-surface ready`
+- `decision_reason` and `weixin_blocker_category` explain why Weixin is still below parity when the baseline remains available
+
 ## Notification delivery endpoint
 
 The gateway now exposes the IM-side notification contract endpoint:
@@ -153,11 +221,13 @@ The gateway now exposes the IM-side notification contract endpoint:
 Current behavior:
 
 - resolves outbound routes primarily through `destination.route_key`
+- falls back to `destination.platform` plus `destination.id` or `destination.recipient` when no `route_key` is supplied
 - uses a shared non-200 error envelope for request-rejection failures such as `ROUTE_NOT_FOUND`
 - uses HTTP 200 delivery responses for accepted requests
 - enforces `delivery.mode` field combinations
 - stores outbound idempotency results by `delivery.idempotency_key`
 - optional redacted gateway status is available at `GET /api/gateway/status`
+- gateway status includes a redacted `delivery_observability` summary with source-bound versus proactive counts and queue/failure classification
 
 Required request header:
 
@@ -312,6 +382,29 @@ Important:
 - the user must send the bot a DM first, because the first inbound message provides the `context_token`
 - if `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` are unset, replies come from the built-in demo brain
 - if you want model-backed responses, set those variables before starting the runner
+
+### 4. Confirm real provider-side ingress
+
+Use the ingress probe when you need to distinguish between:
+
+- `poll is healthy but no private text has arrived yet`
+- `poll itself is failing`
+
+```powershell
+harborgate-weixin-ingress-probe
+```
+
+Or, without reinstalling scripts:
+
+```powershell
+python .\tools\run_weixin_ingress_probe.py
+```
+
+What to expect:
+
+- `provider_private_text_seen=true` means HarborGate has observed a real provider-originated Weixin private text message
+- `last_poll_outcome=idle_timeout` means long polling was healthy but idle; this is no longer treated as a transport failure
+- `blocked_reason=waiting_for_private_text` means the account is restored and polling is healthy, but you still need to send one real DM from Weixin to complete the ingress proof
 
 ## Feishu transport
 

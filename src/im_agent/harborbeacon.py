@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import warnings
 from dataclasses import dataclass, field
 from typing import Any
 from urllib import error, parse, request
@@ -16,28 +15,30 @@ DEFAULT_INTENT_DOMAIN = "general"
 DEFAULT_INTENT_ACTION = "message"
 DEFAULT_SOURCE_SURFACE = "harborgate"
 DEFAULT_TIMEOUT_SECONDS = 15
+DEFAULT_ADMIN_TIMEOUT_SECONDS = 10
 
 
-def _env_with_legacy_alias(primary: str, legacy: str) -> str:
-    primary_value = os.getenv(primary, "").strip()
-    if primary_value:
-        return primary_value
-
-    legacy_value = os.getenv(legacy, "").strip()
-    if legacy_value:
-        warnings.warn(
-            f"{legacy} is deprecated; prefer {primary}",
-            FutureWarning,
-            stacklevel=2,
-        )
-    return legacy_value
+def _env(primary: str) -> str:
+    return os.getenv(primary, "").strip()
 
 
-def _int_env_with_legacy_alias(primary: str, legacy: str, default: int) -> int:
-    raw = _env_with_legacy_alias(primary, legacy)
+def _int_env(primary: str, default: int) -> int:
+    raw = _env(primary)
     if not raw:
         return default
     return int(raw)
+
+
+def _strip_endpoint_suffix(base_url: str, endpoint_suffix: str) -> str:
+    normalized = base_url.strip()
+    if not normalized:
+        return ""
+    if normalized.endswith(endpoint_suffix):
+        return normalized[: -len(endpoint_suffix)].rstrip("/")
+    suffixed = f"{endpoint_suffix}/"
+    if normalized.endswith(suffixed):
+        return normalized[: -len(suffixed)].rstrip("/")
+    return normalized
 
 
 def _canonical_json(payload: Any) -> str:
@@ -308,59 +309,124 @@ class HarborBeaconTaskClient:
         )
 
 
+@dataclass(slots=True)
+class HarborBeaconAdminClient:
+    base_url: str
+    api_token: str = ""
+    contract_version: str = DEFAULT_CONTRACT_VERSION
+    timeout_seconds: int = DEFAULT_ADMIN_TIMEOUT_SECONDS
+
+    def upsert_notification_target(
+        self,
+        *,
+        label: str,
+        route_key: str,
+        platform_hint: str,
+        is_default: bool = False,
+        target_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "label": label,
+            "route_key": route_key,
+            "platform_hint": platform_hint,
+        }
+        if is_default:
+            payload["is_default"] = True
+        if target_id and target_id.strip():
+            payload["target_id"] = target_id.strip()
+        return self._post_json("/api/admin/notification-targets", payload)
+
+    def _post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        req = request.Request(
+            self._url(endpoint),
+            data=body,
+            headers=self._headers(body),
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(self._format_http_error(exc.code, detail)) from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"Could not reach HarborBeacon admin API: {exc.reason}") from exc
+
+        data = json.loads(raw) if raw else {}
+        if not isinstance(data, dict):
+            raise RuntimeError("HarborBeacon admin API returned a non-object JSON payload")
+        return data
+
+    def _headers(self, body: bytes) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+            "X-Contract-Version": self.contract_version,
+        }
+        if self.api_token:
+            headers["Authorization"] = f"Bearer {self.api_token}"
+        return headers
+
+    def _url(self, endpoint: str) -> str:
+        if self.base_url.endswith(endpoint):
+            return self.base_url
+        return parse.urljoin(f"{self.base_url.rstrip('/')}/", endpoint.lstrip("/"))
+
+    @staticmethod
+    def _format_http_error(status_code: int, detail: str) -> str:
+        message = f"HarborBeacon admin API returned HTTP {status_code}"
+        try:
+            payload = json.loads(detail)
+        except json.JSONDecodeError:
+            payload = None
+
+        if isinstance(payload, dict):
+            error_block = payload.get("error")
+            if isinstance(error_block, dict):
+                code = str(error_block.get("code") or "").strip()
+                text = str(error_block.get("message") or "").strip()
+                details = " ".join(part for part in (code, text) if part).strip()
+                if details:
+                    return f"{message}: {details}"
+        detail = detail.strip()
+        return f"{message}: {detail}" if detail else message
+
+
 def build_harborbeacon_client_from_env() -> HarborBeaconTaskClient | None:
-    base_url = _env_with_legacy_alias(
-        "HARBORBEACON_TASK_API_URL",
-        "HARBORNAS_TASK_API_URL",
-    )
+    base_url = _env("HARBORBEACON_TASK_API_URL")
     if not base_url:
         return None
     return HarborBeaconTaskClient(
         base_url=base_url,
-        api_token=_env_with_legacy_alias(
-            "HARBORBEACON_TASK_API_TOKEN",
-            "HARBORNAS_TASK_API_TOKEN",
-        ),
-        contract_version=_env_with_legacy_alias(
-            "HARBORBEACON_CONTRACT_VERSION",
-            "HARBORNAS_CONTRACT_VERSION",
-        )
-        or DEFAULT_CONTRACT_VERSION,
-        autonomy_level=_env_with_legacy_alias(
-            "HARBORBEACON_AUTONOMY_LEVEL",
-            "HARBORNAS_AUTONOMY_LEVEL",
-        )
-        or DEFAULT_AUTONOMY_LEVEL,
-        default_domain=_env_with_legacy_alias(
-            "HARBORBEACON_DEFAULT_DOMAIN",
-            "HARBORNAS_DEFAULT_DOMAIN",
-        )
-        or DEFAULT_INTENT_DOMAIN,
-        default_action=_env_with_legacy_alias(
-            "HARBORBEACON_DEFAULT_ACTION",
-            "HARBORNAS_DEFAULT_ACTION",
-        )
-        or DEFAULT_INTENT_ACTION,
-        source_surface=_env_with_legacy_alias(
-            "HARBORBEACON_SOURCE_SURFACE",
-            "HARBORNAS_SOURCE_SURFACE",
-        )
-        or DEFAULT_SOURCE_SURFACE,
-        timeout_seconds=_int_env_with_legacy_alias(
+        api_token=_env("HARBORBEACON_TASK_API_TOKEN"),
+        contract_version=_env("HARBORBEACON_CONTRACT_VERSION") or DEFAULT_CONTRACT_VERSION,
+        autonomy_level=_env("HARBORBEACON_AUTONOMY_LEVEL") or DEFAULT_AUTONOMY_LEVEL,
+        default_domain=_env("HARBORBEACON_DEFAULT_DOMAIN") or DEFAULT_INTENT_DOMAIN,
+        default_action=_env("HARBORBEACON_DEFAULT_ACTION") or DEFAULT_INTENT_ACTION,
+        source_surface=_env("HARBORBEACON_SOURCE_SURFACE") or DEFAULT_SOURCE_SURFACE,
+        timeout_seconds=_int_env(
             "HARBORBEACON_TASK_API_TIMEOUT_SECONDS",
-            "HARBORNAS_TASK_API_TIMEOUT_SECONDS",
             DEFAULT_TIMEOUT_SECONDS,
         ),
     )
 
 
-HarborNASTaskClient = HarborBeaconTaskClient
-
-
-def build_harbornas_client_from_env() -> HarborBeaconTaskClient | None:
-    warnings.warn(
-        "build_harbornas_client_from_env() is deprecated; prefer build_harborbeacon_client_from_env()",
-        FutureWarning,
-        stacklevel=2,
+def build_harborbeacon_admin_client_from_env() -> HarborBeaconAdminClient | None:
+    base_url = _env("HARBORBEACON_ADMIN_API_URL") or _env("HARBORBEACON_TASK_API_URL")
+    base_url = _strip_endpoint_suffix(base_url, "/api/tasks")
+    if not base_url:
+        return None
+    return HarborBeaconAdminClient(
+        base_url=base_url,
+        api_token=(
+            _env("HARBORBEACON_ADMIN_API_TOKEN")
+            or _env("HARBORBEACON_TASK_API_TOKEN")
+            or _env("IM_AGENT_SERVICE_TOKEN")
+        ),
+        contract_version=_env("HARBORBEACON_CONTRACT_VERSION") or DEFAULT_CONTRACT_VERSION,
+        timeout_seconds=_int_env(
+            "HARBORBEACON_ADMIN_API_TIMEOUT_SECONDS",
+            DEFAULT_ADMIN_TIMEOUT_SECONDS,
+        ),
     )
-    return build_harborbeacon_client_from_env()

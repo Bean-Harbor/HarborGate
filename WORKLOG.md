@@ -1,5 +1,24 @@
 # HarborGate Work Log
 
+## 2026-04-19
+
+### Closeout Snapshot
+
+- Feishu baseline rehearsal is ready on the frozen HarborBeacon `v1.5` seam.
+- Weixin remains on the parity track with blockers only in the four fixed ingress classes: `account_restore`, `qr_recovery`, `getupdates`, and `context_token_send`.
+- The closeout stayed within HarborGate-only docs and verification; no HarborBeacon contract or recipient-shape changes were made.
+
+### Validation Commands
+
+```powershell
+pytest tests/test_platform_live_gate.py tests/test_gateway.py tests/test_weixin_adapter.py
+```
+
+### Known Pending
+
+- Weixin private-DM ingress still needs one of the four fixed blockers cleared before it reaches parity with the Feishu rehearsal surface.
+- Group chats remain out of scope for this cutover and should not be used to widen the seam.
+
 ## 2026-04-18
 
 ### Contract Baseline Locked
@@ -28,7 +47,7 @@
 
 ### Repository Tracking
 
-- Created GitHub repository: `https://github.com/Bean-Harbor/harbornas-im-gateway`
+- Created GitHub repository: `https://github.com/Bean-Harbor/harborbeacon-im-gateway`
 - Local repo has been initialized and prepared for first push.
 - Added `.gitignore` protections so local runtime state under `data/` is not committed.
 - A dedicated GitHub Projects board is still pending because the current GitHub token does not include project scopes.
