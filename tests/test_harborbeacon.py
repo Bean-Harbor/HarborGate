@@ -380,6 +380,25 @@ class HarborBeaconContractTests(unittest.TestCase):
         self.assertEqual(client.base_url, "http://127.0.0.1:4175")
         self.assertEqual(client.api_token, "task-token")
 
+    def test_admin_env_builder_prefers_explicit_admin_url_and_token(self) -> None:
+        previous = {
+            "HARBORBEACON_TASK_API_URL": os.environ.get("HARBORBEACON_TASK_API_URL"),
+            "HARBORBEACON_TASK_API_TOKEN": os.environ.get("HARBORBEACON_TASK_API_TOKEN"),
+            "HARBORBEACON_ADMIN_API_URL": os.environ.get("HARBORBEACON_ADMIN_API_URL"),
+            "HARBORBEACON_ADMIN_API_TOKEN": os.environ.get("HARBORBEACON_ADMIN_API_TOKEN"),
+        }
+        os.environ["HARBORBEACON_TASK_API_URL"] = "http://127.0.0.1:4175/api/tasks"
+        os.environ["HARBORBEACON_TASK_API_TOKEN"] = "task-token"
+        os.environ["HARBORBEACON_ADMIN_API_URL"] = "http://127.0.0.1:4174"
+        os.environ["HARBORBEACON_ADMIN_API_TOKEN"] = "admin-token"
+        self.addCleanup(self._restore_env, previous)
+
+        client = build_harborbeacon_admin_client_from_env()
+        self.assertIsNotNone(client)
+        assert client is not None
+        self.assertEqual(client.base_url, "http://127.0.0.1:4174")
+        self.assertEqual(client.api_token, "admin-token")
+
     @staticmethod
     def _restore_env(previous: dict[str, str | None]) -> None:
         for key, value in previous.items():

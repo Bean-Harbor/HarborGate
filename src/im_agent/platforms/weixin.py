@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
+import shutil
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -19,17 +23,24 @@ ILINK_APP_ID = "bot"
 ILINK_APP_CLIENT_VERSION = str((2 << 16) | (2 << 8) | 0)
 
 EP_GET_UPDATES = "ilink/bot/getupdates"
+EP_GET_UPLOAD_URL = "ilink/bot/getuploadurl"
 EP_SEND_MESSAGE = "ilink/bot/sendmessage"
 EP_GET_BOT_QR = "ilink/bot/get_bot_qrcode"
 EP_GET_QR_STATUS = "ilink/bot/get_qrcode_status"
 
 ITEM_TEXT = 1
+ITEM_IMAGE = 2
 MSG_TYPE_BOT = 2
 MSG_STATE_FINISH = 2
+UPLOAD_MEDIA_IMAGE = 1
+WEIXIN_MEDIA_ENCRYPT_TYPE = 1
+DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 
 DEFAULT_TIMEOUT_SECONDS = 45
 DEFAULT_POLL_TIMEOUT_MS = 35_000
 MAX_TEXT_CHUNK_LENGTH = 900
+MAX_IMAGE_THUMBNAIL_EDGE = 320
+CDN_UPLOAD_MAX_RETRIES = 3
 
 
 def utc_now_iso() -> str:
@@ -250,6 +261,22 @@ def build_send_message_payload(
     context_token: str | None,
     client_id: str | None = None,
 ) -> dict[str, Any]:
+    items = [{"type": ITEM_TEXT, "text_item": {"text": text}}] if text else []
+    return build_send_message_payload_items(
+        to_user_id=to_user_id,
+        item_list=items,
+        context_token=context_token,
+        client_id=client_id,
+    )
+
+
+def build_send_message_payload_items(
+    *,
+    to_user_id: str,
+    item_list: list[dict[str, Any]],
+    context_token: str | None,
+    client_id: str | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "msg": {
             "from_user_id": "",
@@ -257,12 +284,301 @@ def build_send_message_payload(
             "client_id": client_id or f"harborgate-{uuid.uuid4().hex}",
             "message_type": MSG_TYPE_BOT,
             "message_state": MSG_STATE_FINISH,
-            "item_list": [{"type": ITEM_TEXT, "text_item": {"text": text}}],
         }
     }
+    if item_list:
+        payload["msg"]["item_list"] = item_list
     if context_token:
         payload["msg"]["context_token"] = context_token
     return payload
+
+
+def _md5_hex(payload: bytes) -> str:
+    return hashlib.md5(payload).hexdigest()
+
+
+def _aes_ecb_padded_size(plaintext_size: int) -> int:
+    return ((plaintext_size // 16) + 1) * 16
+
+
+def _encrypt_aes_ecb(plaintext: bytes, key: bytes) -> bytes:
+    try:
+        from cryptography.hazmat.primitives import padding
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError as exc:  # pragma: no cover - runtime dependency boundary
+        raise RuntimeError(
+            "Weixin native image send requires the cryptography package for AES-128-ECB"
+        ) from exc
+
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return encryptor.update(padded) + encryptor.finalize()
+
+
+def _build_cdn_upload_url(*, cdn_base_url: str, upload_param: str, filekey: str) -> str:
+    return (
+        f"{cdn_base_url.rstrip('/')}/upload"
+        f"?encrypted_query_param={parse.quote(upload_param)}"
+        f"&filekey={parse.quote(filekey)}"
+    )
+
+
+def _upload_binary_to_cdn(
+    *,
+    plaintext: bytes,
+    upload_full_url: str | None,
+    upload_param: str | None,
+    filekey: str,
+    cdn_base_url: str,
+    aeskey: bytes,
+    label: str,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> str:
+    ciphertext = _encrypt_aes_ecb(plaintext, aeskey)
+    trimmed_full_url = str(upload_full_url or "").strip()
+    if trimmed_full_url:
+        upload_url = trimmed_full_url
+    else:
+        trimmed_upload_param = str(upload_param or "").strip()
+        if not trimmed_upload_param:
+            raise RuntimeError(f"{label}: CDN upload URL missing")
+        upload_url = _build_cdn_upload_url(
+            cdn_base_url=cdn_base_url,
+            upload_param=trimmed_upload_param,
+            filekey=filekey,
+        )
+
+    last_error: Exception | None = None
+    for attempt in range(1, CDN_UPLOAD_MAX_RETRIES + 1):
+        req = request.Request(
+            upload_url,
+            data=ciphertext,
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=timeout_seconds) as response:
+                encrypted_param = response.headers.get("x-encrypted-param", "").strip()
+                if not encrypted_param:
+                    raise RuntimeError("CDN upload response missing x-encrypted-param header")
+                return encrypted_param
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            status_message = exc.headers.get("x-error-message", "").strip() or detail or str(exc)
+            if 400 <= exc.code < 500:
+                raise RuntimeError(
+                    f"{label}: CDN client error {exc.code}: {status_message}"
+                ) from exc
+            last_error = RuntimeError(f"{label}: CDN server error {exc.code}: {status_message}")
+        except Exception as exc:  # pragma: no cover - network retry boundary
+            last_error = exc if isinstance(exc, RuntimeError) else RuntimeError(str(exc))
+        if attempt >= CDN_UPLOAD_MAX_RETRIES:
+            break
+    raise RuntimeError(str(last_error or f"{label}: CDN upload failed"))
+
+
+def _resolve_ffmpeg_bin() -> str:
+    candidate = str(os.getenv("HARBOR_FFMPEG_BIN", "")).strip()
+    if candidate and Path(candidate).is_file():
+        return candidate
+    fallback = shutil.which("ffmpeg")
+    if fallback:
+        return fallback
+    raise RuntimeError("No ffmpeg binary is available for Weixin image thumbnail generation")
+
+
+def _render_jpeg_thumbnail_bytes(image_path: Path) -> bytes:
+    ffmpeg_bin = _resolve_ffmpeg_bin()
+    proc = subprocess.run(
+        [
+            ffmpeg_bin,
+            "-loglevel",
+            "error",
+            "-i",
+            str(image_path),
+            "-vf",
+            f"scale={MAX_IMAGE_THUMBNAIL_EDGE}:-2:force_original_aspect_ratio=decrease",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        error_text = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg thumbnail render failed: {error_text or proc.returncode}")
+    if not proc.stdout:
+        raise RuntimeError("ffmpeg thumbnail render produced empty output")
+    return proc.stdout
+
+
+def _resolve_local_attachment_path(raw_path: str) -> Path | None:
+    normalized = str(raw_path or "").strip()
+    if not normalized:
+        return None
+
+    candidate = Path(normalized)
+    if candidate.is_file():
+        return candidate
+
+    if candidate.is_absolute():
+        return None
+
+    roots = []
+    for env_name in (
+        "HARBOR_CAPTURE_ROOT",
+        "HARBOR_HARBOROS_WRITABLE_ROOT",
+        "HARBOR_RELEASE_INSTALL_ROOT",
+        "WORKSPACE_ROOT",
+    ):
+        root = str(os.getenv(env_name, "")).strip()
+        if root:
+            roots.append(Path(root))
+    roots.append(Path.cwd())
+
+    for root in roots:
+        resolved = root / normalized
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+@dataclass(slots=True)
+class WeixinUploadedImage:
+    filekey: str
+    original_download_param: str
+    thumbnail_download_param: str
+    aeskey_hex: str
+    original_size: int
+    original_ciphertext_size: int
+    thumbnail_size: int
+    thumbnail_ciphertext_size: int
+
+
+def _upload_image_artifact_to_weixin(
+    *,
+    image_path: Path,
+    to_user_id: str,
+    base_url: str,
+    token: str,
+    cdn_base_url: str,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> WeixinUploadedImage:
+    original_bytes = image_path.read_bytes()
+    if not original_bytes:
+        raise RuntimeError(f"Weixin image artifact is empty: {image_path}")
+
+    thumbnail_bytes = _render_jpeg_thumbnail_bytes(image_path)
+    filekey = os.urandom(16).hex()
+    aeskey = os.urandom(16)
+    upload_payload = {
+        "filekey": filekey,
+        "media_type": UPLOAD_MEDIA_IMAGE,
+        "to_user_id": to_user_id,
+        "rawsize": len(original_bytes),
+        "rawfilemd5": _md5_hex(original_bytes),
+        "filesize": _aes_ecb_padded_size(len(original_bytes)),
+        "thumb_rawsize": len(thumbnail_bytes),
+        "thumb_rawfilemd5": _md5_hex(thumbnail_bytes),
+        "thumb_filesize": _aes_ecb_padded_size(len(thumbnail_bytes)),
+        "no_need_thumb": False,
+        "aeskey": aeskey.hex(),
+    }
+    upload_response = post_json(
+        base_url,
+        EP_GET_UPLOAD_URL,
+        upload_payload,
+        token=token,
+        timeout_seconds=timeout_seconds,
+    )
+    upload_full_url = str(upload_response.get("upload_full_url") or "").strip() or None
+    upload_param = str(upload_response.get("upload_param") or "").strip() or None
+    thumb_upload_param = str(upload_response.get("thumb_upload_param") or "").strip() or None
+    if not upload_full_url and not upload_param:
+        raise RuntimeError("Weixin getuploadurl returned no upload URL for the original image")
+    if not thumb_upload_param:
+        raise RuntimeError("Weixin getuploadurl returned no thumbnail upload URL")
+
+    original_download_param = _upload_binary_to_cdn(
+        plaintext=original_bytes,
+        upload_full_url=upload_full_url,
+        upload_param=upload_param,
+        filekey=filekey,
+        cdn_base_url=cdn_base_url,
+        aeskey=aeskey,
+        label="weixin-image-orig",
+        timeout_seconds=timeout_seconds,
+    )
+    thumbnail_download_param = _upload_binary_to_cdn(
+        plaintext=thumbnail_bytes,
+        upload_full_url=None,
+        upload_param=thumb_upload_param,
+        filekey=filekey,
+        cdn_base_url=cdn_base_url,
+        aeskey=aeskey,
+        label="weixin-image-thumb",
+        timeout_seconds=timeout_seconds,
+    )
+    return WeixinUploadedImage(
+        filekey=filekey,
+        original_download_param=original_download_param,
+        thumbnail_download_param=thumbnail_download_param,
+        aeskey_hex=aeskey.hex(),
+        original_size=len(original_bytes),
+        original_ciphertext_size=_aes_ecb_padded_size(len(original_bytes)),
+        thumbnail_size=len(thumbnail_bytes),
+        thumbnail_ciphertext_size=_aes_ecb_padded_size(len(thumbnail_bytes)),
+    )
+
+
+def _build_native_image_message_item(uploaded: WeixinUploadedImage) -> dict[str, Any]:
+    aes_key_base64 = base64.b64encode(bytes.fromhex(uploaded.aeskey_hex)).decode("ascii")
+    return {
+        "type": ITEM_IMAGE,
+        "image_item": {
+            "media": {
+                "encrypt_query_param": uploaded.original_download_param,
+                "aes_key": aes_key_base64,
+                "encrypt_type": WEIXIN_MEDIA_ENCRYPT_TYPE,
+            },
+            "thumb_media": {
+                "encrypt_query_param": uploaded.thumbnail_download_param,
+                "aes_key": aes_key_base64,
+                "encrypt_type": WEIXIN_MEDIA_ENCRYPT_TYPE,
+            },
+            "aeskey": uploaded.aeskey_hex,
+            "mid_size": uploaded.original_ciphertext_size,
+            "hd_size": uploaded.original_ciphertext_size,
+            "thumb_size": uploaded.thumbnail_ciphertext_size,
+        },
+    }
+
+
+def _should_send_native_image_reply(outbound: OutboundMessage) -> bool:
+    return str(outbound.metadata.get("source") or "").strip() == "harborbeacon" and bool(outbound.attachments)
+
+
+def _resolve_native_image_attachment_path(outbound: OutboundMessage) -> Path:
+    attachments = [item for item in outbound.attachments if isinstance(item, dict)]
+    if len(attachments) != 1:
+        raise RuntimeError("Weixin native image reply requires exactly one attachment")
+
+    attachment = attachments[0]
+    kind = str(attachment.get("kind") or attachment.get("type") or "").strip().lower()
+    mime_type = str(attachment.get("mime_type") or "").strip().lower()
+    if kind != "image" or not mime_type.startswith("image/"):
+        raise RuntimeError("Weixin native image reply requires a single image/* attachment")
+
+    path = _resolve_local_attachment_path(str(attachment.get("path") or ""))
+    if path is None:
+        raise RuntimeError("Weixin native image reply requires a readable same-host attachment path")
+    return path
 
 
 def _headers(token: str | None, body: bytes | None = None) -> dict[str, str]:
@@ -407,6 +723,7 @@ class WeixinAdapter(PlatformAdapter):
         self.account_id = (account_id or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
         self.token = (token or os.getenv("WEIXIN_BOT_TOKEN", "")).strip()
         self.base_url = (base_url or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip() or ILINK_BASE_URL
+        self.cdn_base_url = str(os.getenv("WEIXIN_CDN_BASE_URL", DEFAULT_CDN_BASE_URL)).strip() or DEFAULT_CDN_BASE_URL
         self.user_id = os.getenv("WEIXIN_USER_ID", "").strip()
         self._transport_state: dict[str, Any] = {
             "mode": "polling",
@@ -430,6 +747,8 @@ class WeixinAdapter(PlatformAdapter):
             "last_send_retryable": False,
             "last_send_provider_message_id": "",
             "last_send_context_token_used": False,
+            "last_send_attachment_count": 0,
+            "last_send_content_kind": "",
             "last_inbound_at": "",
             "last_inbound_message_id": "",
             "last_inbound_chat_id": "",
@@ -460,7 +779,7 @@ class WeixinAdapter(PlatformAdapter):
             "surface_family": "weixin",
             "transport_mode": "polling",
             "supports_mentions": False,
-            "supports_attachments": False,
+            "supports_attachments": True,
             "supports_replies": True,
             "supports_updates": False,
             "supports_live_receive": False,
@@ -636,9 +955,11 @@ class WeixinAdapter(PlatformAdapter):
                 "Send a DM from WeChat first so the gateway can learn the session token."
             )
 
-        chunks = split_text_for_weixin(outbound.text)
-        if not chunks:
+        native_image_reply = _should_send_native_image_reply(outbound)
+        chunks = split_text_for_weixin(outbound.text) if not native_image_reply else []
+        if not native_image_reply and not chunks:
             raise RuntimeError("Outbound Weixin message is empty")
+        send_unit_count = 1 if native_image_reply else len(chunks)
 
         observed_at = utc_now_iso()
         self._set_transport_state(
@@ -646,24 +967,47 @@ class WeixinAdapter(PlatformAdapter):
             connected=True,
             last_error="",
             last_send_at=observed_at,
-            last_send_chunk_count=len(chunks),
+            last_send_chunk_count=send_unit_count,
             last_inbound_chat_id=outbound.chat_id,
             last_send_status="sending",
             last_send_error="",
             last_send_retryable=False,
             last_send_provider_message_id="",
             last_send_context_token_used=True,
+            last_send_attachment_count=len(outbound.attachments),
+            last_send_content_kind="text+image" if native_image_reply else "text",
         )
         last_client_id = ""
         try:
-            for chunk in chunks:
-                payload = build_send_message_payload(
+            if native_image_reply:
+                attachment_path = _resolve_native_image_attachment_path(outbound)
+                uploaded_image = _upload_image_artifact_to_weixin(
+                    image_path=attachment_path,
                     to_user_id=outbound.chat_id,
-                    text=chunk,
+                    base_url=self.base_url,
+                    token=self.token,
+                    cdn_base_url=self.cdn_base_url,
+                )
+                item_list: list[dict[str, Any]] = []
+                if outbound.text.strip():
+                    item_list.append({"type": ITEM_TEXT, "text_item": {"text": outbound.text.strip()}})
+                item_list.append(_build_native_image_message_item(uploaded_image))
+                payload = build_send_message_payload_items(
+                    to_user_id=outbound.chat_id,
+                    item_list=item_list,
                     context_token=context_token,
                 )
                 last_client_id = str((payload.get("msg") or {}).get("client_id") or "")
                 post_json(self.base_url, EP_SEND_MESSAGE, payload, token=self.token)
+            else:
+                for chunk in chunks:
+                    payload = build_send_message_payload(
+                        to_user_id=outbound.chat_id,
+                        text=chunk,
+                        context_token=context_token,
+                    )
+                    last_client_id = str((payload.get("msg") or {}).get("client_id") or "")
+                    post_json(self.base_url, EP_SEND_MESSAGE, payload, token=self.token)
         except Exception as exc:
             error_text = _redact_sensitive_text(str(exc), self.account_id, self.token, context_token)
             self._set_transport_state(
@@ -673,7 +1017,7 @@ class WeixinAdapter(PlatformAdapter):
                 last_error=error_text,
                 last_send_status="failed",
                 last_send_error=error_text,
-                last_send_retryable=True,
+                last_send_retryable=False if native_image_reply else True,
                 last_send_provider_message_id=last_client_id,
                 last_send_context_token_used=True,
             )
@@ -699,10 +1043,13 @@ class WeixinAdapter(PlatformAdapter):
             "sent": True,
             "message_id": last_client_id,
             "provider_message_id": last_client_id,
+            "attachments": [dict(item) for item in outbound.attachments if isinstance(item, dict)],
             "metadata": {
                 **outbound.metadata,
                 "context_token_used": True,
-                "chunk_count": len(chunks),
+                "chunk_count": send_unit_count,
+                "attachment_count": len(outbound.attachments),
+                "native_image_reply": native_image_reply,
             },
         }
 

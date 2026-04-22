@@ -112,7 +112,84 @@ def _render_retrieval_entry(record: dict[str, object], *, kind: str) -> str:
     return primary or secondary or "未命名附件"
 
 
-def _render_retrieval_reply(base_text: str, response_payload: dict[str, object]) -> tuple[str, dict[str, object]]:
+def _coerce_artifact_candidates(response_payload: dict[str, object]) -> list[dict[str, object]]:
+    result = response_payload.get("result")
+    result = result if isinstance(result, dict) else {}
+    return _coerce_record_list(
+        result.get("artifacts")
+        or result.get("attachments")
+        or result.get("evidence")
+    )
+
+
+def _normalize_outbound_attachment(record: dict[str, object]) -> dict[str, object] | None:
+    kind = str(record.get("kind") or record.get("type") or "").strip().lower()
+    mime_type = str(record.get("mime_type") or "").strip().lower()
+    label = str(record.get("label") or record.get("name") or record.get("title") or "").strip()
+    media_asset_id = str(record.get("media_asset_id") or "").strip()
+    path = str(record.get("path") or "").strip()
+    url = str(record.get("url") or "").strip()
+    metadata = dict(record.get("metadata") or {}) if isinstance(record.get("metadata"), dict) else {}
+
+    if not kind:
+        if mime_type.startswith("image/"):
+            kind = "image"
+        elif mime_type.startswith("video/"):
+            kind = "video"
+        elif url:
+            kind = "link"
+        else:
+            kind = "text"
+
+    if not (path or url or media_asset_id):
+        return None
+
+    return {
+        "kind": kind,
+        "label": label,
+        "mime_type": mime_type,
+        "media_asset_id": media_asset_id,
+        "path": path,
+        "url": url,
+        "metadata": metadata,
+    }
+
+
+def _native_source_bound_attachments(
+    *,
+    adapter_name: str,
+    response_payload: dict[str, object],
+) -> list[dict[str, object]]:
+    if adapter_name != "weixin":
+        return []
+
+    normalized = [
+        attachment
+        for attachment in (
+            _normalize_outbound_attachment(record)
+            for record in _coerce_artifact_candidates(response_payload)
+        )
+        if attachment is not None
+    ]
+    if len(normalized) != 1:
+        return []
+
+    attachment = normalized[0]
+    if attachment["kind"] != "image":
+        return []
+    if not str(attachment.get("mime_type") or "").startswith("image/"):
+        return []
+    if not str(attachment.get("path") or "").strip():
+        return []
+    return [attachment]
+
+
+def _render_retrieval_reply(
+    base_text: str,
+    response_payload: dict[str, object],
+    *,
+    suppress_artifact_entries: bool = False,
+) -> tuple[str, dict[str, object]]:
     result = response_payload.get("result")
     result = result if isinstance(result, dict) else {}
     citation_candidates = _coerce_record_list(
@@ -122,11 +199,7 @@ def _render_retrieval_reply(base_text: str, response_payload: dict[str, object])
         or result.get("top_hits")
         or result.get("hits")
     )
-    artifact_candidates = _coerce_record_list(
-        result.get("artifacts")
-        or result.get("attachments")
-        or result.get("evidence")
-    )
+    artifact_candidates = _coerce_artifact_candidates(response_payload)
 
     citation_entries = [_render_retrieval_entry(item, kind="citation") for item in citation_candidates[:3]]
     artifact_entries = [_render_retrieval_entry(item, kind="artifact") for item in artifact_candidates[:3]]
@@ -139,19 +212,20 @@ def _render_retrieval_reply(base_text: str, response_payload: dict[str, object])
         if len(citation_candidates) > len(citation_entries):
             citation_block = f"{citation_block}\n... 还有 {len(citation_candidates) - len(citation_entries)} 条引用"
         sections.append(f"引用\n{citation_block}")
-    if artifact_entries:
+    if artifact_entries and not suppress_artifact_entries:
         artifact_block = "\n".join(f"{index}. {entry}" for index, entry in enumerate(artifact_entries, start=1))
         if len(artifact_candidates) > len(artifact_entries):
             artifact_block = f"{artifact_block}\n... 还有 {len(artifact_candidates) - len(artifact_entries)} 个附件"
         sections.append(f"附件\n{artifact_block}")
 
+    has_rendered_retrieval = bool(citation_candidates or (artifact_candidates and not suppress_artifact_entries))
     retrieval_summary = {
-        "content_kind": "retrieval_reply" if (citation_candidates or artifact_candidates) else "plain_reply",
+        "content_kind": "retrieval_reply" if has_rendered_retrieval else "plain_reply",
         "citation_count": len(citation_candidates),
         "artifact_count": len(artifact_candidates),
         "rendered_sections": [section.split("\n", 1)[0] for section in sections[1:]],
     }
-    if citation_candidates or artifact_candidates:
+    if has_rendered_retrieval:
         header = f"检索结果（{len(citation_candidates)} 条引用，{len(artifact_candidates)} 个附件）"
         sections.insert(0, header)
 
@@ -285,7 +359,15 @@ class GatewayService:
         if self.task_client is not None:
             task_result = self.task_client.submit_turn(inbound, session_metadata=session_metadata)
             resolved_route_key = task_result.route_key or resolved_route_key
-            reply_text, retrieval_summary = _render_retrieval_reply(task_result.text, task_result.response_payload)
+            outbound_attachments = _native_source_bound_attachments(
+                adapter_name=adapter_name,
+                response_payload=task_result.response_payload,
+            )
+            reply_text, retrieval_summary = _render_retrieval_reply(
+                task_result.text,
+                task_result.response_payload,
+                suppress_artifact_entries=bool(outbound_attachments),
+            )
             next_metadata = {
                 **session_metadata,
                 "route_key": resolved_route_key,
@@ -319,6 +401,7 @@ class GatewayService:
                     "route_key": resolved_route_key,
                     "next_actions": task_result.next_actions,
                     "retrieval_render": retrieval_summary,
+                    "native_attachment_count": len(outbound_attachments),
                 }
             )
             if task_result.resume_token:
@@ -437,6 +520,7 @@ class GatewayService:
             platform=inbound.platform,
             chat_id=inbound.chat_id,
             text=reply_text,
+            attachments=outbound_attachments if self.task_client is not None else [],
             metadata=outbound_metadata,
         )
         adapter_response = adapter.send_outbound(outbound)
@@ -639,10 +723,16 @@ class GatewayService:
                 return dict(response_payload)
 
         outbound_text = self._build_notification_text(content)
+        attachments = [
+            dict(item)
+            for item in (content.get("attachments") or [])
+            if isinstance(item, dict)
+        ]
         outbound = OutboundMessage(
             platform=str(route.get("platform") or adapter_name),
             chat_id=str(route.get("chat_id") or ""),
             text=outbound_text,
+            attachments=attachments,
             metadata={
                 "source": "notification_delivery",
                 "notification_id": notification_id,
@@ -654,7 +744,7 @@ class GatewayService:
                 "reply_to_message_id": reply_to_message_id,
                 "update_message_id": update_message_id,
                 "payload_format": str(content.get("payload_format") or "plain_text").strip() or "plain_text",
-                "attachments": content.get("attachments") if isinstance(content.get("attachments"), list) else [],
+                "attachments": attachments,
                 "structured_payload": content.get("structured_payload") if isinstance(content.get("structured_payload"), dict) else {},
             },
         )

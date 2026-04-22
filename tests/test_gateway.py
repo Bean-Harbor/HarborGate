@@ -274,6 +274,41 @@ class FakePlainRetrievalTaskClient:
         )
 
 
+class FakeImageReplyTaskClient:
+    def __init__(self, image_path: str) -> None:
+        self.image_path = image_path
+        self.calls: list[dict[str, object]] = []
+
+    def submit_turn(self, incoming, *, session_metadata=None):  # type: ignore[no-untyped-def]
+        metadata = dict(session_metadata or {})
+        self.calls.append({"incoming": incoming, "session_metadata": metadata})
+        return TaskTurnResult(
+            text="已抓拍 Tapo 231 当前画面。",
+            task_id="task_camera_snapshot",
+            trace_id="trace_camera_snapshot",
+            status="completed",
+            route_key="gw_route_weixin_room1",
+            response_payload={
+                "task_id": "task_camera_snapshot",
+                "trace_id": "trace_camera_snapshot",
+                "status": "completed",
+                "result": {
+                    "message": "已抓拍 Tapo 231 当前画面。",
+                    "artifacts": [
+                        {
+                            "kind": "image",
+                            "label": "抓拍图片",
+                            "mime_type": "image/jpeg",
+                            "path": self.image_path,
+                            "url": None,
+                            "metadata": {"artifact_role": "camera_snapshot"},
+                        }
+                    ],
+                },
+            },
+        )
+
+
 class FakeSecondSurfaceAdapter(PlatformAdapter):
     name = "wechat-lite"
 
@@ -314,6 +349,37 @@ class FakeSecondSurfaceAdapter(PlatformAdapter):
             "message_id": "wechat-lite-message-1",
             "metadata": dict(outbound.metadata),
         }
+
+
+class FakeNativeWeixinAdapter(PlatformAdapter):
+    name = "weixin"
+
+    def get_profile(self) -> dict[str, object]:
+        return {
+            "adapter_name": self.name,
+            "surface_family": "weixin",
+            "transport_mode": "polling",
+            "supports_mentions": False,
+            "supports_attachments": True,
+            "supports_replies": True,
+            "supports_updates": False,
+            "supports_live_receive": False,
+        }
+
+    def normalize_inbound(self, payload):  # type: ignore[no-untyped-def]
+        return InboundMessage(
+            platform="weixin",
+            chat_id=str(payload.get("chat_id") or "").strip(),
+            user_id=str(payload.get("user_id") or "").strip(),
+            text=str(payload.get("text") or "").strip(),
+            message_id=str(payload.get("message_id") or "").strip(),
+            chat_type="p2p",
+            route_key=str(payload.get("route_key") or "").strip(),
+            raw_payload=payload,
+        )
+
+    def send_outbound(self, outbound: OutboundMessage):  # type: ignore[no-untyped-def]
+        return outbound.to_dict() | {"sent": True, "message_id": "wx-native-image-1"}
 
 
 class FakeNotificationTargetClient:
@@ -1190,6 +1256,40 @@ class GatewayServiceTests(unittest.TestCase):
             self.assertEqual(response["metadata"]["retrieval_render"]["citation_count"], 0)
             self.assertEqual(response["metadata"]["retrieval_render"]["artifact_count"], 0)
             self.assertEqual(response["metadata"]["retrieval_render"]["rendered_sections"], [])
+
+    def test_source_bound_weixin_image_reply_uses_attachment_field_without_synthetic_artifact_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
+            try:
+                image_path.write(b"fake-jpeg")
+                image_path.close()
+                gateway = GatewayService(
+                    store=FileSessionStore(tmp, max_turns=10),
+                    brain=RuleBasedBrain(),
+                    task_client=FakeImageReplyTaskClient(image_path.name),
+                )
+                gateway.register_adapter(FakeNativeWeixinAdapter())
+
+                response = gateway.handle_inbound(
+                    "weixin",
+                    {
+                        "chat_id": "wx-user-1",
+                        "user_id": "wx-user-1",
+                        "text": "帮我抓拍一下当前摄像头画面",
+                        "message_id": "wx-msg-native-image-1",
+                    },
+                )
+
+                self.assertEqual(response["text"], "已抓拍 Tapo 231 当前画面。")
+                self.assertEqual(response["metadata"]["retrieval_render"]["content_kind"], "plain_reply")
+                self.assertEqual(response["metadata"]["native_attachment_count"], 1)
+                self.assertEqual(len(response["attachments"]), 1)
+                self.assertEqual(response["attachments"][0]["kind"], "image")
+                self.assertEqual(response["attachments"][0]["mime_type"], "image/jpeg")
+                self.assertEqual(response["attachments"][0]["path"], image_path.name)
+                self.assertNotIn("附件", response["text"])
+            finally:
+                image_path.close()
 
     def test_local_retrieval_round_trip_launch_pack_smoke(self) -> None:
         payload = {
