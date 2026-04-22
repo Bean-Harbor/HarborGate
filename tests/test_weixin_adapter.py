@@ -1,4 +1,3 @@
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -243,70 +242,13 @@ class WeixinAdapterTests(unittest.TestCase):
             self.assertTrue(transport["last_send_provider_message_id"])
             self.assertEqual(mocked_post.call_count, 1)
 
-    def test_upload_image_artifact_to_weixin_requests_thumbnail_and_uploads_both_variants(self) -> None:
+    def test_upload_image_artifact_to_weixin_uses_original_only_upload_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
             try:
                 image_path.write(b"fake-jpeg-bytes")
                 image_path.close()
                 with patch(
-                    "im_agent.platforms.weixin._resolve_ffmpeg_bin",
-                    return_value="ffmpeg",
-                ), patch(
-                    "im_agent.platforms.weixin.subprocess.run",
-                    return_value=subprocess.CompletedProcess(
-                        args=["ffmpeg"],
-                        returncode=0,
-                        stdout=b"thumb-jpeg-bytes",
-                        stderr=b"",
-                    ),
-                ), patch(
-                    "im_agent.platforms.weixin.post_json",
-                    return_value={
-                        "upload_param": "orig-upload-param",
-                        "thumb_upload_param": "thumb-upload-param",
-                    },
-                ) as mocked_post, patch(
-                    "im_agent.platforms.weixin._upload_binary_to_cdn",
-                    side_effect=["orig-download-param", "thumb-download-param"],
-                ) as mocked_upload:
-                    uploaded = _upload_image_artifact_to_weixin(
-                        image_path=Path(image_path.name),
-                        to_user_id="wx-user-1",
-                        base_url="https://example.com",
-                        token="secret",
-                        cdn_base_url="https://cdn.example.com/c2c",
-                    )
-
-                request_payload = mocked_post.call_args.args[2]
-                self.assertEqual(mocked_post.call_args.args[1], "ilink/bot/getuploadurl")
-                self.assertEqual(request_payload["to_user_id"], "wx-user-1")
-                self.assertEqual(request_payload["thumb_rawsize"], len(b"thumb-jpeg-bytes"))
-                self.assertEqual(request_payload["no_need_thumb"], False)
-                self.assertEqual(mocked_upload.call_count, 2)
-                self.assertEqual(uploaded.original_download_param, "orig-download-param")
-                self.assertEqual(uploaded.thumbnail_download_param, "thumb-download-param")
-            finally:
-                image_path.close()
-
-    def test_upload_image_artifact_to_weixin_tolerates_missing_thumbnail_upload_param(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
-            try:
-                image_path.write(b"fake-jpeg-bytes")
-                image_path.close()
-                with patch(
-                    "im_agent.platforms.weixin._resolve_ffmpeg_bin",
-                    return_value="ffmpeg",
-                ), patch(
-                    "im_agent.platforms.weixin.subprocess.run",
-                    return_value=subprocess.CompletedProcess(
-                        args=["ffmpeg"],
-                        returncode=0,
-                        stdout=b"thumb-jpeg-bytes",
-                        stderr=b"",
-                    ),
-                ), patch(
                     "im_agent.platforms.weixin.post_json",
                     return_value={
                         "upload_param": "orig-upload-param",
@@ -324,9 +266,43 @@ class WeixinAdapterTests(unittest.TestCase):
                     )
 
                 request_payload = mocked_post.call_args.args[2]
+                self.assertEqual(mocked_post.call_args.args[1], "ilink/bot/getuploadurl")
                 self.assertEqual(request_payload["to_user_id"], "wx-user-1")
-                self.assertEqual(request_payload["thumb_rawsize"], len(b"thumb-jpeg-bytes"))
-                self.assertEqual(request_payload["no_need_thumb"], False)
+                self.assertNotIn("thumb_rawsize", request_payload)
+                self.assertEqual(request_payload["no_need_thumb"], True)
+                self.assertEqual(mocked_upload.call_count, 1)
+                self.assertEqual(uploaded.original_download_param, "orig-download-param")
+                self.assertEqual(uploaded.thumbnail_download_param, "")
+            finally:
+                image_path.close()
+
+    def test_upload_image_artifact_to_weixin_ignores_unexpected_thumbnail_upload_param(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
+            try:
+                image_path.write(b"fake-jpeg-bytes")
+                image_path.close()
+                with patch(
+                    "im_agent.platforms.weixin.post_json",
+                    return_value={
+                        "upload_param": "orig-upload-param",
+                        "thumb_upload_param": "thumb-upload-param",
+                    },
+                ) as mocked_post, patch(
+                    "im_agent.platforms.weixin._upload_binary_to_cdn",
+                    return_value="orig-download-param",
+                ) as mocked_upload:
+                    uploaded = _upload_image_artifact_to_weixin(
+                        image_path=Path(image_path.name),
+                        to_user_id="wx-user-1",
+                        base_url="https://example.com",
+                        token="secret",
+                        cdn_base_url="https://cdn.example.com/c2c",
+                    )
+
+                request_payload = mocked_post.call_args.args[2]
+                self.assertEqual(request_payload["to_user_id"], "wx-user-1")
+                self.assertEqual(request_payload["no_need_thumb"], True)
                 self.assertEqual(mocked_upload.call_count, 1)
                 self.assertEqual(uploaded.original_download_param, "orig-download-param")
                 self.assertEqual(uploaded.thumbnail_download_param, "")
@@ -419,6 +395,7 @@ class WeixinAdapterTests(unittest.TestCase):
                 self.assertEqual(len(second_payload["msg"]["item_list"]), 1)
                 self.assertEqual(first_payload["msg"]["item_list"][0]["type"], 1)
                 self.assertEqual(second_payload["msg"]["item_list"][0]["type"], 2)
+                self.assertNotIn("thumb_media", second_payload["msg"]["item_list"][0]["image_item"])
             finally:
                 image_path.close()
 

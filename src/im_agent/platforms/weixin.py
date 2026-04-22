@@ -4,8 +4,6 @@ import base64
 import hashlib
 import json
 import os
-import shutil
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -39,7 +37,6 @@ DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 DEFAULT_TIMEOUT_SECONDS = 45
 DEFAULT_POLL_TIMEOUT_MS = 35_000
 MAX_TEXT_CHUNK_LENGTH = 900
-MAX_IMAGE_THUMBNAIL_EDGE = 320
 CDN_UPLOAD_MAX_RETRIES = 3
 
 
@@ -378,46 +375,6 @@ def _upload_binary_to_cdn(
     raise RuntimeError(str(last_error or f"{label}: CDN upload failed"))
 
 
-def _resolve_ffmpeg_bin() -> str:
-    candidate = str(os.getenv("HARBOR_FFMPEG_BIN", "")).strip()
-    if candidate and Path(candidate).is_file():
-        return candidate
-    fallback = shutil.which("ffmpeg")
-    if fallback:
-        return fallback
-    raise RuntimeError("No ffmpeg binary is available for Weixin image thumbnail generation")
-
-
-def _render_jpeg_thumbnail_bytes(image_path: Path) -> bytes:
-    ffmpeg_bin = _resolve_ffmpeg_bin()
-    proc = subprocess.run(
-        [
-            ffmpeg_bin,
-            "-loglevel",
-            "error",
-            "-i",
-            str(image_path),
-            "-vf",
-            f"scale={MAX_IMAGE_THUMBNAIL_EDGE}:-2:force_original_aspect_ratio=decrease",
-            "-frames:v",
-            "1",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "pipe:1",
-        ],
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        error_text = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"ffmpeg thumbnail render failed: {error_text or proc.returncode}")
-    if not proc.stdout:
-        raise RuntimeError("ffmpeg thumbnail render produced empty output")
-    return proc.stdout
-
-
 def _resolve_local_attachment_path(raw_path: str) -> Path | None:
     normalized = str(raw_path or "").strip()
     if not normalized:
@@ -474,7 +431,6 @@ def _upload_image_artifact_to_weixin(
     if not original_bytes:
         raise RuntimeError(f"Weixin image artifact is empty: {image_path}")
 
-    thumbnail_bytes = _render_jpeg_thumbnail_bytes(image_path)
     filekey = os.urandom(16).hex()
     aeskey = os.urandom(16)
     upload_payload = {
@@ -484,10 +440,7 @@ def _upload_image_artifact_to_weixin(
         "rawsize": len(original_bytes),
         "rawfilemd5": _md5_hex(original_bytes),
         "filesize": _aes_ecb_padded_size(len(original_bytes)),
-        "thumb_rawsize": len(thumbnail_bytes),
-        "thumb_rawfilemd5": _md5_hex(thumbnail_bytes),
-        "thumb_filesize": _aes_ecb_padded_size(len(thumbnail_bytes)),
-        "no_need_thumb": False,
+        "no_need_thumb": True,
         "aeskey": aeskey.hex(),
     }
     upload_response = post_json(
@@ -513,36 +466,17 @@ def _upload_image_artifact_to_weixin(
         label="weixin-image-orig",
         timeout_seconds=timeout_seconds,
     )
-    thumbnail_download_param = ""
-    thumbnail_size = 0
-    thumbnail_ciphertext_size = 0
-    if thumb_upload_param:
-        thumbnail_download_param = _upload_binary_to_cdn(
-            plaintext=thumbnail_bytes,
-            upload_full_url=None,
-            upload_param=thumb_upload_param,
-            filekey=filekey,
-            cdn_base_url=cdn_base_url,
-            aeskey=aeskey,
-            label="weixin-image-thumb",
-            timeout_seconds=timeout_seconds,
-        )
-        thumbnail_size = len(thumbnail_bytes)
-        thumbnail_ciphertext_size = _aes_ecb_padded_size(len(thumbnail_bytes))
     return WeixinUploadedImage(
         filekey=filekey,
         original_download_param=original_download_param,
         aeskey_hex=aeskey.hex(),
         original_size=len(original_bytes),
         original_ciphertext_size=_aes_ecb_padded_size(len(original_bytes)),
-        thumbnail_download_param=thumbnail_download_param,
-        thumbnail_size=thumbnail_size,
-        thumbnail_ciphertext_size=thumbnail_ciphertext_size,
     )
 
 
 def _build_native_image_message_item(uploaded: WeixinUploadedImage) -> dict[str, Any]:
-    aes_key_base64 = base64.b64encode(bytes.fromhex(uploaded.aeskey_hex)).decode("ascii")
+    aes_key_base64 = base64.b64encode(uploaded.aeskey_hex.encode("ascii")).decode("ascii")
     image_item: dict[str, Any] = {
         "media": {
             "encrypt_query_param": uploaded.original_download_param,
@@ -551,15 +485,6 @@ def _build_native_image_message_item(uploaded: WeixinUploadedImage) -> dict[str,
         },
         "mid_size": uploaded.original_ciphertext_size,
     }
-    if uploaded.thumbnail_download_param:
-        image_item["thumb_media"] = {
-            "encrypt_query_param": uploaded.thumbnail_download_param,
-            "aes_key": aes_key_base64,
-            "encrypt_type": WEIXIN_MEDIA_ENCRYPT_TYPE,
-        }
-        image_item["aeskey"] = uploaded.aeskey_hex
-        image_item["hd_size"] = uploaded.original_ciphertext_size
-        image_item["thumb_size"] = uploaded.thumbnail_ciphertext_size
     return {"type": ITEM_IMAGE, "image_item": image_item}
 
 
