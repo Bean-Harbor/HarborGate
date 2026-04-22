@@ -453,12 +453,12 @@ def _resolve_local_attachment_path(raw_path: str) -> Path | None:
 class WeixinUploadedImage:
     filekey: str
     original_download_param: str
-    thumbnail_download_param: str
     aeskey_hex: str
     original_size: int
     original_ciphertext_size: int
-    thumbnail_size: int
-    thumbnail_ciphertext_size: int
+    thumbnail_download_param: str = ""
+    thumbnail_size: int = 0
+    thumbnail_ciphertext_size: int = 0
 
 
 def _upload_image_artifact_to_weixin(
@@ -502,8 +502,6 @@ def _upload_image_artifact_to_weixin(
     thumb_upload_param = str(upload_response.get("thumb_upload_param") or "").strip() or None
     if not upload_full_url and not upload_param:
         raise RuntimeError("Weixin getuploadurl returned no upload URL for the original image")
-    if not thumb_upload_param:
-        raise RuntimeError("Weixin getuploadurl returned no thumbnail upload URL")
 
     original_download_param = _upload_binary_to_cdn(
         plaintext=original_bytes,
@@ -515,49 +513,54 @@ def _upload_image_artifact_to_weixin(
         label="weixin-image-orig",
         timeout_seconds=timeout_seconds,
     )
-    thumbnail_download_param = _upload_binary_to_cdn(
-        plaintext=thumbnail_bytes,
-        upload_full_url=None,
-        upload_param=thumb_upload_param,
-        filekey=filekey,
-        cdn_base_url=cdn_base_url,
-        aeskey=aeskey,
-        label="weixin-image-thumb",
-        timeout_seconds=timeout_seconds,
-    )
+    thumbnail_download_param = ""
+    thumbnail_size = 0
+    thumbnail_ciphertext_size = 0
+    if thumb_upload_param:
+        thumbnail_download_param = _upload_binary_to_cdn(
+            plaintext=thumbnail_bytes,
+            upload_full_url=None,
+            upload_param=thumb_upload_param,
+            filekey=filekey,
+            cdn_base_url=cdn_base_url,
+            aeskey=aeskey,
+            label="weixin-image-thumb",
+            timeout_seconds=timeout_seconds,
+        )
+        thumbnail_size = len(thumbnail_bytes)
+        thumbnail_ciphertext_size = _aes_ecb_padded_size(len(thumbnail_bytes))
     return WeixinUploadedImage(
         filekey=filekey,
         original_download_param=original_download_param,
-        thumbnail_download_param=thumbnail_download_param,
         aeskey_hex=aeskey.hex(),
         original_size=len(original_bytes),
         original_ciphertext_size=_aes_ecb_padded_size(len(original_bytes)),
-        thumbnail_size=len(thumbnail_bytes),
-        thumbnail_ciphertext_size=_aes_ecb_padded_size(len(thumbnail_bytes)),
+        thumbnail_download_param=thumbnail_download_param,
+        thumbnail_size=thumbnail_size,
+        thumbnail_ciphertext_size=thumbnail_ciphertext_size,
     )
 
 
 def _build_native_image_message_item(uploaded: WeixinUploadedImage) -> dict[str, Any]:
     aes_key_base64 = base64.b64encode(bytes.fromhex(uploaded.aeskey_hex)).decode("ascii")
-    return {
-        "type": ITEM_IMAGE,
-        "image_item": {
-            "media": {
-                "encrypt_query_param": uploaded.original_download_param,
-                "aes_key": aes_key_base64,
-                "encrypt_type": WEIXIN_MEDIA_ENCRYPT_TYPE,
-            },
-            "thumb_media": {
-                "encrypt_query_param": uploaded.thumbnail_download_param,
-                "aes_key": aes_key_base64,
-                "encrypt_type": WEIXIN_MEDIA_ENCRYPT_TYPE,
-            },
-            "aeskey": uploaded.aeskey_hex,
-            "mid_size": uploaded.original_ciphertext_size,
-            "hd_size": uploaded.original_ciphertext_size,
-            "thumb_size": uploaded.thumbnail_ciphertext_size,
+    image_item: dict[str, Any] = {
+        "media": {
+            "encrypt_query_param": uploaded.original_download_param,
+            "aes_key": aes_key_base64,
+            "encrypt_type": WEIXIN_MEDIA_ENCRYPT_TYPE,
         },
+        "mid_size": uploaded.original_ciphertext_size,
     }
+    if uploaded.thumbnail_download_param:
+        image_item["thumb_media"] = {
+            "encrypt_query_param": uploaded.thumbnail_download_param,
+            "aes_key": aes_key_base64,
+            "encrypt_type": WEIXIN_MEDIA_ENCRYPT_TYPE,
+        }
+        image_item["aeskey"] = uploaded.aeskey_hex
+        image_item["hd_size"] = uploaded.original_ciphertext_size
+        image_item["thumb_size"] = uploaded.thumbnail_ciphertext_size
+    return {"type": ITEM_IMAGE, "image_item": image_item}
 
 
 def _should_send_native_image_reply(outbound: OutboundMessage) -> bool:
