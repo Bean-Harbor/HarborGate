@@ -158,6 +158,30 @@ def save_weixin_transport_state(state_dir: str | Path, account_id: str, payload:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_weixin_context_tokens(state_dir: str | Path, account_id: str) -> dict[str, str]:
+    path = _context_file(state_dir, account_id)
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in payload.items()
+        if str(key).strip() and str(value).strip()
+    }
+
+
+def save_weixin_context_tokens(state_dir: str | Path, account_id: str, payload: dict[str, Any]) -> None:
+    path = _context_file(state_dir, account_id)
+    sanitized = {
+        str(key): str(value)
+        for key, value in payload.items()
+        if str(key).strip() and str(value).strip()
+    }
+    path.write_text(json.dumps(sanitized, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 class ContextTokenStore:
     def __init__(self, state_dir: str | Path, account_id: str) -> None:
         self.path = _context_file(state_dir, account_id)
@@ -174,17 +198,10 @@ class ContextTokenStore:
         self._persist()
 
     def _restore(self) -> None:
-        if not self.path.exists():
-            return
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            self._cache = {str(key): str(value) for key, value in data.items() if str(value).strip()}
+        self._cache = load_weixin_context_tokens(self.path.parent.parent, self.path.stem.removesuffix(".context_tokens"))
 
     def _persist(self) -> None:
-        self.path.write_text(
-            json.dumps(self._cache, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        save_weixin_context_tokens(self.path.parent.parent, self.path.stem.removesuffix(".context_tokens"), self._cache)
 
 
 class ProcessedMessageStore:
@@ -689,6 +706,7 @@ class WeixinAdapter(PlatformAdapter):
             "last_getupdates_buf": "",
             "last_getupdates_count": 0,
             "last_private_text_message_count": 0,
+            "last_private_text_message_at": "",
             "last_getupdates_message_ids": [],
             "last_getupdates_private_message_ids": [],
             "last_getupdates_error": "",
@@ -844,6 +862,7 @@ class WeixinAdapter(PlatformAdapter):
             last_getupdates_message_ids=message_ids,
             last_getupdates_private_message_ids=private_message_ids,
             last_getupdates_error="",
+            **({"last_private_text_message_at": utc_now_iso()} if private_messages else {}),
         )
         return [item for item in messages if isinstance(item, dict)]
 
@@ -878,6 +897,7 @@ class WeixinAdapter(PlatformAdapter):
             last_inbound_at=observed_at,
             last_inbound_message_id=message_id,
             last_inbound_chat_id=chat_id,
+            last_private_text_message_at=observed_at,
         )
         if context_token and self._context_tokens:
             self._context_tokens.set(chat_id, context_token)

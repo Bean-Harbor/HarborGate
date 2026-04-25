@@ -17,8 +17,10 @@ from im_agent.platforms.weixin import (
     extract_text_from_item_list,
     is_weixin_dns_resolution_error,
     load_sync_buf,
+    load_weixin_context_tokens,
     load_weixin_transport_state,
     save_weixin_account,
+    save_weixin_context_tokens,
     split_text_for_weixin,
 )
 
@@ -95,6 +97,19 @@ class WeixinHelpersTests(unittest.TestCase):
             self.assertTrue(restored.contains("msg-2"))
             self.assertTrue(restored.contains("msg-3"))
 
+    def test_context_token_helpers_use_safe_account_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_context_tokens(
+                tmp,
+                "d5ba3cf20a24@im.bot",
+                {"wx-user-1": "ctx-123"},
+            )
+
+            restored = load_weixin_context_tokens(tmp, "d5ba3cf20a24@im.bot")
+
+            self.assertEqual(restored, {"wx-user-1": "ctx-123"})
+            self.assertTrue((Path(tmp) / "accounts" / "d5ba3cf20a24_im.bot.context_tokens.json").exists())
+
 
 class WeixinAdapterTests(unittest.TestCase):
     def test_adapter_restores_saved_account_and_poll_updates_cursor(self) -> None:
@@ -137,6 +152,7 @@ class WeixinAdapterTests(unittest.TestCase):
             self.assertEqual(transport["last_getupdates_count"], 1)
             self.assertEqual(transport["last_getupdates_message_ids"], ["wx-msg-1"])
             self.assertEqual(transport["last_getupdates_error"], "")
+            self.assertTrue(transport["last_private_text_message_at"])
             mocked_post.assert_called_once()
 
     def test_poll_updates_treats_idle_read_timeout_as_healthy_empty_poll(self) -> None:
@@ -212,6 +228,7 @@ class WeixinAdapterTests(unittest.TestCase):
             token_store = ContextTokenStore(tmp, "bot-1")
             self.assertEqual(token_store.get("wx-user-1"), "ctx-001")
             transport = adapter.transport_status()
+            self.assertTrue(transport["last_private_text_message_at"])
             self.assertEqual(transport["last_inbound_chat_id"], "wx-user-1")
             self.assertEqual(transport["last_inbound_message_id"], "")
             self.assertTrue(transport["last_inbound_at"])

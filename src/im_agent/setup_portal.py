@@ -23,6 +23,7 @@ from im_agent.platforms.weixin import (
     is_weixin_dns_resolution_error,
     is_weixin_provider_auth_error,
     load_weixin_account,
+    load_weixin_context_tokens,
     load_weixin_transport_state,
 )
 
@@ -427,19 +428,11 @@ class SetupPortalService:
             else:
                 adapter = WeixinAdapter(state_dir=self.weixin_state_dir)
 
-        accounts_dir = Path(self.weixin_state_dir) / "accounts"
         context_token_count = 0
         if record:
             account_id = str(record.get("account_id") or "").strip()
-            safe_account_id = account_id.replace("/", "_").replace("\\", "_")
-            context_path = accounts_dir / f"{safe_account_id}.context_tokens.json"
-            if context_path.exists():
-                try:
-                    context_data = json.loads(context_path.read_text(encoding="utf-8"))
-                except Exception:  # noqa: BLE001
-                    context_data = {}
-                if isinstance(context_data, dict):
-                    context_token_count = sum(1 for value in context_data.values() if str(value or "").strip())
+            context_data = load_weixin_context_tokens(self.weixin_state_dir, account_id)
+            context_token_count = sum(1 for value in context_data.values() if str(value or "").strip())
 
         transport = self._effective_weixin_transport(adapter=adapter, record=record)
         configured = bool(adapter.configured or record)
@@ -465,10 +458,11 @@ class SetupPortalService:
                     "status": str(transport.get("status") or "").strip(),
                     "connected": bool(transport.get("connected")),
                     "last_poll_outcome": str(transport.get("last_poll_outcome") or "").strip(),
-                    "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
-                    "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
-                },
-            }
+                "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
+                "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
+                "last_private_text_message_at": str(transport.get("last_private_text_message_at") or "").strip(),
+            },
+        }
         poll_status = str(transport.get("status") or "").strip().lower()
         poll_outcome = str(transport.get("last_poll_outcome") or "").strip().lower()
         poll_error = str(transport.get("last_getupdates_error") or transport.get("last_error") or "").strip()
@@ -506,6 +500,7 @@ class SetupPortalService:
             "last_getupdates_buf": str(transport.get("last_getupdates_buf") or "").strip(),
             "last_getupdates_count": int(transport.get("last_getupdates_count") or 0),
             "last_private_text_message_count": int(transport.get("last_private_text_message_count") or 0),
+            "last_private_text_message_at": str(transport.get("last_private_text_message_at") or "").strip(),
             "last_getupdates_message_ids": list(transport.get("last_getupdates_message_ids") or []),
             "last_getupdates_private_message_ids": list(transport.get("last_getupdates_private_message_ids") or []),
             "last_getupdates_error": str(transport.get("last_getupdates_error") or "").strip(),
@@ -546,12 +541,14 @@ class SetupPortalService:
                 "last_getupdates_buf": str(transport.get("last_getupdates_buf") or "").strip(),
                 "last_getupdates_count": int(transport.get("last_getupdates_count") or 0),
                 "last_private_text_message_count": int(transport.get("last_private_text_message_count") or 0),
+                "last_private_text_message_at": str(transport.get("last_private_text_message_at") or "").strip(),
                 "error": poll_error,
             },
             "context_token_count": context_token_count,
             "last_context_token_at": str(transport.get("last_context_token_at") or "").strip(),
             "last_send_at": str(transport.get("last_send_at") or "").strip(),
             "last_send_chunk_count": int(transport.get("last_send_chunk_count") or 0),
+            "last_private_text_message_at": str(transport.get("last_private_text_message_at") or "").strip(),
             "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
             "last_inbound_message_id": str(transport.get("last_inbound_message_id") or "").strip(),
             "last_inbound_chat_id": str(transport.get("last_inbound_chat_id") or "").strip(),

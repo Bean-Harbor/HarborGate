@@ -15,6 +15,7 @@ from im_agent.platforms.webhook import WebhookAdapter
 from im_agent.platforms.weixin import (
     WeixinAdapter,
     save_weixin_account,
+    save_weixin_context_tokens,
     save_weixin_transport_state,
 )
 from im_agent.server import build_handler
@@ -316,6 +317,7 @@ class NotificationServerTests(unittest.TestCase):
                     "last_getupdates_buf": "cursor-1",
                     "last_getupdates_count": 0,
                     "last_private_text_message_count": 0,
+                    "last_private_text_message_at": "",
                     "last_getupdates_message_ids": [],
                     "last_getupdates_private_message_ids": [],
                     "last_getupdates_error": "",
@@ -359,7 +361,9 @@ class NotificationServerTests(unittest.TestCase):
                 self.assertEqual(data["weixin"]["status"], "polling_idle")
                 self.assertIn("ingress_observability", data["weixin"])
                 self.assertIn("delivery_observability", data["weixin"])
+                self.assertEqual(data["weixin"]["poll"]["last_private_text_message_at"], "")
                 self.assertEqual(data["weixin"]["ingress_observability"]["last_getupdates_count"], 0)
+                self.assertEqual(data["weixin"]["ingress_observability"]["last_private_text_message_at"], "")
                 self.assertEqual(data["weixin"]["delivery_observability"]["last_send_status"], "")
                 self.assertIn("gateway_status", data)
                 self.assertTrue(data["gateway_status"]["ok"])
@@ -415,6 +419,7 @@ class NotificationServerTests(unittest.TestCase):
                     "last_getupdates_buf": "cursor-runtime",
                     "last_getupdates_count": 0,
                     "last_private_text_message_count": 0,
+                    "last_private_text_message_at": "",
                     "last_getupdates_message_ids": [],
                     "last_getupdates_private_message_ids": [],
                     "last_getupdates_error": "",
@@ -456,6 +461,8 @@ class NotificationServerTests(unittest.TestCase):
                     data["weixin"]["ingress_observability"]["blocked_reason"],
                     "waiting_for_private_text",
                 )
+                self.assertEqual(data["weixin"]["poll"]["last_private_text_message_at"], "")
+                self.assertEqual(data["weixin"]["ingress_observability"]["last_private_text_message_at"], "")
                 self.assertEqual(data["gateway_status"]["weixin"]["blocker_category"], "weixin_waiting_for_private_text")
                 self.assertEqual(data["gateway_status"]["weixin"]["ingress_blocker_category"], "getupdates")
                 weixin_channel = next(
@@ -463,6 +470,86 @@ class NotificationServerTests(unittest.TestCase):
                 )
                 self.assertTrue(weixin_channel["connected"])
                 self.assertEqual(weixin_channel["transport"]["status"], "polling_idle")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_setup_status_reads_context_tokens_from_safe_slugged_account_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gateway = GatewayService(
+                store=FileSessionStore(tmp, max_turns=10),
+                brain=RuleBasedBrain(),
+            )
+            weixin_state_dir = os.path.join(tmp, "weixin")
+            account_id = "d5ba3cf20a24@im.bot"
+            save_weixin_account(
+                weixin_state_dir,
+                account_id=account_id,
+                token="wx-secret-d5ba",
+                base_url="https://ilinkai.weixin.qq.com",
+                user_id="wx-user-d5ba",
+            )
+            save_weixin_context_tokens(
+                weixin_state_dir,
+                account_id,
+                {"wx-chat-1": "ctx-d5ba"},
+            )
+            save_weixin_transport_state(
+                weixin_state_dir,
+                account_id,
+                {
+                    "mode": "polling",
+                    "status": "polling_idle",
+                    "connected": True,
+                    "last_error": "",
+                    "last_poll_outcome": "idle_timeout",
+                    "last_poll_at": "2026-04-25T09:00:00Z",
+                    "last_getupdates_at": "2026-04-25T09:00:00Z",
+                    "last_getupdates_buf": "cursor-d5ba",
+                    "last_getupdates_count": 0,
+                    "last_private_text_message_count": 0,
+                    "last_private_text_message_at": "2026-04-25T09:00:10Z",
+                    "last_getupdates_message_ids": [],
+                    "last_getupdates_private_message_ids": [],
+                    "last_getupdates_error": "",
+                    "last_context_token_at": "2026-04-25T09:00:10Z",
+                    "last_send_at": "2026-04-25T09:00:11Z",
+                    "last_send_chunk_count": 1,
+                    "last_send_status": "sent",
+                    "last_send_error": "",
+                    "last_send_retryable": False,
+                    "last_send_provider_message_id": "provider-d5ba",
+                    "last_send_context_token_used": True,
+                    "last_send_attachment_count": 0,
+                    "last_send_content_kind": "text",
+                    "last_inbound_at": "2026-04-25T09:00:10Z",
+                    "last_inbound_message_id": "wx-msg-d5ba",
+                    "last_inbound_chat_id": "wx-chat-1",
+                },
+            )
+            gateway.register_adapter(WeixinAdapter(state_dir=weixin_state_dir, account_id=account_id))
+            setup_portal = SetupPortalService(
+                gateway=gateway,
+                store=FileSetupPortalStore(tmp),
+                bind_host="127.0.0.1",
+                bind_port=0,
+                weixin_state_dir=weixin_state_dir,
+            )
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(gateway, setup_portal))
+            setup_portal.bind_port = server.server_port
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with request.urlopen(f"http://127.0.0.1:{server.server_port}/api/setup/status", timeout=5) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+
+                self.assertEqual(data["weixin"]["context_token_count"], 1)
+                self.assertEqual(data["weixin"]["blocker_category"], "")
+                self.assertEqual(data["weixin"]["ingress_blocker_category"], "")
+                self.assertTrue(data["gateway_status"]["weixin"]["connected"])
+                self.assertEqual(data["gateway_status"]["weixin"]["blocker_category"], "")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -593,6 +680,7 @@ class NotificationServerTests(unittest.TestCase):
                     "last_getupdates_buf": "cursor-status",
                     "last_getupdates_count": 0,
                     "last_private_text_message_count": 0,
+                    "last_private_text_message_at": "",
                     "last_getupdates_message_ids": [],
                     "last_getupdates_private_message_ids": [],
                     "last_getupdates_error": "<urlopen error [Errno 11001] getaddrinfo failed>",
@@ -751,6 +839,7 @@ class NotificationServerTests(unittest.TestCase):
                 self.assertEqual(data["weixin"]["blocker_category"], "weixin_dns_resolution")
                 self.assertEqual(data["weixin"]["ingress_blocker_category"], "getupdates")
                 self.assertEqual(data["weixin"]["poll"]["status"], "error")
+                self.assertEqual(data["weixin"]["poll"]["last_private_text_message_at"], "")
                 self.assertIn("getaddrinfo failed", data["weixin"]["poll"]["error"])
                 delivery_observability = data["delivery_observability"]
                 self.assertEqual(delivery_observability["record_count"], 2)
