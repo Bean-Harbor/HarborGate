@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -154,6 +156,18 @@ class PlatformLiveGateTests(unittest.TestCase):
         )
         self.assertEqual(blocker, "weixin_poll_timeout")
 
+    def test_classify_weixin_blocker_marks_dns_resolution(self) -> None:
+        blocker = platform_live_gate.classify_weixin_blocker(
+            {
+                "configured": True,
+                "poll": {
+                    "status": "error",
+                    "error": "<urlopen error [Errno 11001] getaddrinfo failed>",
+                },
+            }
+        )
+        self.assertEqual(blocker, "weixin_dns_resolution")
+
     def test_classify_weixin_blocker_distinguishes_waiting_for_private_text(self) -> None:
         blocker = platform_live_gate.classify_weixin_blocker(
             {
@@ -185,6 +199,82 @@ class PlatformLiveGateTests(unittest.TestCase):
         )
         self.assertEqual(blocker, "")
 
+    def test_classify_weixin_blocker_marks_dns_resolution_on_live_send_failure(self) -> None:
+        blocker = platform_live_gate.classify_weixin_blocker(
+            {
+                "configured": True,
+                "poll": {
+                    "status": "ok",
+                    "outcome": "messages",
+                    "private_text_message_count": 1,
+                },
+                "ingress_probe": {"provider_private_text_seen": True},
+                "live_send": {
+                    "status": "error",
+                    "error": "HTTPSConnectionPool(host='ilinkai.weixin.qq.com'): NameResolutionError",
+                },
+            }
+        )
+        self.assertEqual(blocker, "weixin_dns_resolution")
+
+    def test_discover_latest_weixin_ingress_probe_prefers_current_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_dir = Path(tmpdir)
+            probe_dir = runtime_dir / "weixin-ingress-probe"
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            successful_probe = probe_dir / "weixin-ingress-probe-success.json"
+            latest_probe = probe_dir / "weixin-ingress-probe-latest.json"
+            successful_probe.write_text(
+                json.dumps({"provider_private_text_seen": True, "blocked_reason": ""}),
+                encoding="utf-8",
+            )
+            latest_probe.write_text(
+                json.dumps(
+                    {
+                        "provider_private_text_seen": False,
+                        "blocked_reason": "waiting_for_private_text",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(successful_probe, (1_700_000_000, 1_700_000_000))
+            os.utime(latest_probe, (1_700_000_100, 1_700_000_100))
+
+            current = platform_live_gate.discover_latest_weixin_ingress_probe(runtime_dir)
+            successful = platform_live_gate.discover_latest_successful_weixin_ingress_probe(runtime_dir)
+
+            self.assertFalse(current["provider_private_text_seen"])
+            self.assertEqual(current["blocked_reason"], "waiting_for_private_text")
+            self.assertTrue(successful["provider_private_text_seen"])
+            self.assertEqual(successful["blocked_reason"], "")
+
+    def test_discover_weixin_state_prefers_newest_account_and_matching_context_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            accounts_dir = Path(tmpdir) / "accounts"
+            accounts_dir.mkdir(parents=True, exist_ok=True)
+            old_account = accounts_dir / "26d88700bd27_im.bot.json"
+            new_account = accounts_dir / "d5ba3cf20a24_im.bot.json"
+            old_context = accounts_dir / "26d88700bd27_im.bot.context_tokens.json"
+            new_context = accounts_dir / "d5ba3cf20a24_im.bot.context_tokens.json"
+            old_runtime = accounts_dir / "26d88700bd27_im.bot.runtime.json"
+
+            old_account.write_text(json.dumps({"account_id": "old@im.bot"}), encoding="utf-8")
+            new_account.write_text(json.dumps({"account_id": "new@im.bot"}), encoding="utf-8")
+            old_context.write_text(json.dumps({"old-chat": "old-token"}), encoding="utf-8")
+            new_context.write_text(json.dumps({"new-chat": "new-token"}), encoding="utf-8")
+            old_runtime.write_text(json.dumps({"status": "stale"}), encoding="utf-8")
+
+            os.utime(old_account, (1_700_000_000, 1_700_000_000))
+            os.utime(new_account, (1_700_000_100, 1_700_000_100))
+            os.utime(old_context, (1_700_000_000, 1_700_000_000))
+            os.utime(new_context, (1_700_000_100, 1_700_000_100))
+            os.utime(old_runtime, (1_700_000_200, 1_700_000_200))
+
+            state = platform_live_gate.discover_weixin_state(Path(tmpdir))
+
+            self.assertEqual(state["account"]["account_id"], "new@im.bot")
+            self.assertEqual(state["context_tokens"], {"new-chat": "new-token"})
+
     def test_classify_weixin_ingress_blocker_groups_parity_checks(self) -> None:
         self.assertEqual(
             platform_live_gate.classify_weixin_ingress_blocker({"configured": False}),
@@ -204,6 +294,15 @@ class PlatformLiveGateTests(unittest.TestCase):
                 {
                     "configured": True,
                     "poll": {"status": "timeout", "error": "The read operation timed out"},
+                }
+            ),
+            "getupdates",
+        )
+        self.assertEqual(
+            platform_live_gate.classify_weixin_ingress_blocker(
+                {
+                    "configured": True,
+                    "poll": {"status": "error", "error": "<urlopen error [Errno 11001] getaddrinfo failed>"},
                 }
             ),
             "getupdates",

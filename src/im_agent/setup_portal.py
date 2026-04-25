@@ -20,6 +20,8 @@ from im_agent.gateway import GatewayService
 from im_agent.platforms.feishu import FeishuAdapter, FeishuSettings
 from im_agent.platforms.weixin import (
     WeixinAdapter,
+    is_weixin_dns_resolution_error,
+    is_weixin_provider_auth_error,
     load_weixin_account,
     load_weixin_transport_state,
 )
@@ -51,6 +53,65 @@ def _html_escape(value: str) -> str:
         .replace("'", "&#39;")
     )
     return escaped
+
+
+def _classify_weixin_transport_blocker(
+    *,
+    configured: bool,
+    connected: bool,
+    poll_status: str,
+    poll_outcome: str,
+    poll_error: str,
+    private_text_message_count: int,
+    private_text_confirmed: bool,
+    context_token_count: int,
+    last_send_status: str,
+    last_send_error: str,
+) -> str:
+    if not configured:
+        return "account_restore"
+    if poll_status == "timeout":
+        return "weixin_poll_timeout"
+    if poll_status == "error" or (not connected and poll_error):
+        if is_weixin_dns_resolution_error(poll_error):
+            return "weixin_dns_resolution"
+        if is_weixin_provider_auth_error(poll_error):
+            return "weixin_provider_auth_failed"
+        return "weixin_poll_error"
+    if private_text_message_count <= 0 and not private_text_confirmed:
+        if poll_outcome in {"idle_timeout", "empty"} or poll_status in {"polling", "polling_idle"}:
+            return "weixin_waiting_for_private_text"
+        return "weixin_live_ingress_not_confirmed"
+    if context_token_count <= 0:
+        return "context_token_send"
+    if last_send_status in {"failed", "send_failed", "error"}:
+        if is_weixin_dns_resolution_error(last_send_error):
+            return "weixin_dns_resolution"
+        return "weixin_live_send_failed"
+    return ""
+
+
+def _classify_weixin_ingress_blocker(
+    *,
+    configured: bool,
+    connected: bool,
+    poll_status: str,
+    poll_error: str,
+    private_text_confirmed: bool,
+    context_token_count: int,
+    last_send_status: str,
+) -> str:
+    if not configured:
+        return "account_restore"
+    if poll_status in {"error", "timeout"}:
+        if is_weixin_provider_auth_error(poll_error):
+            return "qr_recovery"
+        return "getupdates"
+    if not connected or not private_text_confirmed:
+        return "getupdates"
+    if context_token_count <= 0 or last_send_status in {"failed", "send_failed", "error"}:
+        return "context_token_send"
+    return ""
 
 
 def _qr_to_svg(text: str, border: int = 4) -> str:
@@ -386,6 +447,7 @@ class SetupPortalService:
         base_url = str(record.get("base_url") or getattr(adapter, "base_url", "") or "").strip()
         user_id = str(record.get("user_id") or getattr(adapter, "user_id", "") or "").strip()
         last_send_status = str(transport.get("last_send_status") or "").strip().lower()
+        last_send_error = str(transport.get("last_send_error") or "").strip()
         ingress_proof = self._discover_latest_weixin_ingress_probe()
         if not ingress_proof:
             provider_private_text_count = int(transport.get("last_private_text_message_count") or 0)
@@ -404,26 +466,37 @@ class SetupPortalService:
                     "connected": bool(transport.get("connected")),
                     "last_poll_outcome": str(transport.get("last_poll_outcome") or "").strip(),
                     "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
-                "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
-            },
-        }
-        blocker_category = "account_restore"
-        if configured:
-            poll_status = str(transport.get("status") or "").strip().lower()
-            ingress_blocked_reason = str(ingress_proof.get("blocked_reason") or "").strip().lower()
-            provider_private_text_seen = bool(ingress_proof.get("provider_private_text_seen"))
-            if poll_status in {"error", "timeout"}:
-                blocker_category = "getupdates"
-            elif not bool(transport.get("connected")):
-                blocker_category = "getupdates"
-            elif ingress_blocked_reason == "waiting_for_private_text" or not provider_private_text_seen:
-                blocker_category = "getupdates"
-            elif context_token_count <= 0:
-                blocker_category = "context_token_send"
-            elif last_send_status in {"failed", "send_failed", "error"}:
-                blocker_category = "context_token_send"
-            else:
-                blocker_category = ""
+                    "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
+                },
+            }
+        poll_status = str(transport.get("status") or "").strip().lower()
+        poll_outcome = str(transport.get("last_poll_outcome") or "").strip().lower()
+        poll_error = str(transport.get("last_getupdates_error") or transport.get("last_error") or "").strip()
+        provider_private_text_seen = bool(ingress_proof.get("provider_private_text_seen"))
+        provider_private_text_count = int(
+            ingress_proof.get("provider_private_text_count") or transport.get("last_private_text_message_count") or 0
+        )
+        blocker_category = _classify_weixin_transport_blocker(
+            configured=configured,
+            connected=bool(transport.get("connected")),
+            poll_status=poll_status,
+            poll_outcome=poll_outcome,
+            poll_error=poll_error,
+            private_text_message_count=provider_private_text_count,
+            private_text_confirmed=provider_private_text_seen,
+            context_token_count=context_token_count,
+            last_send_status=last_send_status,
+            last_send_error=last_send_error,
+        )
+        ingress_blocker_category = _classify_weixin_ingress_blocker(
+            configured=configured,
+            connected=bool(transport.get("connected")),
+            poll_status=poll_status,
+            poll_error=poll_error,
+            private_text_confirmed=provider_private_text_seen,
+            context_token_count=context_token_count,
+            last_send_status=last_send_status,
+        )
         ingress_observability = {
             "poll_status": str(transport.get("status") or "").strip(),
             "last_poll_outcome": str(transport.get("last_poll_outcome") or "").strip(),
@@ -464,6 +537,7 @@ class SetupPortalService:
             "status": str(transport.get("status") or ("waiting_for_credentials" if not configured else "polling_idle")).strip(),
             "connected": bool(transport.get("connected")),
             "blocker_category": blocker_category,
+            "ingress_blocker_category": ingress_blocker_category,
             "poll": {
                 "status": str(transport.get("status") or "").strip(),
                 "outcome": str(transport.get("last_poll_outcome") or "").strip(),
@@ -472,6 +546,7 @@ class SetupPortalService:
                 "last_getupdates_buf": str(transport.get("last_getupdates_buf") or "").strip(),
                 "last_getupdates_count": int(transport.get("last_getupdates_count") or 0),
                 "last_private_text_message_count": int(transport.get("last_private_text_message_count") or 0),
+                "error": poll_error,
             },
             "context_token_count": context_token_count,
             "last_context_token_at": str(transport.get("last_context_token_at") or "").strip(),
@@ -580,6 +655,8 @@ class SetupPortalService:
 
     def build_gateway_status_payload(self, *, request_host: str = "") -> dict[str, Any]:
         origin = self.resolve_public_origin(request_host=request_host)
+        self._bootstrap_weixin_adapter()
+        weixin = self._build_weixin_status_payload(request_host=request_host)
         channels: list[dict[str, Any]] = []
         weixin_record = self._discover_weixin_account_state()
         for adapter_name, adapter in self.gateway._adapters.items():
@@ -666,6 +743,19 @@ class SetupPortalService:
             "gateway_base_url": origin,
             "manage_url": f"{origin}/admin/im",
             "channels": channels,
+            "weixin": {
+                "configured": bool(weixin.get("configured")),
+                "connected": bool(weixin.get("connected")),
+                "status": str(weixin.get("status") or "").strip(),
+                "blocker_category": str(weixin.get("blocker_category") or "").strip(),
+                "ingress_blocker_category": str(weixin.get("ingress_blocker_category") or "").strip(),
+                "poll": dict(weixin.get("poll") or {}) if isinstance(weixin.get("poll"), dict) else {},
+                "delivery_observability": (
+                    dict(weixin.get("delivery_observability") or {})
+                    if isinstance(weixin.get("delivery_observability"), dict)
+                    else {}
+                ),
+            },
             "delivery_observability": delivery_observability,
             "delivery_health": delivery_health,
             "delivery_policy": self._release_v1_delivery_policy(),
@@ -786,7 +876,8 @@ class SetupPortalService:
       <div class="status">
         <div><strong>连接状态：</strong>{_html_escape(str(weixin["status"]))}</div>
         <div><strong>账号状态：</strong>{_html_escape(str(weixin["account_id_masked"] or "未配置"))}</div>
-        <div><strong>账号恢复：</strong>{_html_escape(str(weixin["blocker_category"] or "ready"))}</div>
+        <div><strong>Transport blocker：</strong>{_html_escape(str(weixin["blocker_category"] or "ready"))}</div>
+        <div><strong>Parity bucket：</strong>{_html_escape(str(weixin["ingress_blocker_category"] or "ready"))}</div>
         <div><strong>最近 getupdates：</strong>{_html_escape(str(weixin["poll"]["last_getupdates_at"] or "暂无"))}</div>
         <div><strong>私聊消息：</strong>{_html_escape(str(weixin["poll"]["last_private_text_message_count"]))}</div>
         <div><strong>context_token：</strong>{_html_escape(str(weixin["context_token_count"]))}</div>

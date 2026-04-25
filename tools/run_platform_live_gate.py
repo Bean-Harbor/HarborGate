@@ -19,7 +19,11 @@ from im_agent.gateway import GatewayService
 from im_agent.harborbeacon import HarborBeaconTaskClient
 from im_agent.models import OutboundMessage
 from im_agent.platforms.feishu import FeishuAdapter, FeishuSettings
-from im_agent.platforms.weixin import WeixinAdapter
+from im_agent.platforms.weixin import (
+    WeixinAdapter,
+    is_weixin_dns_resolution_error,
+    is_weixin_provider_auth_error,
+)
 from im_agent.session_store import FileSessionStore
 from im_agent.setup_portal import FileSetupPortalStore
 
@@ -41,12 +45,17 @@ def account_json_paths(accounts_dir: Path) -> list[Path]:
         ".sync.json",
         ".context_tokens.json",
         ".processed_messages.json",
+        ".runtime.json",
     )
-    return [
+    return sorted(
+        [
         path
-        for path in sorted(accounts_dir.glob("*.json"))
+        for path in accounts_dir.glob("*.json")
         if not any(path.name.endswith(suffix) for suffix in ignored_suffixes)
-    ]
+        ],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
 
 
 def discover_weixin_state(state_dir: Path) -> dict[str, Any]:
@@ -56,9 +65,12 @@ def discover_weixin_state(state_dir: Path) -> dict[str, Any]:
     account_paths = account_json_paths(accounts_dir)
     if not account_paths:
         return {}
-    account = load_json(account_paths[0])
-    context_paths = sorted(accounts_dir.glob("*.context_tokens.json"))
-    context_tokens = load_json(context_paths[0]) if context_paths else {}
+    selected_account_path = account_paths[0]
+    account = load_json(selected_account_path)
+    context_path = selected_account_path.with_name(
+        selected_account_path.name.removesuffix(".json") + ".context_tokens.json"
+    )
+    context_tokens = load_json(context_path) if context_path.exists() else {}
     return {
         "account": account if isinstance(account, dict) else {},
         "context_tokens": context_tokens if isinstance(context_tokens, dict) else {},
@@ -70,7 +82,6 @@ def discover_latest_weixin_ingress_probe(runtime_dir: Path) -> dict[str, Any]:
     if not probe_dir.exists():
         return {}
     candidates = sorted(probe_dir.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
-    latest_any: dict[str, Any] = {}
     for path in candidates:
         try:
             payload = load_json(path)
@@ -79,11 +90,25 @@ def discover_latest_weixin_ingress_probe(runtime_dir: Path) -> dict[str, Any]:
         if isinstance(payload, dict):
             payload = dict(payload)
             payload["_report_path"] = str(path)
-            if not latest_any:
-                latest_any = payload
-            if bool(payload.get("provider_private_text_seen")):
-                return payload
-    return latest_any
+            return payload
+    return {}
+
+
+def discover_latest_successful_weixin_ingress_probe(runtime_dir: Path) -> dict[str, Any]:
+    probe_dir = runtime_dir / "weixin-ingress-probe"
+    if not probe_dir.exists():
+        return {}
+    candidates = sorted(probe_dir.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in candidates:
+        try:
+            payload = load_json(path)
+        except Exception:
+            continue
+        if isinstance(payload, dict) and bool(payload.get("provider_private_text_seen")):
+            payload = dict(payload)
+            payload["_report_path"] = str(path)
+            return payload
+    return {}
 
 
 def build_feishu_adapter(state_root: Path) -> tuple[FeishuAdapter, dict[str, Any]]:
@@ -299,7 +324,9 @@ def classify_weixin_blocker(result: dict[str, Any]) -> str:
     if poll_status == "timeout":
         return "weixin_poll_timeout"
     if poll_status == "error":
-        if any(marker in error_text for marker in ("401", "403", "auth", "token", "forbidden")):
+        if is_weixin_dns_resolution_error(error_text):
+            return "weixin_dns_resolution"
+        if is_weixin_provider_auth_error(error_text):
             return "weixin_provider_auth_failed"
         return "weixin_poll_error"
     if private_text_message_count <= 0 and poll_status == "ok" and not private_text_confirmed:
@@ -310,6 +337,9 @@ def classify_weixin_blocker(result: dict[str, Any]) -> str:
     live_send = result.get("live_send")
     live_send = live_send if isinstance(live_send, dict) else {}
     if str(live_send.get("status") or "").strip().lower() != "sent":
+        live_send_error = str(live_send.get("error") or "").strip().lower()
+        if is_weixin_dns_resolution_error(live_send_error):
+            return "weixin_dns_resolution"
         return "weixin_live_send_failed"
 
     notification = result.get("notification_replay")
@@ -344,7 +374,7 @@ def classify_weixin_ingress_blocker(result: dict[str, Any]) -> str:
     if poll_status == "timeout":
         return "getupdates"
     if poll_status == "error":
-        if any(marker in error_text for marker in ("401", "403", "auth", "token", "forbidden")):
+        if is_weixin_provider_auth_error(error_text):
             return "qr_recovery"
         return "getupdates"
     if private_text_message_count <= 0 and not private_text_confirmed:
@@ -666,6 +696,7 @@ def run_weixin_surface(args: argparse.Namespace) -> dict[str, Any]:
     runtime_dir = Path(args.runtime_dir)
     state = discover_weixin_state(state_dir)
     latest_probe = discover_latest_weixin_ingress_probe(runtime_dir)
+    latest_successful_probe = discover_latest_successful_weixin_ingress_probe(runtime_dir)
     account = state.get("account") or {}
     context_tokens = state.get("context_tokens") or {}
     account_id = str(account.get("account_id") or "")
@@ -678,6 +709,8 @@ def run_weixin_surface(args: argparse.Namespace) -> dict[str, Any]:
         "ingress_blocker_category": "",
         "ingress_probe": latest_probe,
     }
+    if latest_successful_probe and latest_successful_probe.get("_report_path") != latest_probe.get("_report_path"):
+        result["latest_successful_ingress_probe"] = latest_successful_probe
 
     if not adapter.configured:
         result["blocked_reason"] = "saved_account_missing_or_invalid"
@@ -758,6 +791,7 @@ def run_weixin_surface(args: argparse.Namespace) -> dict[str, Any]:
                 task_api_token=args.task_api_token,
             )
 
+    latest_probe_confirmed = bool(latest_probe.get("provider_private_text_seen"))
     result["gate_complete"] = bool(
         result.get("configured")
         and (
@@ -765,7 +799,7 @@ def run_weixin_surface(args: argparse.Namespace) -> dict[str, Any]:
                 result.get("poll", {}).get("status") == "ok"
                 and int(result.get("poll", {}).get("private_text_message_count") or 0) > 0
             )
-            or bool(latest_probe.get("provider_private_text_seen"))
+            or latest_probe_confirmed
         )
         and result.get("live_send", {}).get("status") == "sent"
         and notification_replay_ready(
@@ -790,7 +824,7 @@ def run_weixin_surface(args: argparse.Namespace) -> dict[str, Any]:
             result["ingress_blocker_category"] == "getupdates"
             and str(poll.get("status") or "").strip().lower() == "ok"
             and int(poll.get("private_text_message_count") or 0) <= 0
-            and not bool(latest_probe.get("provider_private_text_seen"))
+            and not latest_probe_confirmed
         )
         result["blocked_reason"] = (
             "weixin_waiting_for_private_text"

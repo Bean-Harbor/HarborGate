@@ -5,7 +5,9 @@
 ### Closeout Snapshot
 
 - Feishu baseline rehearsal is ready on the frozen HarborBeacon `v1.5` seam.
-- Weixin remains on the parity track with blockers only in the four fixed ingress classes: `account_restore`, `qr_recovery`, `getupdates`, and `context_token_send`.
+- Weixin remains on the parity track with release-v1 ingress blockers only in the four fixed classes: `account_restore`, `qr_recovery`, `getupdates`, and `context_token_send`.
+- The redacted gateway status can now export a more specific transport `blocker_category` such as `weixin_dns_resolution` while `release_v1.weixin_blocker_category` stays on the coarse parity bucket.
+- `run_platform_live_gate.py` now keeps the latest real `ingress_probe` separate from `latest_successful_ingress_probe`, so a stale success report cannot hide the current blocker when Weixin is waiting for a new private text.
 - The closeout stayed within HarborGate-only docs and verification; no HarborBeacon contract or recipient-shape changes were made.
 
 ### Validation Commands

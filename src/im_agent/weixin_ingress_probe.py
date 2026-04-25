@@ -29,8 +29,17 @@ def discover_account_id(state_dir: Path) -> str:
     accounts_dir = state_dir / "accounts"
     if not accounts_dir.exists():
         return ""
-    ignored_suffixes = (".sync.json", ".context_tokens.json", ".processed_messages.json")
-    for path in sorted(accounts_dir.glob("*.json")):
+    ignored_suffixes = (".sync.json", ".context_tokens.json", ".processed_messages.json", ".runtime.json")
+    candidates = sorted(
+        (
+            path
+            for path in accounts_dir.glob("*.json")
+            if not any(path.name.endswith(suffix) for suffix in ignored_suffixes)
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in candidates:
         if any(path.name.endswith(suffix) for suffix in ignored_suffixes):
             continue
         try:

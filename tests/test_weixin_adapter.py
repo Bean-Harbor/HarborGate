@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,6 +6,7 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 from im_agent.models import OutboundMessage
+from im_agent.weixin_ingress_probe import discover_account_id
 from im_agent.platforms.weixin import (
     ContextTokenStore,
     ProcessedMessageStore,
@@ -13,6 +15,7 @@ from im_agent.platforms.weixin import (
     build_send_message_payload,
     extract_weixin_message_id,
     extract_text_from_item_list,
+    is_weixin_dns_resolution_error,
     load_sync_buf,
     load_weixin_transport_state,
     save_weixin_account,
@@ -21,6 +24,34 @@ from im_agent.platforms.weixin import (
 
 
 class WeixinHelpersTests(unittest.TestCase):
+    def test_discover_account_id_prefers_newest_saved_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            accounts_dir = Path(tmp) / "accounts"
+            accounts_dir.mkdir(parents=True, exist_ok=True)
+            old_account = accounts_dir / "26d88700bd27_im.bot.json"
+            new_account = accounts_dir / "d5ba3cf20a24_im.bot.json"
+            runtime_sidecar = accounts_dir / "z-sidecar.runtime.json"
+            old_account.write_text('{"account_id":"old@im.bot"}', encoding="utf-8")
+            new_account.write_text('{"account_id":"new@im.bot"}', encoding="utf-8")
+            runtime_sidecar.write_text('{"status":"stale"}', encoding="utf-8")
+            old_time = 1_700_000_000
+            new_time = 1_700_000_100
+            runtime_time = 1_700_000_200
+            os.utime(old_account, (old_time, old_time))
+            os.utime(new_account, (new_time, new_time))
+            os.utime(runtime_sidecar, (runtime_time, runtime_time))
+
+            self.assertEqual(discover_account_id(Path(tmp)), "new@im.bot")
+
+    def test_is_weixin_dns_resolution_error_matches_common_provider_failures(self) -> None:
+        self.assertTrue(
+            is_weixin_dns_resolution_error("<urlopen error [Errno 11001] getaddrinfo failed>")
+        )
+        self.assertTrue(
+            is_weixin_dns_resolution_error("HTTPSConnectionPool(...): NameResolutionError(...)")
+        )
+        self.assertFalse(is_weixin_dns_resolution_error("HTTP 403 forbidden"))
+
     def test_extract_text_from_item_list(self) -> None:
         text = extract_text_from_item_list(
             [

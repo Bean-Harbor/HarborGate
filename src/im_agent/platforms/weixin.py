@@ -59,6 +59,27 @@ def _redact_sensitive_text(value: str, *secrets: str) -> str:
     return redacted
 
 
+def is_weixin_dns_resolution_error(error_text: str) -> bool:
+    normalized = str(error_text or "").strip().lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "getaddrinfo",
+            "name resolution",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "nodename nor servname",
+            "nameresolutionerror",
+            "socket.gaierror",
+        )
+    )
+
+
+def is_weixin_provider_auth_error(error_text: str) -> bool:
+    normalized = str(error_text or "").strip().lower()
+    return any(marker in normalized for marker in ("401", "403", "auth", "token", "forbidden"))
+
+
 def _poll_status_for_error(error_text: str) -> str:
     normalized = error_text.lower()
     if "read operation timed out" in normalized:

@@ -178,7 +178,8 @@ If `HARBORBEACON_TASK_API_URL` is unset, the gateway falls back to the local rul
 This repo currently treats the cross-repo prelaunch rehearsal like this:
 
 - Feishu is the stable baseline surface on the same HarborBeacon `v1.5` seam
-- Weixin `1:1` text is on a parity track with the same fixed blocker taxonomy: `account_restore`, `qr_recovery`, `getupdates`, and `context_token_send`
+- Weixin `1:1` text stays on the same fixed release-v1 ingress taxonomy: `account_restore`, `qr_recovery`, `getupdates`, and `context_token_send`
+- the redacted gateway summary can also export a more specific transport `blocker_category` such as `weixin_dns_resolution` without rewriting the release-v1 parity bucket
 - only when both surfaces pass the same rehearsal matrix do we call the result `dual-surface ready`
 - HarborBeacon still only sees `POST /api/tasks` and `POST /api/notifications/deliveries`
 - Weixin group chats remain explicitly out of scope for this round
@@ -211,6 +212,7 @@ Use the generated report like this:
 - `notification_replay` and `proactive_notification_replay` show source-bound versus proactive delivery outcomes
 - `parity_ready=true` means both surfaces are ready and the system is `dual-surface ready`
 - `decision_reason` and `weixin_blocker_category` explain why Weixin is still below parity when the baseline remains available
+- `weixin.ingress_probe` records the latest real ingress attempt, while `weixin.latest_successful_ingress_probe` keeps the most recent historical success so stale proof does not hide a current blocker such as `weixin_waiting_for_private_text`
 
 ## Notification delivery endpoint
 
@@ -228,6 +230,12 @@ Current behavior:
 - stores outbound idempotency results by `delivery.idempotency_key`
 - optional redacted gateway status is available at `GET /api/gateway/status`
 - gateway status includes a redacted `delivery_observability` summary with source-bound versus proactive counts and queue/failure classification
+- gateway status now includes a top-level redacted `weixin` summary with:
+  - specific `blocker_category`
+  - coarse `ingress_blocker_category`
+  - `poll`
+  - `delivery_observability`
+- `release_v1.weixin_blocker_category` remains the coarse parity bucket, not the DNS-specific blocker code
 
 Required request header:
 
