@@ -502,6 +502,135 @@ class WeixinAdapterTests(unittest.TestCase):
             finally:
                 image_path.close()
 
+    def test_send_outbound_native_video_records_successful_delivery_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            video_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".mp4", delete=False)
+            try:
+                video_path.write(b"fake-mp4")
+                video_path.close()
+                adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+                assert adapter._context_tokens is not None
+                adapter._context_tokens.set("wx-user-1", "ctx-123")
+                with patch(
+                    "im_agent.platforms.weixin._upload_media_artifact_to_weixin",
+                    return_value=type(
+                        "UploadedMedia",
+                        (),
+                        {
+                            "download_param": "video-download-param",
+                            "aeskey_hex": "0123456789abcdef0123456789abcdef",
+                            "plaintext_size": 4096,
+                            "ciphertext_size": 4112,
+                        },
+                    )(),
+                ) as mocked_upload, patch(
+                    "im_agent.platforms.weixin.post_json",
+                    return_value={},
+                ) as mocked_post:
+                    response = adapter.send_outbound(
+                        OutboundMessage(
+                            platform="weixin",
+                            chat_id="wx-user-1",
+                            text="完整回放如下",
+                            attachments=[
+                                {
+                                    "kind": "video",
+                                    "mime_type": "video/mp4",
+                                    "path": video_path.name,
+                                }
+                            ],
+                            metadata={"source": "harborbeacon"},
+                        )
+                    )
+
+                transport = adapter.transport_status()
+                first_payload = mocked_post.call_args_list[0].args[2]
+                second_payload = mocked_post.call_args_list[1].args[2]
+                self.assertTrue(response["sent"])
+                self.assertEqual(mocked_upload.call_count, 1)
+                self.assertEqual(mocked_post.call_count, 2)
+                self.assertEqual(mocked_upload.call_args.kwargs["media_type"], 2)
+                self.assertEqual(transport["last_send_status"], "sent")
+                self.assertEqual(transport["last_send_content_kind"], "text+video")
+                self.assertEqual(first_payload["msg"]["item_list"][0]["type"], 1)
+                self.assertEqual(second_payload["msg"]["item_list"][0]["type"], 5)
+                self.assertEqual(response["metadata"]["native_attachment_kind"], "video")
+                self.assertFalse(response["metadata"]["native_attachment_fallback"])
+            finally:
+                video_path.close()
+
+    def test_send_outbound_native_video_falls_back_to_file_when_video_transport_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            video_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".mp4", delete=False)
+            try:
+                video_path.write(b"fake-mp4")
+                video_path.close()
+                adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+                assert adapter._context_tokens is not None
+                adapter._context_tokens.set("wx-user-1", "ctx-123")
+                with patch(
+                    "im_agent.platforms.weixin._upload_media_artifact_to_weixin",
+                    side_effect=[
+                        RuntimeError("video unsupported"),
+                        type(
+                            "UploadedMedia",
+                            (),
+                            {
+                                "download_param": "file-download-param",
+                                "aeskey_hex": "0123456789abcdef0123456789abcdef",
+                                "plaintext_size": 4096,
+                                "ciphertext_size": 4112,
+                            },
+                        )(),
+                    ],
+                ) as mocked_upload, patch(
+                    "im_agent.platforms.weixin.post_json",
+                    return_value={},
+                ) as mocked_post:
+                    response = adapter.send_outbound(
+                        OutboundMessage(
+                            platform="weixin",
+                            chat_id="wx-user-1",
+                            text="完整回放如下",
+                            attachments=[
+                                {
+                                    "kind": "video",
+                                    "mime_type": "video/mp4",
+                                    "path": video_path.name,
+                                }
+                            ],
+                            metadata={"source": "harborbeacon"},
+                        )
+                    )
+
+                transport = adapter.transport_status()
+                text_payload = mocked_post.call_args_list[0].args[2]
+                file_payload = mocked_post.call_args_list[1].args[2]
+                self.assertTrue(response["sent"])
+                self.assertEqual(mocked_upload.call_count, 2)
+                self.assertEqual(mocked_upload.call_args_list[0].kwargs["media_type"], 2)
+                self.assertEqual(mocked_upload.call_args_list[1].kwargs["media_type"], 3)
+                self.assertEqual(text_payload["msg"]["item_list"][0]["text_item"]["text"], "完整回放如下（以文件发送）")
+                self.assertEqual(file_payload["msg"]["item_list"][0]["type"], 4)
+                self.assertEqual(transport["last_send_status"], "sent")
+                self.assertEqual(transport["last_send_content_kind"], "text+file")
+                self.assertEqual(response["metadata"]["native_attachment_kind"], "file")
+                self.assertTrue(response["metadata"]["native_attachment_fallback"])
+            finally:
+                video_path.close()
+
     def test_send_outbound_native_image_fails_strictly_when_upload_step_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             save_weixin_account(

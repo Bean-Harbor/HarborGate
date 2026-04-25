@@ -155,6 +155,20 @@ def _normalize_outbound_attachment(record: dict[str, object]) -> dict[str, objec
     }
 
 
+def _result_data_block(response_payload: dict[str, object]) -> dict[str, object]:
+    result = response_payload.get("result")
+    result = result if isinstance(result, dict) else {}
+    data = result.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _clip_delivery_instruction(response_payload: dict[str, object]) -> dict[str, object] | None:
+    instruction = _result_data_block(response_payload).get("clip_delivery")
+    if not isinstance(instruction, dict):
+        return None
+    return instruction if str(instruction.get("kind") or "").strip() == "clip_delivery" else None
+
+
 def _native_source_bound_attachments(
     *,
     adapter_name: str,
@@ -175,6 +189,13 @@ def _native_source_bound_attachments(
         return []
 
     attachment = normalized[0]
+    if _clip_delivery_instruction(response_payload) is not None:
+        if attachment["kind"] not in {"video", "file"}:
+            return []
+        if not str(attachment.get("path") or "").strip():
+            return []
+        return [attachment]
+
     if attachment["kind"] != "image":
         return []
     if not str(attachment.get("mime_type") or "").startswith("image/"):

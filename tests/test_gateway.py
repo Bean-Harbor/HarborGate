@@ -309,6 +309,49 @@ class FakeImageReplyTaskClient:
         )
 
 
+class FakeClipDeliveryTaskClient:
+    def __init__(self, video_path: str) -> None:
+        self.video_path = video_path
+        self.calls: list[dict[str, object]] = []
+
+    def submit_turn(self, incoming, *, session_metadata=None):  # type: ignore[no-untyped-def]
+        metadata = dict(session_metadata or {})
+        self.calls.append({"incoming": incoming, "session_metadata": metadata})
+        return TaskTurnResult(
+            text="完整回放如下",
+            task_id="task_camera_clip_delivery",
+            trace_id="trace_camera_clip_delivery",
+            status="completed",
+            route_key="gw_route_weixin_room1",
+            response_payload={
+                "task_id": "task_camera_clip_delivery",
+                "trace_id": "trace_camera_clip_delivery",
+                "status": "completed",
+                "result": {
+                    "message": "完整回放如下",
+                    "data": {
+                        "clip_delivery": {
+                            "kind": "clip_delivery",
+                            "clip_media_asset_id": "asset-clip-1",
+                            "preferred_transport": "native_video",
+                            "fallback_transport": "file",
+                            "caption": "完整回放如下",
+                        }
+                    },
+                    "artifacts": [
+                        {
+                            "kind": "video",
+                            "label": "门口摄像头 完整回放",
+                            "mime_type": "video/mp4",
+                            "path": self.video_path,
+                            "metadata": {"artifact_role": "video_full_clip"},
+                        }
+                    ],
+                },
+            },
+        )
+
+
 class FakeSecondSurfaceAdapter(PlatformAdapter):
     name = "wechat-lite"
 
@@ -1290,6 +1333,40 @@ class GatewayServiceTests(unittest.TestCase):
                 self.assertNotIn("附件", response["text"])
             finally:
                 image_path.close()
+
+    def test_source_bound_weixin_clip_delivery_uses_video_attachment_without_synthetic_artifact_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".mp4", delete=False)
+            try:
+                video_path.write(b"fake-mp4")
+                video_path.close()
+                gateway = GatewayService(
+                    store=FileSessionStore(tmp, max_turns=10),
+                    brain=RuleBasedBrain(),
+                    task_client=FakeClipDeliveryTaskClient(video_path.name),
+                )
+                gateway.register_adapter(FakeNativeWeixinAdapter())
+
+                response = gateway.handle_inbound(
+                    "weixin",
+                    {
+                        "chat_id": "wx-user-1",
+                        "user_id": "wx-user-1",
+                        "text": "要",
+                        "message_id": "wx-msg-native-video-1",
+                    },
+                )
+
+                self.assertEqual(response["text"], "完整回放如下")
+                self.assertEqual(response["metadata"]["retrieval_render"]["content_kind"], "plain_reply")
+                self.assertEqual(response["metadata"]["native_attachment_count"], 1)
+                self.assertEqual(len(response["attachments"]), 1)
+                self.assertEqual(response["attachments"][0]["kind"], "video")
+                self.assertEqual(response["attachments"][0]["mime_type"], "video/mp4")
+                self.assertEqual(response["attachments"][0]["path"], video_path.name)
+                self.assertNotIn("附件", response["text"])
+            finally:
+                video_path.close()
 
     def test_local_retrieval_round_trip_launch_pack_smoke(self) -> None:
         payload = {

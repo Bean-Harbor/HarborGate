@@ -28,9 +28,13 @@ EP_GET_QR_STATUS = "ilink/bot/get_qrcode_status"
 
 ITEM_TEXT = 1
 ITEM_IMAGE = 2
+ITEM_FILE = 4
+ITEM_VIDEO = 5
 MSG_TYPE_BOT = 2
 MSG_STATE_FINISH = 2
 UPLOAD_MEDIA_IMAGE = 1
+UPLOAD_MEDIA_VIDEO = 2
+UPLOAD_MEDIA_FILE = 3
 WEIXIN_MEDIA_ENCRYPT_TYPE = 1
 DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 
@@ -456,6 +460,23 @@ class WeixinUploadedImage:
     thumbnail_ciphertext_size: int = 0
 
 
+@dataclass(slots=True)
+class WeixinUploadedMedia:
+    filekey: str
+    download_param: str
+    aeskey_hex: str
+    plaintext_size: int
+    ciphertext_size: int
+
+
+@dataclass(slots=True)
+class NativeWeixinAttachment:
+    delivery_kind: str
+    path: Path
+    mime_type: str
+    file_name: str
+
+
 def _upload_image_artifact_to_weixin(
     *,
     image_path: Path,
@@ -526,29 +547,153 @@ def _build_native_image_message_item(uploaded: WeixinUploadedImage) -> dict[str,
     return {"type": ITEM_IMAGE, "image_item": image_item}
 
 
+def _build_cdn_media_reference(download_param: str, aeskey_hex: str) -> dict[str, Any]:
+    aes_key_base64 = base64.b64encode(aeskey_hex.encode("ascii")).decode("ascii")
+    return {
+        "encrypt_query_param": download_param,
+        "aes_key": aes_key_base64,
+        "encrypt_type": WEIXIN_MEDIA_ENCRYPT_TYPE,
+    }
+
+
+def _upload_media_artifact_to_weixin(
+    *,
+    file_path: Path,
+    media_type: int,
+    to_user_id: str,
+    base_url: str,
+    token: str,
+    cdn_base_url: str,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> WeixinUploadedMedia:
+    file_bytes = file_path.read_bytes()
+    if not file_bytes:
+        raise RuntimeError(f"Weixin media artifact is empty: {file_path}")
+
+    filekey = os.urandom(16).hex()
+    aeskey = os.urandom(16)
+    upload_payload = {
+        "filekey": filekey,
+        "media_type": media_type,
+        "to_user_id": to_user_id,
+        "rawsize": len(file_bytes),
+        "rawfilemd5": _md5_hex(file_bytes),
+        "filesize": _aes_ecb_padded_size(len(file_bytes)),
+        "no_need_thumb": True,
+        "aeskey": aeskey.hex(),
+    }
+    upload_response = post_json(
+        base_url,
+        EP_GET_UPLOAD_URL,
+        upload_payload,
+        token=token,
+        timeout_seconds=timeout_seconds,
+    )
+    upload_full_url = str(upload_response.get("upload_full_url") or "").strip() or None
+    upload_param = str(upload_response.get("upload_param") or "").strip() or None
+    if not upload_full_url and not upload_param:
+        raise RuntimeError("Weixin getuploadurl returned no upload URL for the media artifact")
+
+    download_param = _upload_binary_to_cdn(
+        plaintext=file_bytes,
+        upload_full_url=upload_full_url,
+        upload_param=upload_param,
+        filekey=filekey,
+        cdn_base_url=cdn_base_url,
+        aeskey=aeskey,
+        label="weixin-media-orig",
+        timeout_seconds=timeout_seconds,
+    )
+    return WeixinUploadedMedia(
+        filekey=filekey,
+        download_param=download_param,
+        aeskey_hex=aeskey.hex(),
+        plaintext_size=len(file_bytes),
+        ciphertext_size=_aes_ecb_padded_size(len(file_bytes)),
+    )
+
+
+def _build_native_video_message_item(uploaded: WeixinUploadedMedia) -> dict[str, Any]:
+    return {
+        "type": ITEM_VIDEO,
+        "video_item": {
+            "media": _build_cdn_media_reference(uploaded.download_param, uploaded.aeskey_hex),
+            "video_size": uploaded.ciphertext_size,
+        },
+    }
+
+
+def _build_native_file_message_item(
+    uploaded: WeixinUploadedMedia,
+    *,
+    file_name: str,
+) -> dict[str, Any]:
+    return {
+        "type": ITEM_FILE,
+        "file_item": {
+            "media": _build_cdn_media_reference(uploaded.download_param, uploaded.aeskey_hex),
+            "file_name": file_name,
+            "len": str(uploaded.plaintext_size),
+        },
+    }
+
+
 def _build_text_message_item(text: str) -> dict[str, Any]:
     return {"type": ITEM_TEXT, "text_item": {"text": text}}
 
 
-def _should_send_native_image_reply(outbound: OutboundMessage) -> bool:
+def _should_send_native_attachment_reply(outbound: OutboundMessage) -> bool:
     return str(outbound.metadata.get("source") or "").strip() == "harborbeacon" and bool(outbound.attachments)
 
 
-def _resolve_native_image_attachment_path(outbound: OutboundMessage) -> Path:
+def _resolve_native_media_attachment(outbound: OutboundMessage) -> NativeWeixinAttachment:
     attachments = [item for item in outbound.attachments if isinstance(item, dict)]
     if len(attachments) != 1:
-        raise RuntimeError("Weixin native image reply requires exactly one attachment")
+        raise RuntimeError("Weixin native media reply requires exactly one attachment")
 
     attachment = attachments[0]
     kind = str(attachment.get("kind") or attachment.get("type") or "").strip().lower()
     mime_type = str(attachment.get("mime_type") or "").strip().lower()
-    if kind != "image" or not mime_type.startswith("image/"):
-        raise RuntimeError("Weixin native image reply requires a single image/* attachment")
-
     path = _resolve_local_attachment_path(str(attachment.get("path") or ""))
     if path is None:
-        raise RuntimeError("Weixin native image reply requires a readable same-host attachment path")
-    return path
+        raise RuntimeError("Weixin native media reply requires a readable same-host attachment path")
+
+    delivery_kind = "file"
+    if kind == "image" or mime_type.startswith("image/"):
+        delivery_kind = "image"
+    elif kind == "video" or mime_type.startswith("video/"):
+        delivery_kind = "video"
+
+    metadata = dict(attachment.get("metadata") or {}) if isinstance(attachment.get("metadata"), dict) else {}
+    file_name = (
+        str(metadata.get("file_name") or "").strip()
+        or str(attachment.get("label") or "").strip()
+        or path.name
+    )
+    return NativeWeixinAttachment(
+        delivery_kind=delivery_kind,
+        path=path,
+        mime_type=mime_type,
+        file_name=file_name,
+    )
+
+
+def _send_message_items(
+    *,
+    base_url: str,
+    token: str,
+    to_user_id: str,
+    context_token: str | None,
+    item_list: list[dict[str, Any]],
+) -> str:
+    payload = build_send_message_payload_items(
+        to_user_id=to_user_id,
+        item_list=item_list,
+        context_token=context_token,
+    )
+    client_id = str((payload.get("msg") or {}).get("client_id") or "")
+    post_json(base_url, EP_SEND_MESSAGE, payload, token=token)
+    return client_id
 
 
 def _headers(token: str | None, body: bytes | None = None) -> dict[str, str]:
@@ -928,14 +1073,20 @@ class WeixinAdapter(PlatformAdapter):
                 "Send a DM from WeChat first so the gateway can learn the session token."
             )
 
-        native_image_reply = _should_send_native_image_reply(outbound)
-        chunks = split_text_for_weixin(outbound.text) if not native_image_reply else []
-        if not native_image_reply and not chunks:
+        native_attachment = (
+            _resolve_native_media_attachment(outbound)
+            if _should_send_native_attachment_reply(outbound)
+            else None
+        )
+        chunks = split_text_for_weixin(outbound.text) if native_attachment is None else []
+        if native_attachment is None and not chunks:
             raise RuntimeError("Outbound Weixin message is empty")
         native_caption = outbound.text.strip()
         send_unit_count = len(chunks)
-        if native_image_reply:
+        if native_attachment is not None:
             send_unit_count = 1 + (1 if native_caption else 0)
+        delivered_attachment_kind = native_attachment.delivery_kind if native_attachment is not None else ""
+        attachment_fallback_used = False
 
         observed_at = utc_now_iso()
         self._set_transport_state(
@@ -951,34 +1102,127 @@ class WeixinAdapter(PlatformAdapter):
             last_send_provider_message_id="",
             last_send_context_token_used=True,
             last_send_attachment_count=len(outbound.attachments),
-            last_send_content_kind="text+image" if native_image_reply else "text",
+            last_send_content_kind=(
+                f"text+{native_attachment.delivery_kind}" if native_attachment is not None else "text"
+            ),
         )
         last_client_id = ""
         try:
-            if native_image_reply:
-                attachment_path = _resolve_native_image_attachment_path(outbound)
+            if native_attachment is not None and native_attachment.delivery_kind == "image":
                 uploaded_image = _upload_image_artifact_to_weixin(
-                    image_path=attachment_path,
+                    image_path=native_attachment.path,
                     to_user_id=outbound.chat_id,
                     base_url=self.base_url,
                     token=self.token,
                     cdn_base_url=self.cdn_base_url,
                 )
                 if native_caption:
-                    text_payload = build_send_message_payload_items(
+                    last_client_id = _send_message_items(
+                        base_url=self.base_url,
+                        token=self.token,
                         to_user_id=outbound.chat_id,
-                        item_list=[_build_text_message_item(native_caption)],
                         context_token=context_token,
+                        item_list=[_build_text_message_item(native_caption)],
                     )
-                    last_client_id = str((text_payload.get("msg") or {}).get("client_id") or "")
-                    post_json(self.base_url, EP_SEND_MESSAGE, text_payload, token=self.token)
-                image_payload = build_send_message_payload_items(
+                last_client_id = _send_message_items(
+                    base_url=self.base_url,
+                    token=self.token,
                     to_user_id=outbound.chat_id,
-                    item_list=[_build_native_image_message_item(uploaded_image)],
                     context_token=context_token,
+                    item_list=[_build_native_image_message_item(uploaded_image)],
                 )
-                last_client_id = str((image_payload.get("msg") or {}).get("client_id") or "")
-                post_json(self.base_url, EP_SEND_MESSAGE, image_payload, token=self.token)
+            elif native_attachment is not None and native_attachment.delivery_kind == "video":
+                try:
+                    uploaded_video = _upload_media_artifact_to_weixin(
+                        file_path=native_attachment.path,
+                        media_type=UPLOAD_MEDIA_VIDEO,
+                        to_user_id=outbound.chat_id,
+                        base_url=self.base_url,
+                        token=self.token,
+                        cdn_base_url=self.cdn_base_url,
+                    )
+                    if native_caption:
+                        last_client_id = _send_message_items(
+                            base_url=self.base_url,
+                            token=self.token,
+                            to_user_id=outbound.chat_id,
+                            context_token=context_token,
+                            item_list=[_build_text_message_item(native_caption)],
+                        )
+                    last_client_id = _send_message_items(
+                        base_url=self.base_url,
+                        token=self.token,
+                        to_user_id=outbound.chat_id,
+                        context_token=context_token,
+                        item_list=[_build_native_video_message_item(uploaded_video)],
+                    )
+                except Exception as video_exc:
+                    attachment_fallback_used = True
+                    delivered_attachment_kind = "file"
+                    uploaded_file = _upload_media_artifact_to_weixin(
+                        file_path=native_attachment.path,
+                        media_type=UPLOAD_MEDIA_FILE,
+                        to_user_id=outbound.chat_id,
+                        base_url=self.base_url,
+                        token=self.token,
+                        cdn_base_url=self.cdn_base_url,
+                    )
+                    fallback_caption = (
+                        f"{native_caption}（以文件发送）" if native_caption else "完整回放如下（以文件发送）"
+                    )
+                    try:
+                        last_client_id = _send_message_items(
+                            base_url=self.base_url,
+                            token=self.token,
+                            to_user_id=outbound.chat_id,
+                            context_token=context_token,
+                            item_list=[_build_text_message_item(fallback_caption)],
+                        )
+                        last_client_id = _send_message_items(
+                            base_url=self.base_url,
+                            token=self.token,
+                            to_user_id=outbound.chat_id,
+                            context_token=context_token,
+                            item_list=[
+                                _build_native_file_message_item(
+                                    uploaded_file,
+                                    file_name=native_attachment.file_name,
+                                )
+                            ],
+                        )
+                    except Exception as file_exc:
+                        raise RuntimeError(
+                            f"native video send failed: {video_exc}; fallback file send failed: {file_exc}"
+                        ) from file_exc
+            elif native_attachment is not None:
+                if native_caption:
+                    last_client_id = _send_message_items(
+                        base_url=self.base_url,
+                        token=self.token,
+                        to_user_id=outbound.chat_id,
+                        context_token=context_token,
+                        item_list=[_build_text_message_item(native_caption)],
+                    )
+                uploaded_file = _upload_media_artifact_to_weixin(
+                    file_path=native_attachment.path,
+                    media_type=UPLOAD_MEDIA_FILE,
+                    to_user_id=outbound.chat_id,
+                    base_url=self.base_url,
+                    token=self.token,
+                    cdn_base_url=self.cdn_base_url,
+                )
+                last_client_id = _send_message_items(
+                    base_url=self.base_url,
+                    token=self.token,
+                    to_user_id=outbound.chat_id,
+                    context_token=context_token,
+                    item_list=[
+                        _build_native_file_message_item(
+                            uploaded_file,
+                            file_name=native_attachment.file_name,
+                        )
+                    ],
+                )
             else:
                 for chunk in chunks:
                     payload = build_send_message_payload(
@@ -997,9 +1241,12 @@ class WeixinAdapter(PlatformAdapter):
                 last_error=error_text,
                 last_send_status="failed",
                 last_send_error=error_text,
-                last_send_retryable=False if native_image_reply else True,
+                last_send_retryable=False if native_attachment is not None else True,
                 last_send_provider_message_id=last_client_id,
                 last_send_context_token_used=True,
+                last_send_content_kind=(
+                    f"text+{delivered_attachment_kind}" if native_attachment is not None else "text"
+                ),
             )
             raise
 
@@ -1013,6 +1260,10 @@ class WeixinAdapter(PlatformAdapter):
             last_send_retryable=False,
             last_send_provider_message_id=last_client_id,
             last_send_context_token_used=True,
+            last_send_attachment_count=len(outbound.attachments),
+            last_send_content_kind=(
+                f"text+{delivered_attachment_kind}" if native_attachment is not None else "text"
+            ),
         )
         return {
             "platform": "weixin",
@@ -1029,7 +1280,9 @@ class WeixinAdapter(PlatformAdapter):
                 "context_token_used": True,
                 "chunk_count": send_unit_count,
                 "attachment_count": len(outbound.attachments),
-                "native_image_reply": native_image_reply,
+                "native_image_reply": native_attachment is not None and delivered_attachment_kind == "image",
+                "native_attachment_kind": delivered_attachment_kind,
+                "native_attachment_fallback": attachment_fallback_used,
             },
         }
 
