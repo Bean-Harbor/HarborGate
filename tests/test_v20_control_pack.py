@@ -38,6 +38,12 @@ def test_default_contract_version_is_v20() -> None:
     assert harborbeacon.DEFAULT_CONTRACT_VERSION == "2.0"
 
 
+def test_service_contract_default_is_v20() -> None:
+    server_source = _read(ROOT / "src" / "im_agent" / "server.py")
+    assert 'os.getenv("IM_AGENT_CONTRACT_VERSION", "2.0")' in server_source
+    assert 'os.getenv("IM_AGENT_CONTRACT_VERSION", "1.5")' not in server_source
+
+
 def test_active_client_no_longer_posts_tasks_endpoint() -> None:
     content = _read(ROOT / "src" / "im_agent" / "harborbeacon.py")
     assert '"/api/tasks"' not in content
@@ -54,3 +60,22 @@ def test_gateway_does_not_route_on_beacon_active_frame_kind() -> None:
     gateway_source = _read(ROOT / "src" / "im_agent" / "gateway.py")
     assert "active_frame.kind" not in gateway_source
     assert 'active_frame["kind"]' not in gateway_source
+
+
+def test_active_sources_have_no_v15_contract_version_defaults() -> None:
+    active_sources = [
+        ROOT / "src" / "im_agent" / "server.py",
+        ROOT / "src" / "im_agent" / "harborbeacon.py",
+    ]
+    forbidden = [
+        'X-Contract-Version": "1.5"',
+        'IM_AGENT_CONTRACT_VERSION", "1.5"',
+        'DEFAULT_CONTRACT_VERSION = "1.5"',
+    ]
+    offenders = [
+        f"{path}:{pattern}"
+        for path in active_sources
+        for pattern in forbidden
+        if pattern in _read(path)
+    ]
+    assert not offenders

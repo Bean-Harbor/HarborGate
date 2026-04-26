@@ -211,7 +211,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return None
 
     def _require_service_contract(self) -> None:
-        expected = os.getenv("IM_AGENT_CONTRACT_VERSION", "1.5").strip() or "1.5"
+        expected = os.getenv("IM_AGENT_CONTRACT_VERSION", "2.0").strip() or "2.0"
         received = self.headers.get("X-Contract-Version", "").strip()
         if received != expected:
             raise GatewayContractError(

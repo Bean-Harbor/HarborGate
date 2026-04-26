@@ -126,7 +126,7 @@ class NotificationServerTests(unittest.TestCase):
                     data=body,
                     headers={
                         "Content-Type": "application/json",
-                        "X-Contract-Version": "1.5",
+                        "X-Contract-Version": "2.0",
                     },
                     method="POST",
                 )
@@ -187,7 +187,7 @@ class NotificationServerTests(unittest.TestCase):
                     data=body,
                     headers={
                         "Content-Type": "application/json",
-                        "X-Contract-Version": "1.5",
+                        "X-Contract-Version": "2.0",
                     },
                     method="POST",
                 )
@@ -803,7 +803,7 @@ class NotificationServerTests(unittest.TestCase):
                     req = request.Request(
                         f"http://127.0.0.1:{server.server_port}/api/gateway/status",
                         headers={
-                            "X-Contract-Version": "1.5",
+                            "X-Contract-Version": "2.0",
                             "Authorization": "Bearer status-secret",
                         },
                         method="GET",
@@ -926,7 +926,7 @@ class NotificationServerTests(unittest.TestCase):
                 with patch.dict(os.environ, {"IM_AGENT_SERVICE_TOKEN": "status-secret"}, clear=False):
                     req = request.Request(
                         f"http://127.0.0.1:{server.server_port}/api/gateway/status",
-                        headers={"X-Contract-Version": "1.5"},
+                        headers={"X-Contract-Version": "2.0"},
                         method="GET",
                     )
                     with self.assertRaises(error.HTTPError) as ctx:
@@ -973,7 +973,7 @@ class NotificationServerTests(unittest.TestCase):
                     req = request.Request(
                         f"http://127.0.0.1:{server.server_port}/api/gateway/status",
                         headers={
-                            "X-Contract-Version": "1.5",
+                            "X-Contract-Version": "2.0",
                             "Authorization": "Bearer status-secret",
                         },
                         method="GET",
