@@ -104,5 +104,4 @@ Record:
   `/api/tasks` or emits `args.resume_token`.
 - Blockers: `.182` live Weixin validation is still pending target-registry
   confirmation.
-- Next exact step: after the fresh Beacon frame-first bundle is deployed on
-  `.182`, run the Weixin private-DM v2.0 matrix.
+- Next exact step: run the Weixin private-DM v2.0 matrix on `.182`.

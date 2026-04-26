@@ -138,6 +138,9 @@ pytest tests/test_platform_live_gate.py tests/test_gateway.py tests/test_weixin_
   frame and continuation.
 - Kept Weixin native video/file delivery in Gate, now driven by v2
   `delivery_hints`.
+- Deployed the fresh Beacon frame-first bundle to `.182`; the direct
+  `/api/turns` matrix now proves clip-confirmation feedback and boundary turns
+  preserve continuation until playback or cancel.
 - Renamed local release observability from `release_v1` to `release_v2`.
 - Changed files: `src/im_agent/harborbeacon.py`, `src/im_agent/gateway.py`,
   `src/im_agent/setup_portal.py`, `tools/run_platform_live_gate.py`, and
@@ -150,5 +153,5 @@ pytest tests/test_platform_live_gate.py tests/test_gateway.py tests/test_weixin_
   `/api/tasks` or emits `args.resume_token`.
 - Blockers: `.182` live Weixin validation is still pending target-registry
   confirmation.
-- Next exact step: deploy the fresh Beacon frame-first bundle to `.182`, then
-  run the Weixin private-DM v2.0 matrix through the updated Gate client.
+- Next exact step: run the Weixin private-DM v2.0 matrix through the updated
+  Gate client.
