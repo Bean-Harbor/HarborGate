@@ -133,6 +133,9 @@ pytest tests/test_platform_live_gate.py tests/test_gateway.py tests/test_weixin_
   and `POST /api/turns`.
 - Replaced request-time `resume_token` metadata with opaque `continuation`
   storage.
+- Added coverage that Gate preserves an opaque continuation when Beacon returns
+  a `completed` turn with an active frame, then clears it when Beacon omits the
+  frame and continuation.
 - Kept Weixin native video/file delivery in Gate, now driven by v2
   `delivery_hints`.
 - Renamed local release observability from `release_v1` to `release_v2`.
@@ -140,11 +143,12 @@ pytest tests/test_platform_live_gate.py tests/test_gateway.py tests/test_weixin_
   `src/im_agent/setup_portal.py`, `tools/run_platform_live_gate.py`, and
   related tests.
 - Tests run: `python -m pytest tests/test_v20_control_pack.py -q`,
+  `python -m pytest tests/test_gateway.py::GatewayServiceTests::test_completed_active_frame_persists_and_reuses_continuation -q`,
   `python -m pytest tests/test_v20_control_pack.py tests/test_harborbeacon.py tests/test_gateway.py tests/test_weixin_adapter.py tests/test_platform_live_gate.py tests/test_server.py -q`,
   `python -m pytest`, and `git diff --check`.
 - Drift check: Gate v2.0 guard passed; active client no longer posts
   `/api/tasks` or emits `args.resume_token`.
 - Blockers: `.182` live Weixin validation is still pending target-registry
   confirmation.
-- Next exact step: confirm `.182`, then run the Weixin private-DM v2.0 matrix
-  through the updated Gate client.
+- Next exact step: deploy the fresh Beacon frame-first bundle to `.182`, then
+  run the Weixin private-DM v2.0 matrix through the updated Gate client.

@@ -55,6 +55,45 @@ class FakeTaskClient:
         )
 
 
+class FakeCompletedFrameTaskClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._call_count = 0
+
+    def submit_turn(self, incoming, *, session_metadata=None):  # type: ignore[no-untyped-def]
+        metadata = dict(session_metadata or {})
+        self.calls.append({"incoming": incoming, "session_metadata": metadata})
+        self._call_count += 1
+        if self._call_count == 1:
+            return TaskTurnResult(
+                text="是否看完整回放？回复：要 / 不要",
+                task_id="task_frame_preserved",
+                trace_id="trace_frame_preserved",
+                status="completed",
+                route_key="gw_route_room1",
+                conversation_handle="conv_room1",
+                continuation={
+                    "token": "cont_frame_preserved",
+                    "frame_id": "frame_clip_confirmation",
+                    "reply_to_turn_id": "task_frame_preserved",
+                    "expires_at": None,
+                },
+                active_frame={
+                    "frame_id": "frame_clip_confirmation",
+                    "kind": "camera.clip_confirmation",
+                    "continuation_token": "cont_frame_preserved",
+                    "expected_reply": ["要", "不要"],
+                },
+            )
+        return TaskTurnResult(
+            text="完整回放如下",
+            task_id="task_frame_resolved",
+            trace_id="trace_frame_resolved",
+            status="completed",
+            route_key="gw_route_room1",
+        )
+
+
 class FakeReplayTaskClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -608,6 +647,48 @@ class GatewayServiceTests(unittest.TestCase):
             self.assertEqual(first["metadata"]["conversation_handle"], "conv_room1")
             self.assertEqual(second["metadata"]["task_id"], "task_second")
             self.assertNotIn("continuation", store.load_metadata("feishu", "room-1"))
+
+    def test_completed_active_frame_persists_and_reuses_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_client = FakeCompletedFrameTaskClient()
+            store = FileSessionStore(tmp, max_turns=10)
+            gateway = GatewayService(
+                store=store,
+                brain=RuleBasedBrain(),
+                task_client=task_client,
+            )
+            gateway.register_adapter(WebhookAdapter())
+
+            first = gateway.handle_inbound(
+                "webhook",
+                {
+                    "platform": "weixin",
+                    "chat_id": "room-1",
+                    "user_id": "alice",
+                    "text": "非常好",
+                    "message_id": "msg-1",
+                },
+            )
+            second = gateway.handle_inbound(
+                "webhook",
+                {
+                    "platform": "weixin",
+                    "chat_id": "room-1",
+                    "user_id": "alice",
+                    "text": "回放一下",
+                    "message_id": "msg-2",
+                },
+            )
+
+            self.assertEqual(first["metadata"]["status"], "completed")
+            self.assertEqual(first["metadata"]["continuation"]["token"], "cont_frame_preserved")
+            self.assertEqual(first["metadata"]["conversation_handle"], "conv_room1")
+            self.assertEqual(
+                task_client.calls[1]["session_metadata"]["continuation"]["token"],
+                "cont_frame_preserved",
+            )
+            self.assertEqual(second["metadata"]["task_id"], "task_frame_resolved")
+            self.assertNotIn("continuation", store.load_metadata("weixin", "room-1"))
 
     def test_replayed_older_message_does_not_rewind_gateway_session_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
