@@ -13,14 +13,18 @@ This project does not copy Hermes source code. It borrows the architecture direc
 
 ## Project governance
 
-The project is now pinned to [`HarborBeacon-HarborGate-Agent-Contract-v1.5.md`](./HarborBeacon-HarborGate-Agent-Contract-v1.5.md) as the working cross-repo implementation guide.
+The project is now pinned to [`HarborBeacon-HarborGate-Agent-Contract-v2.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v2.0.md) as the active cross-repo implementation guide.
+
+`HarborBeacon-HarborGate-Agent-Contract-v1.5.md` remains historical reference
+only.
 
 Management documents:
 
 - [`ROADMAP.md`](./ROADMAP.md)
 - [`PLAN.md`](./PLAN.md)
 - [`WORKLOG.md`](./WORKLOG.md)
-- [`HarborBeacon-HarborGate-v1.5-Cutover-Checklist.md`](./HarborBeacon-HarborGate-v1.5-Cutover-Checklist.md)
+- [`HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md`](./HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md)
+- [`HarborBeacon-HarborGate-v2.0-Cutover-Checklist.md`](./HarborBeacon-HarborGate-v2.0-Cutover-Checklist.md)
 
 ## What is included
 
@@ -62,7 +66,7 @@ What the placeholder layer means today:
 - `/api/gateway/status` reports each platform as `not_configured`, `configured_placeholder`, or `live`
 - placeholder outbound delivery returns a stable simulated delivery payload instead of raising random transport errors
 
-This keeps the HarborBeacon `v1.5` seam stable while giving us a near-usable skeleton for future live transports.
+This keeps the HarborBeacon v2.0 seam controlled while giving us a near-usable skeleton for future live transports.
 
 ## Layout
 
@@ -152,24 +156,23 @@ Supported contract:
 
 ## HarborBeacon task API mode
 
-If `HARBORBEACON_TASK_API_URL` is set, the gateway sends inbound turns to HarborBeacon through the frozen `v1.5` task contract instead of using the local demo brain.
+If `HARBORBEACON_TASK_API_URL` is set, the current code still uses the historical v1.5 task client. This is now a v2.0 drift item and must be replaced by the `/api/turns` client before release.
 
 ```powershell
 $env:HARBORBEACON_TASK_API_URL='http://127.0.0.1:9000'
 $env:HARBORBEACON_TASK_API_TOKEN='replace-me'
-$env:HARBORBEACON_CONTRACT_VERSION='1.5'
+$env:HARBORBEACON_CONTRACT_VERSION='2.0'
 $env:HARBORBEACON_DEFAULT_DOMAIN='general'
 $env:HARBORBEACON_DEFAULT_ACTION='message'
 $env:HARBORBEACON_AUTONOMY_LEVEL='supervised'
 ```
 
-Behavior in this mode:
+Historical drift in this mode:
 
-- the gateway builds canonical `POST /api/tasks` requests
-- stable `task_id` and `trace_id` are derived from inbound event identity
-- `route_key` and `session_id` are generated when the adapter does not provide them
-- `resume_token` is stored per chat and sent back on the next follow-up turn
-- HarborBeacon `TaskResponse` content is mapped back into the adapter delivery path
+- the current implementation still builds task requests instead of v2 turn requests
+- it still derives task-style identity instead of `turn.turn_id`
+- it still stores task-style continuation metadata
+- it must be replaced before the v2.0 release gate can pass
 
 If `HARBORBEACON_TASK_API_URL` is unset, the gateway falls back to the local rule-based brain or the OpenAI-compatible backend.
 
@@ -177,11 +180,11 @@ If `HARBORBEACON_TASK_API_URL` is unset, the gateway falls back to the local rul
 
 This repo currently treats the cross-repo prelaunch rehearsal like this:
 
-- Feishu is the stable baseline surface on the same HarborBeacon `v1.5` seam
-- Weixin `1:1` text stays on the same fixed release-v1 ingress taxonomy: `account_restore`, `qr_recovery`, `getupdates`, and `context_token_send`
-- the redacted gateway summary can also export a more specific transport `blocker_category` such as `weixin_dns_resolution` without rewriting the release-v1 parity bucket
-- only when both surfaces pass the same rehearsal matrix do we call the result `dual-surface ready`
-- HarborBeacon still only sees `POST /api/tasks` and `POST /api/notifications/deliveries`
+- Feishu v1.5 evidence is historical baseline only while the v2.0 turn seam is built
+- Weixin `1:1` private DM is the active live surface for v2.0 proof
+- the redacted gateway summary may export transport `blocker_category` such as `weixin_dns_resolution`, but contract readiness is judged by the v2.0 runbook
+- only when the v2.0 private-DM matrix passes do we call the result ready
+- HarborBeacon v2.0 work must move active ingress to `POST /api/turns` while keeping notification delivery in HarborGate
 - Weixin group chats remain explicitly out of scope for this round
 
 Recommended live-gate collector:
@@ -237,10 +240,10 @@ Current behavior:
   - `delivery_observability`
 - `release_v1.weixin_blocker_category` remains the coarse parity bucket, not the DNS-specific blocker code
 
-Required request header:
+Required request header for active v2.0 work:
 
 ```text
-X-Contract-Version: 1.5
+X-Contract-Version: 2.0
 ```
 
 Optional service auth:
@@ -260,7 +263,7 @@ Minimal example:
 ```bash
 curl -X POST http://127.0.0.1:8787/api/notifications/deliveries \
   -H "Content-Type: application/json" \
-  -H "X-Contract-Version: 1.5" \
+  -H "X-Contract-Version: 2.0" \
   -d '{
     "notification_id": "notif_001",
     "trace_id": "trace_001",

@@ -1,5 +1,10 @@
 # HarborBeacon HarborGate v1.5 Closeout - 2026-04-19
 
+## Historical Status
+
+This closeout remains valid only as historical v1.5 evidence. Current work
+follows `HarborBeacon-HarborGate-Agent-Contract-v2.0.md`.
+
 ## Status
 
 Feishu baseline rehearsal is ready on the frozen HarborBeacon `v1.5` seam.

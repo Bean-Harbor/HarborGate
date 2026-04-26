@@ -1,5 +1,22 @@
 # HarborGate Work Log
 
+## 2026-04-26
+
+### v2.0 Control Pack Start
+
+- Switched the active cross-repo baseline to `HarborBeacon-HarborGate-Agent-Contract-v2.0.md`.
+- Marked v1.5 as historical reference only.
+- Added the HarborGate v2.0 upgrade runbook and cutover checklist.
+- Current focus is control-pack and drift-guard setup before business code migration.
+
+### Stop-The-Line Rules
+
+- Ask before adding public contract fields.
+- Ask before changing Beacon/Gate ownership.
+- Ask before adding v1.5 runtime compatibility.
+- Ask before adding group-chat scope.
+- Ask on live target, credential, DNS, or provider blockers.
+
 ## 2026-04-19
 
 ### Closeout Snapshot

@@ -1,5 +1,12 @@
 # HarborBeacon HarborGate v1.5 Cutover Checklist
 
+## Historical Status
+
+This document is historical after the 2026-04-26 decision to move the active
+HarborBeacon <-> HarborGate seam to Contract v2.0.
+
+Use `HarborBeacon-HarborGate-v2.0-Cutover-Checklist.md` for current work.
+
 This repo is the IM-side evidence bundle for the frozen HarborBeacon seam in
 `HarborBeacon-HarborGate-Agent-Contract-v1.5.md`.
 

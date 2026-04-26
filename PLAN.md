@@ -1,415 +1,98 @@
-# HarborGate Master Plan
+# HarborGate v2.0 Master Plan
 
 ## Baseline
 
-- This plan is pinned to [`HarborBeacon-HarborGate-Agent-Contract-v1.5.md`](./HarborBeacon-HarborGate-Agent-Contract-v1.5.md).
-- If implementation pressure conflicts with the contract, the team updates the plan first and code second.
-- `v1.5` remains the working cross-repo baseline unless both repos explicitly approve a newer version.
+This plan is pinned to
+[`HarborBeacon-HarborGate-Agent-Contract-v2.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v2.0.md).
+
+v2.0 is the active cross-repo baseline. v1.5 is historical reference only.
+There is no in-process v1.5/v2.0 dual stack.
 
 ## Mission
 
-Build an independent HarborGate that replaces the HarborBeacon IM-facing layer while keeping a clean hard boundary:
+Build the HarborGate side of the v2.0 seam while keeping the boundary clean:
 
-- HarborGate owns IM platform adapters, ingress, route management, and outbound delivery.
-- HarborBeacon owns business execution, resumable workflow state, approvals, artifacts, and audit.
+- HarborGate owns IM adapters, ingress, route management, credentials, and
+  outbound delivery.
+- HarborBeacon owns conversation turns, active frames, business execution,
+  approvals, artifacts, and audit.
 
 ## Success Criteria
 
-The project is successful when all of the following are true:
-
-- HarborGate can receive a real IM message and send a canonical `POST /api/tasks` request to HarborBeacon.
-- HarborBeacon can return a user-renderable `TaskResponse` that HarborGate sends back without changing business meaning.
-- HarborBeacon can return `status=needs_input` and HarborGate can continue the same business flow with `args.resume_token`.
-- HarborBeacon can send notification intent to HarborGate through `POST /api/notifications/deliveries`.
-- HarborGate becomes the only long-term owner of IM delivery and IM platform credentials.
-
-## Scope Boundaries
-
-### In Scope
-
-- Inbound IM message normalization
-- HarborBeacon task-client wiring
-- Route-key-based outbound delivery
-- Resume flow support
-- Adapter maturation for Weixin and Feishu
-- Contract tests, integration tests, and cutover support
-
-### Out of Scope for This Delivery Wave
-
-- A second cross-repo contract beyond `v1.5`
-- Moving all intent parsing into HarborBeacon
-- Multi-step async-only IM turns without an initial synchronous reply
-- Broad multi-platform expansion before the first contract path is stable
-
-## Working Model
-
-### Principles
-
-- Contract-first before adapter-first
-- Platform logic stays in adapters
-- Business logic stays in HarborBeacon
-- No shared runtime state across repos
-- Idempotency behavior is a first-class feature, not a later patch
-- Real round-trips matter more than mock-only success
-
-### Ownership Split
-
-#### HarborGate Engineer
-
-- gateway runtime
-- normalized transport models
-- adapter registry
-- route registry
-- platform delivery
-- delivery idempotency
-- IM platform credential handling
-- HarborBeacon HTTP client integration
-
-#### HarborBeacon Engineer
-
-- `assistant_task_api`
-- business state machine
-- resumable workflow state
-- approval flow
-- artifact and audit persistence
-- notification intent generation
-- removal of direct platform-delivery assumptions
-
-#### Shared Integration Ownership
-
-- contract fixtures
-- end-to-end acceptance tests
-- error mapping decisions
-- cutover checklist
+- HarborGate receives a real IM message and sends a canonical `POST /api/turns`
+  request to HarborBeacon.
+- HarborBeacon returns a v2 turn response with user-renderable `reply.text`.
+- HarborGate stores `conversation.handle` and `continuation` opaquely.
+- HarborGate does not route business behavior from `active_frame.kind`.
+- HarborGate delivers artifacts using platform-neutral `delivery_hints`.
+- HarborBeacon remains free of direct IM delivery and raw platform credentials.
 
 ## Delivery Phases
 
-### Phase 0: Governance and Freeze
+### Phase 0: Control Pack
 
-Status: done
+Status: in progress
 
-Goals:
+- Publish the v2.0 contract.
+- Update README, ROADMAP, PLAN, WORKLOG, runbook, and checklist.
+- Add drift guard tests for remaining v1.5 active paths.
 
-- Freeze `v1.5` as the implementation baseline.
-- Align roadmap, plan, and work log with the frozen contract.
-- Use the GitHub repository as the common tracking hub.
-
-Artifacts:
-
-- `HarborBeacon-HarborGate-Agent-Contract-v1.5.md`
-- `ROADMAP.md`
-- `PLAN.md`
-- `WORKLOG.md`
-- GitHub repo setup
-
-### Phase 1: Internal Alignment in HarborGate
-
-Status: next
-
-Goals:
-
-- Align internal gateway models and flow with the contract boundary.
-- Prepare the codebase so HarborBeacon integration plugs into a stable, platform-agnostic path.
-
-Tasks:
-
-1. Confirm one internal inbound message shape and one outbound message shape.
-2. Add a HarborBeacon task client abstraction for `POST /api/tasks`.
-3. Define gateway-side mapping from internal inbound message to canonical HarborBeacon task request.
-4. Define gateway-side mapping from `TaskResponse` to outbound delivery requests.
-5. Make route key and message identity first-class in the gateway runtime.
-
-Deliverables:
-
-- internal request/response mapping layer
-- HarborBeacon client configuration surface
-- clear separation between adapter payloads and contract payloads
-
-Acceptance:
-
-- A local simulated inbound event can be transformed into a contract-valid HarborBeacon request.
-- A simulated HarborBeacon response can be rendered back into adapter-facing outbound content.
-
-### Phase 2: Inbound Task Contract Path
+### Phase 1: Turn Client
 
 Status: planned
 
-Goals:
+- Replace the historical task-client path with a v2 turn client.
+- Use `X-Contract-Version: 2.0`.
+- Send inbound IM turns to `/api/turns`.
+- Replace `message_task_ids` with `message_turn_ids`.
 
-- Make HarborGate send real canonical `POST /api/tasks` requests.
-- Make HarborBeacon accept and process those requests in the expected shape.
-
-Tasks:
-
-1. Implement actual HTTP task submission from HarborGate to HarborBeacon.
-2. Populate `task_id`, `trace_id`, `source`, `intent`, `message`, `entity_refs`, `args`, and `autonomy` correctly.
-3. Ensure retry behavior reuses the same `task_id` for the same inbound event.
-4. Preserve `source.route_key` for later replies and follow-up notifications.
-5. Add contract fixtures for inbound success, retry, and conflict paths.
-
-Dependencies:
-
-- HarborGate task client
-- HarborBeacon request validation and idempotency logic
-
-Acceptance:
-
-- Real IM inbound round-trip passes through `HarborGate -> /api/tasks -> TaskResponse -> user reply`.
-- Same-message retry with the same `task_id` is idempotent.
-- Conflicting replay of the same `task_id` is rejected with `409` and `IDEMPOTENCY_CONFLICT`.
-
-### Phase 3: Resume and Needs-Input Flow
+### Phase 2: Continuation Cache
 
 Status: planned
 
-Goals:
+- Replace `resume_token` metadata with opaque `continuation`.
+- Cache only `conversation.handle`, `frame_id`, continuation `token`,
+  `reply_to_turn_id`, and `expires_at`.
+- Do not interpret active-frame business semantics.
 
-- Support HarborBeacon resumable business flows from IM.
-
-Tasks:
-
-1. Support `status=needs_input`, `prompt`, and `resume_token`.
-2. Persist the minimum gateway state needed to continue the same conversation cleanly.
-3. Send the next user message as a new `task_id` with `args.resume_token`.
-4. Verify HarborBeacon treats `resume_token` as business continuity, not idempotency identity.
-5. Add contract fixtures for resumed turns.
-
-Acceptance:
-
-- Real `needs_input -> resumed turn` flow passes end to end.
-- Retry of the same follow-up message stays idempotent.
-- Resume flow does not require HarborGate to become the source of truth for workflow state.
-
-### Phase 4: Outbound Notification Delivery Contract
+### Phase 3: Delivery Hints
 
 Status: planned
 
-Goals:
+- Keep notification delivery hosted by HarborGate.
+- Use v2 `delivery_hints` for native media selection.
+- Keep Weixin native video/file fallback as Gate-side delivery behavior.
 
-- Move HarborBeacon notification delivery behind HarborGate.
-
-Tasks:
-
-1. Implement `POST /api/notifications/deliveries` in HarborGate.
-2. Resolve routes primarily through `destination.route_key`.
-3. Enforce `delivery.mode` validation and outbound idempotency.
-4. Separate request-rejection failures from accepted-request delivery failures.
-5. Add contract fixtures for success, retry, conflict, and route expiry paths.
-
-Dependencies:
-
-- route registry persistence
-- HarborBeacon notification producer
-
-Acceptance:
-
-- Real `HarborBeacon -> HarborGate -> platform delivery` round-trip succeeds.
-- Same `delivery.idempotency_key` retry does not duplicate end-user delivery.
-- Conflicting replay of the same `delivery.idempotency_key` is rejected.
-- `ROUTE_NOT_FOUND` and `ROUTE_EXPIRED` return non-200 shared-envelope failures, not `200 ok=false`.
-
-### Phase 5: Adapter Maturity
+### Phase 4: Live Evidence
 
 Status: planned
 
-Goals:
+- Run local tests.
+- Run platform live gate.
+- Capture the Weixin private-DM matrix from the v2 checklist.
 
-- Make at least one live adapter fully trustworthy.
-- Promote Feishu from skeleton to working transport after the core contract path is stable.
+## Drift Guards
 
-Priority order:
+The project is not release-ready while any of these remain in active code:
 
-1. Weixin hardening
-2. Feishu live transport
-3. Additional IM platforms
+- `X-Contract-Version: 1.5`
+- HarborGate posts to `/api/tasks`
+- request builders emit `args.resume_token`
+- Gate routes on Beacon `active_frame.kind`
+- group chat is treated as ready path
 
-#### Weixin Hardening
+## Stop-The-Line Conditions
 
-Tasks:
+Stop and ask before continuing when:
 
-- harden long-poll runner behavior
-- verify context token lifecycle
-- verify outbound retry and error handling
-- verify message identity stability
+- a new public v2 contract field is needed
+- Beacon/Gate ownership would change
+- v1.5 runtime compatibility is requested
+- group chat is needed
+- live target, credential, DNS, or provider state blocks the path
 
-Acceptance:
+## Verification
 
-- real private-text round-trip is stable under repeated use
-- outbound failures are surfaced clearly
-
-#### Feishu Live Transport
-
-Tasks:
-
-- add websocket-first transport
-- support text receive/send through the real Feishu connection
-- keep group gating and mention logic inside the adapter
-
-Acceptance:
-
-- real Feishu text round-trip works through the gateway
-- adapter keeps Feishu protocol concerns out of the agent core
-
-### Phase 6: Cutover and Hardening
-
-Status: planned
-
-Goals:
-
-- Make HarborGate the only long-term IM delivery owner.
-
-Tasks:
-
-1. Remove HarborBeacon direct IM delivery from the live path.
-2. Remove HarborBeacon long-term ownership of IM platform credentials.
-3. Add redacted status support if HarborBeacon UI needs connection state.
-4. Run cutover validation and rollback-readiness checks.
-
-Acceptance:
-
-- HarborBeacon no longer depends on direct platform credential validation for live IM delivery.
-- HarborGate is the only runtime that talks to IM platforms for delivery.
-
-## Workstreams
-
-### Stream A: Contract Implementation in HarborGate
-
-Priority:
-
-1. HarborBeacon task client
-2. request/response mapping
-3. route-key-aware outbound delivery
-4. notification delivery endpoint
-
-### Stream B: HarborBeacon Contract Compliance
-
-Priority:
-
-1. inbound idempotency behavior
-2. route key persistence
-3. `needs_input` and resume flow compliance
-4. notification producer behavior
-
-### Stream C: Shared Validation
-
-Priority:
-
-1. JSON schema
-2. golden fixtures
-3. cross-repo contract tests
-4. real adapter smoke tests
-
-## Suggested Execution Order
-
-### Immediate Sequence
-
-1. Implement HarborGate HarborBeacon task client and config.
-2. Wire canonical task request building from the internal inbound message model.
-3. Build reply mapping from HarborBeacon `TaskResponse` into adapter-facing outbound content.
-4. Align HarborBeacon with `task_id` replay and idempotency conflict behavior.
-5. Validate the first real inbound round-trip.
-6. Implement `needs_input` continuation path.
-7. Implement notification delivery endpoint and route-key resolution.
-8. Validate the first real outbound notification round-trip.
-9. Harden Weixin.
-10. Promote Feishu to live transport.
-
-### Recommended Two-Week Focus
-
-#### Week 1
-
-- Day 1-2: HarborGate task client and request builder
-- Day 2-3: HarborBeacon inbound contract alignment
-- Day 3-4: first end-to-end inbound round-trip
-- Day 4-5: retry and idempotency conflict validation
-
-#### Week 2
-
-- Day 1-2: `needs_input` and resumed turn flow
-- Day 2-3: notification delivery endpoint
-- Day 3-4: route-key and outbound idempotency validation
-- Day 4-5: first cutover-ready demo path
-
-## Deliverables Checklist
-
-- frozen contract baseline documented
-- gateway request builder
-- HarborBeacon task client
-- inbound contract fixtures
-- resumed-turn support
-- notification delivery endpoint
-- outbound contract fixtures
-- route registry behavior
-- one stable live adapter
-- cutover checklist
-
-## Test Strategy
-
-### Contract Tests
-
-- request schema conformance
-- response schema conformance
-- idempotent inbound replay
-- inbound replay conflict rejection
-- resumed-turn behavior
-- outbound delivery idempotency
-- outbound delivery conflict rejection
-- route expiry handling
-- failure channel separation
-
-### Integration Tests
-
-- simulated HarborBeacon round-trip from HarborGate
-- simulated notification round-trip into HarborGate
-- adapter-to-gateway-to-HarborBeacon smoke flow
-
-### Real Environment Validation
-
-- one real inbound IM round-trip
-- one real `needs_input` resumed turn
-- one real outbound notification round-trip
-
-## Risks and Mitigations
-
-### Risk: Contract Drift During Implementation
-
-Mitigation:
-
-- any contract-impacting change must be discussed before code lands
-- fields are not added ad hoc in only one repo
-
-### Risk: HarborBeacon Still Leaks Platform Logic
-
-Mitigation:
-
-- keep `route_key` as the preferred outbound handle
-- block new platform-native send shortcuts during review
-
-### Risk: Retry Behavior Is Correct in Mocks but Wrong in Live Traffic
-
-Mitigation:
-
-- test same-message retries against the real adapter path
-- log `task_id`, `trace_id`, `message.message_id`, and `route_key`
-
-### Risk: HarborGate Starts Owning Business State by Accident
-
-Mitigation:
-
-- keep resume flow dependent on `resume_token`
-- keep workflow truth in HarborBeacon only
-
-### Risk: Feishu Expansion Distracts from the Core Contract Path
-
-Mitigation:
-
-- do not prioritize Feishu live transport before the core inbound and outbound contract path is working
-
-## Done Definition
-
-The project is done for this delivery wave when:
-
-- the `v1.5` release gate is satisfied
-- the inbound path, resume path, and notification path each pass at least one real round-trip
-- retry and idempotency conflict behavior is proven in tests
-- HarborBeacon no longer owns live IM delivery
+- `python -m pytest`
+- targeted: `python -m pytest tests/test_gateway.py tests/test_harborbeacon.py tests/test_weixin_adapter.py tests/test_platform_live_gate.py`
+- live: `python .\tools\run_platform_live_gate.py --task-api-url http://127.0.0.1:4175 --task-api-token <shared-token>` after target confirmation
