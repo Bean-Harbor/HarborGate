@@ -33,7 +33,18 @@ class FakeTaskClient:
                 trace_id="trace_first",
                 status="needs_input",
                 route_key="gw_route_room1",
-                resume_token="resume_first",
+                conversation_handle="conv_room1",
+                continuation={
+                    "token": "cont_first",
+                    "frame_id": "frame_first",
+                    "reply_to_turn_id": "task_first",
+                    "expires_at": None,
+                },
+                active_frame={
+                    "frame_id": "frame_first",
+                    "continuation_token": "cont_first",
+                    "expected_reply": ["front door"],
+                },
             )
         return TaskTurnResult(
             text="Front door scan started.",
@@ -58,7 +69,18 @@ class FakeReplayTaskClient:
                 trace_id="trace_first",
                 status="needs_input",
                 route_key="gw_route_room1",
-                resume_token="resume_first",
+                conversation_handle="conv_room1",
+                continuation={
+                    "token": "cont_first",
+                    "frame_id": "frame_first",
+                    "reply_to_turn_id": "task_first",
+                    "expires_at": None,
+                },
+                active_frame={
+                    "frame_id": "frame_first",
+                    "continuation_token": "cont_first",
+                    "expected_reply": ["front door"],
+                },
             )
         return TaskTurnResult(
             text="Front door scan started.",
@@ -85,23 +107,30 @@ class FakeHarborOsTaskClient:
                 trace_id="trace_harbor_restart",
                 status="needs_input",
                 route_key="gw_route_room1",
-                resume_token="resume_harbor_restart",
+                conversation_handle="conv_harbor_room1",
+                continuation={
+                    "token": "cont_harbor_restart",
+                    "frame_id": "frame_harbor_restart",
+                    "reply_to_turn_id": "task_harbor_restart",
+                    "expires_at": None,
+                },
+                active_frame={
+                    "frame_id": "frame_harbor_restart",
+                    "continuation_token": "cont_harbor_restart",
+                    "expected_reply": ["approval_token approval_harbor_restart_1"],
+                },
                 response_payload={
-                    "task_id": "task_harbor_restart",
-                    "trace_id": "trace_harbor_restart",
-                    "status": "needs_input",
-                    "prompt": "ssh restart requires approval",
-                    "result": {
-                        "message": "ssh restart requires approval",
-                        "data": {
-                            "approval_ticket": {
-                                "approval_id": "approval_harbor_restart_1",
-                                "policy_ref": "service.restart",
-                            }
-                        },
-                        "next_actions": ["approval_token approval_harbor_restart_1"],
+                    "turn": {
+                        "turn_id": "task_harbor_restart",
+                        "trace_id": "trace_harbor_restart",
+                        "status": "needs_input",
                     },
-                    "resume_token": "resume_harbor_restart",
+                    "reply": {"kind": "frame_prompt", "text": "ssh restart requires approval"},
+                    "active_frame": {
+                        "frame_id": "frame_harbor_restart",
+                        "continuation_token": "cont_harbor_restart",
+                        "expected_reply": ["approval_token approval_harbor_restart_1"],
+                    },
                 },
             )
         return TaskTurnResult(
@@ -140,23 +169,30 @@ class FakeReplayHarborOsTaskClient:
                 trace_id="trace_weixin_restart",
                 status="needs_input",
                 route_key="gw_route_weixin_room1",
-                resume_token="resume_weixin_restart",
+                conversation_handle="conv_weixin_room1",
+                continuation={
+                    "token": "cont_weixin_restart",
+                    "frame_id": "frame_weixin_restart",
+                    "reply_to_turn_id": "task_weixin_restart",
+                    "expires_at": None,
+                },
+                active_frame={
+                    "frame_id": "frame_weixin_restart",
+                    "continuation_token": "cont_weixin_restart",
+                    "expected_reply": ["approval_token approval_weixin_restart_1"],
+                },
                 response_payload={
-                    "task_id": "task_weixin_restart",
-                    "trace_id": "trace_weixin_restart",
-                    "status": "needs_input",
-                    "prompt": "restart ssh requires approval",
-                    "result": {
-                        "message": "restart ssh requires approval",
-                        "data": {
-                            "approval_ticket": {
-                                "approval_id": "approval_weixin_restart_1",
-                                "policy_ref": "service.restart",
-                            }
-                        },
-                        "next_actions": ["approval_token approval_weixin_restart_1"],
+                    "turn": {
+                        "turn_id": "task_weixin_restart",
+                        "trace_id": "trace_weixin_restart",
+                        "status": "needs_input",
                     },
-                    "resume_token": "resume_weixin_restart",
+                    "reply": {"kind": "frame_prompt", "text": "restart ssh requires approval"},
+                    "active_frame": {
+                        "frame_id": "frame_weixin_restart",
+                        "continuation_token": "cont_weixin_restart",
+                        "expected_reply": ["approval_token approval_weixin_restart_1"],
+                    },
                 },
             )
         return TaskTurnResult(
@@ -324,30 +360,29 @@ class FakeClipDeliveryTaskClient:
             status="completed",
             route_key="gw_route_weixin_room1",
             response_payload={
-                "task_id": "task_camera_clip_delivery",
-                "trace_id": "trace_camera_clip_delivery",
-                "status": "completed",
-                "result": {
-                    "message": "完整回放如下",
-                    "data": {
-                        "clip_delivery": {
-                            "kind": "clip_delivery",
-                            "clip_media_asset_id": "asset-clip-1",
-                            "preferred_transport": "native_video",
-                            "fallback_transport": "file",
-                            "caption": "完整回放如下",
-                        }
-                    },
-                    "artifacts": [
-                        {
-                            "kind": "video",
-                            "label": "门口摄像头 完整回放",
-                            "mime_type": "video/mp4",
-                            "path": self.video_path,
-                            "metadata": {"artifact_role": "video_full_clip"},
-                        }
-                    ],
+                "turn": {
+                    "turn_id": "task_camera_clip_delivery",
+                    "trace_id": "trace_camera_clip_delivery",
+                    "status": "completed",
                 },
+                "reply": {"kind": "tool_result", "text": "完整回放如下"},
+                "artifacts": [
+                    {
+                        "kind": "video",
+                        "label": "门口摄像头 完整回放",
+                        "mime_type": "video/mp4",
+                        "media_asset_id": "asset-clip-1",
+                        "path": self.video_path,
+                        "metadata": {"artifact_role": "video_full_clip"},
+                    }
+                ],
+                "delivery_hints": [
+                    {
+                        "kind": "native_video",
+                        "artifact_id": "asset-clip-1",
+                        "fallback": "file",
+                    }
+                ],
             },
         )
 
@@ -532,7 +567,7 @@ class GatewayServiceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gateway.handle_inbound("missing", {"chat_id": "x", "text": "y"})
 
-    def test_task_client_path_persists_and_reuses_resume_token(self) -> None:
+    def test_task_client_path_persists_and_reuses_continuation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             task_client = FakeTaskClient()
             store = FileSessionStore(tmp, max_turns=10)
@@ -567,11 +602,12 @@ class GatewayServiceTests(unittest.TestCase):
             self.assertEqual(first["text"], "Which room should I scan?")
             self.assertEqual(second["text"], "Front door scan started.")
             self.assertEqual(task_client.calls[0]["session_metadata"], {})
-            self.assertEqual(task_client.calls[1]["session_metadata"]["resume_token"], "resume_first")
+            self.assertEqual(task_client.calls[1]["session_metadata"]["continuation"]["token"], "cont_first")
             self.assertEqual(first["metadata"]["source"], "harborbeacon")
-            self.assertEqual(first["metadata"]["resume_token"], "resume_first")
+            self.assertEqual(first["metadata"]["continuation"]["token"], "cont_first")
+            self.assertEqual(first["metadata"]["conversation_handle"], "conv_room1")
             self.assertEqual(second["metadata"]["task_id"], "task_second")
-            self.assertNotIn("resume_token", store.load_metadata("feishu", "room-1"))
+            self.assertNotIn("continuation", store.load_metadata("feishu", "room-1"))
 
     def test_replayed_older_message_does_not_rewind_gateway_session_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -619,15 +655,15 @@ class GatewayServiceTests(unittest.TestCase):
             self.assertEqual(first["metadata"]["task_id"], "task_first")
             self.assertEqual(second["metadata"]["task_id"], "task_second")
             self.assertEqual(replay["metadata"]["task_id"], "task_first")
-            self.assertEqual(replay["metadata"]["resume_token"], "resume_first")
-            self.assertEqual(metadata["last_task_id"], "task_second")
+            self.assertEqual(replay["metadata"]["continuation"]["token"], "cont_first")
+            self.assertEqual(metadata["last_turn_id"], "task_second")
             self.assertEqual(metadata["last_trace_id"], "trace_second")
             self.assertEqual(metadata["last_message_id"], "msg-2")
-            self.assertNotIn("resume_token", metadata)
-            self.assertEqual(metadata["message_task_ids"]["msg-1"], "task_first")
-            self.assertEqual(metadata["message_task_ids"]["msg-2"], "task_second")
+            self.assertNotIn("continuation", metadata)
+            self.assertEqual(metadata["message_turn_ids"]["msg-1"], "task_first")
+            self.assertEqual(metadata["message_turn_ids"]["msg-2"], "task_second")
 
-    def test_harboros_service_turn_preserves_resume_and_route_metadata(self) -> None:
+    def test_harboros_service_turn_preserves_continuation_and_route_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             task_client = FakeHarborOsTaskClient()
             store = FileSessionStore(tmp, max_turns=10)
@@ -672,20 +708,20 @@ class GatewayServiceTests(unittest.TestCase):
 
             self.assertEqual(first["metadata"]["task_id"], "task_harbor_restart")
             self.assertEqual(first["metadata"]["trace_id"], "trace_harbor_restart")
-            self.assertEqual(first["metadata"]["resume_token"], "resume_harbor_restart")
+            self.assertEqual(first["metadata"]["continuation"]["token"], "cont_harbor_restart")
             self.assertEqual(second["metadata"]["task_id"], "task_harbor_status")
             self.assertEqual(second["metadata"]["trace_id"], "trace_harbor_status")
             self.assertEqual(
-                task_client.calls[1]["session_metadata"]["resume_token"],
-                "resume_harbor_restart",
+                task_client.calls[1]["session_metadata"]["continuation"]["token"],
+                "cont_harbor_restart",
             )
             self.assertEqual(first_incoming.raw_payload["intent"]["domain"], "service")
             self.assertEqual(first_incoming.raw_payload["intent"]["action"], "restart")
             self.assertEqual(second_incoming.raw_payload["args"]["approval_token"], "approval_harbor_restart_1")
             self.assertEqual(metadata["route_key"], "gw_route_room1")
-            self.assertEqual(metadata["last_task_id"], "task_harbor_status")
+            self.assertEqual(metadata["last_turn_id"], "task_harbor_status")
             self.assertEqual(metadata["last_trace_id"], "trace_harbor_status")
-            self.assertNotIn("resume_token", metadata)
+            self.assertNotIn("continuation", metadata)
 
     def test_harboros_notification_delivery_reuses_registered_route_without_contract_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -852,24 +888,24 @@ class GatewayServiceTests(unittest.TestCase):
 
             self.assertEqual(first["platform"], "weixin")
             self.assertEqual(first["metadata"]["task_id"], "task_weixin_restart")
-            self.assertEqual(first["metadata"]["resume_token"], "resume_weixin_restart")
+            self.assertEqual(first["metadata"]["continuation"]["token"], "cont_weixin_restart")
             self.assertEqual(first["metadata"]["adapter_profile"]["surface_family"], "weixin")
             self.assertEqual(first["metadata"]["adapter_profile"]["transport_mode"], "polling")
             self.assertEqual(second["metadata"]["task_id"], "task_weixin_status")
             self.assertEqual(second["metadata"]["trace_id"], "trace_weixin_status")
             self.assertEqual(
-                task_client.calls[1]["session_metadata"]["resume_token"],
-                "resume_weixin_restart",
+                task_client.calls[1]["session_metadata"]["continuation"]["token"],
+                "cont_weixin_restart",
             )
             self.assertEqual(replay["metadata"]["task_id"], "task_weixin_restart")
-            self.assertEqual(replay["metadata"]["resume_token"], "resume_weixin_restart")
+            self.assertEqual(replay["metadata"]["continuation"]["token"], "cont_weixin_restart")
             self.assertEqual(metadata["route_key"], "gw_route_weixin_room1")
-            self.assertEqual(metadata["last_task_id"], "task_weixin_status")
+            self.assertEqual(metadata["last_turn_id"], "task_weixin_status")
             self.assertEqual(metadata["last_trace_id"], "trace_weixin_status")
             self.assertEqual(metadata["last_message_id"], "wx-msg-2")
-            self.assertNotIn("resume_token", metadata)
-            self.assertEqual(metadata["message_task_ids"]["wx-msg-1"], "task_weixin_restart")
-            self.assertEqual(metadata["message_task_ids"]["wx-msg-2"], "task_weixin_status")
+            self.assertNotIn("continuation", metadata)
+            self.assertEqual(metadata["message_turn_ids"]["wx-msg-1"], "task_weixin_restart")
+            self.assertEqual(metadata["message_turn_ids"]["wx-msg-2"], "task_weixin_status")
 
     def test_weixin_notification_delivery_uses_cached_context_token_and_replays_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1210,7 +1246,7 @@ class GatewayServiceTests(unittest.TestCase):
             self.assertEqual(response["metadata"]["ingress_profile"]["attachment_count"], 1)
             self.assertEqual(response["metadata"]["ingress_profile"]["attachment_types"], ["file"])
             self.assertEqual(response["metadata"]["ingress_profile"]["attachment_metadata_keys"], ["download_url", "file_key", "mime_type", "name", "type"])
-            self.assertNotIn("resume_token", task_client.calls[0]["session_metadata"])
+            self.assertNotIn("continuation", task_client.calls[0]["session_metadata"])
 
     def test_retrieval_reply_renders_citations_and_artifacts_without_leaking_logs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

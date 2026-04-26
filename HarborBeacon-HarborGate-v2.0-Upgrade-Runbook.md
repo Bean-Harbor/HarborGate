@@ -82,3 +82,20 @@ Record:
 - drift check result
 - blockers
 - next exact step
+
+## 2026-04-26 Closeout
+
+- Completed: active Gate client now emits v2.0 turn envelopes to
+  `/api/turns`, caches only opaque `conversation_handle` and `continuation`,
+  and keeps Weixin native video/file delivery driven by `delivery_hints`.
+- Changed files: `src/im_agent/harborbeacon.py`, `src/im_agent/gateway.py`,
+  `src/im_agent/setup_portal.py`, `tools/run_platform_live_gate.py`, and
+  related tests.
+- Tests run: `python -m pytest tests/test_v20_control_pack.py -q`,
+  targeted HarborBeacon/Gateway/Weixin/live-gate/server tests,
+  `python -m pytest`, and `git diff --check`.
+- Drift check: Gate v2.0 guard passed; active client no longer posts
+  `/api/tasks` or emits `args.resume_token`.
+- Blockers: `.182` live Weixin validation is still pending target-registry
+  confirmation.
+- Next exact step: confirm `.182`, then run the Weixin private-DM v2.0 matrix.

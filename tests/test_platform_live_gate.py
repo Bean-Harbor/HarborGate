@@ -57,81 +57,111 @@ class FakeFeishuLiveAdapter(PlatformAdapter):
 
 
 class HarborBeaconRehearsalHandler(BaseHTTPRequestHandler):
+    @staticmethod
+    def _turn_response(
+        *,
+        turn_id: str,
+        trace_id: str,
+        status: str,
+        text: str,
+        conversation_handle: str = "conv_rehearsal",
+        active_frame: dict[str, object] | None = None,
+        data: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "turn": {
+                "turn_id": turn_id,
+                "trace_id": trace_id,
+                "status": status,
+            },
+            "conversation": {
+                "handle": conversation_handle,
+            },
+            "active_frame": active_frame,
+            "reply": {
+                "kind": "frame_prompt" if active_frame else "tool_result",
+                "text": text,
+            },
+            "data": dict(data or {}),
+            "artifacts": [],
+            "delivery_hints": [],
+            "observability": {},
+            "error": None,
+        }
+
     def do_POST(self) -> None:  # noqa: N802
         content_length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(content_length).decode("utf-8")
         payload = json.loads(body) if body else {}
 
-        intent = payload.get("intent") if isinstance(payload.get("intent"), dict) else {}
-        args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+        turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
+        transport = payload.get("transport") if isinstance(payload.get("transport"), dict) else {}
+        metadata = transport.get("metadata") if isinstance(transport.get("metadata"), dict) else {}
+        intent = metadata.get("intent") if isinstance(metadata.get("intent"), dict) else {}
+        args = metadata.get("args") if isinstance(metadata.get("args"), dict) else {}
         domain = str(intent.get("domain") or "")
         action = str(intent.get("action") or "")
-        task_id = str(payload.get("task_id") or "task_unknown")
-        trace_id = str(payload.get("trace_id") or "trace_unknown")
+        task_id = str(turn.get("turn_id") or "turn_unknown")
+        trace_id = str(turn.get("trace_id") or "trace_unknown")
 
         if domain == "service" and action == "status":
-            response_payload = {
-                "task_id": task_id,
-                "trace_id": trace_id,
-                "status": "completed",
-                "result": {
-                    "message": "ssh is running.",
-                    "data": {
-                        "domain": "service",
-                        "operation": "status",
-                        "executor_used": "middleware_api",
-                    },
+            response_payload = self._turn_response(
+                turn_id=task_id,
+                trace_id=trace_id,
+                status="completed",
+                text="ssh is running.",
+                data={
+                    "domain": "service",
+                    "operation": "status",
+                    "executor_used": "middleware_api",
                 },
-            }
+            )
         elif domain == "service" and action == "restart" and not str(args.get("approval_token") or "").strip():
-            response_payload = {
-                "task_id": task_id,
-                "trace_id": trace_id,
-                "status": "needs_input",
-                "prompt": "restart requires approval",
-                "resume_token": f"resume_{task_id}",
-                "result": {
-                    "message": "restart requires approval",
-                    "next_actions": ["approval_token approved"],
+            response_payload = self._turn_response(
+                turn_id=task_id,
+                trace_id=trace_id,
+                status="needs_input",
+                text="restart requires approval",
+                active_frame={
+                    "frame_id": f"frame_{task_id}",
+                    "kind": "task.needs_input",
+                    "state": "awaiting_user_input",
+                    "expected_reply": ["approval_token approved"],
+                    "continuation_token": f"cont_{task_id}",
+                    "expires_at": None,
                 },
-            }
+            )
         elif domain == "service" and action == "restart":
-            response_payload = {
-                "task_id": task_id,
-                "trace_id": trace_id,
-                "status": "completed",
-                "result": {
-                    "message": "ssh restarted.",
-                    "data": {
-                        "domain": "service",
-                        "operation": "restart",
-                        "executor_used": "middleware_api",
-                    },
+            response_payload = self._turn_response(
+                turn_id=task_id,
+                trace_id=trace_id,
+                status="completed",
+                text="ssh restarted.",
+                data={
+                    "domain": "service",
+                    "operation": "restart",
+                    "executor_used": "middleware_api",
                 },
-            }
+            )
         elif domain == "files" and action == "list":
-            response_payload = {
-                "task_id": task_id,
-                "trace_id": trace_id,
-                "status": "completed",
-                "result": {
-                    "message": "listed /mnt",
-                    "data": {
-                        "domain": "files",
-                        "operation": "list",
-                        "executor_used": "middleware_api",
-                    },
+            response_payload = self._turn_response(
+                turn_id=task_id,
+                trace_id=trace_id,
+                status="completed",
+                text="listed /mnt",
+                data={
+                    "domain": "files",
+                    "operation": "list",
+                    "executor_used": "middleware_api",
                 },
-            }
+            )
         else:
-            response_payload = {
-                "task_id": task_id,
-                "trace_id": trace_id,
-                "status": "failed",
-                "result": {
-                    "message": f"unsupported {domain}.{action}",
-                },
-            }
+            response_payload = self._turn_response(
+                turn_id=task_id,
+                trace_id=trace_id,
+                status="failed",
+                text=f"unsupported {domain}.{action}",
+            )
 
         encoded = json.dumps(response_payload).encode("utf-8")
         self.send_response(200)
@@ -398,7 +428,7 @@ class PlatformLiveGateTests(unittest.TestCase):
             self.assertTrue(result["ran"])
             self.assertTrue(result["rehearsal_ready"])
             self.assertTrue(result["route_key_present"])
-            self.assertTrue(result["restart_turn"]["resume_token_present"])
+            self.assertTrue(result["restart_turn"]["continuation_present"])
             self.assertEqual(result["status_turn"]["status"], "completed")
             self.assertEqual(result["restart_turn"]["status"], "needs_input")
             self.assertEqual(result["resume_turn"]["status"], "completed")
@@ -437,9 +467,9 @@ class PlatformLiveGateTests(unittest.TestCase):
         self.assertEqual(report["decision"], "dual_surface_ready")
         self.assertTrue(report["parity_ready"])
         self.assertEqual(report["decision_reason"], "feishu_and_weixin_rehearsal_ready")
-        self.assertIn("release_v1", report)
-        self.assertEqual(report["release_v1"]["delivery_policy"]["interactive_reply"], "source_bound")
-        self.assertTrue(report["release_v1"]["dual_surface_ready"])
+        self.assertIn("release_v2", report)
+        self.assertEqual(report["release_v2"]["delivery_policy"]["interactive_reply"], "source_bound")
+        self.assertTrue(report["release_v2"]["dual_surface_ready"])
 
 
 if __name__ == "__main__":

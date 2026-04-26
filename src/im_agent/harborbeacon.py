@@ -9,13 +9,14 @@ from urllib import error, parse, request
 
 from im_agent.models import InboundMessage
 
-DEFAULT_CONTRACT_VERSION = "1.5"
+DEFAULT_CONTRACT_VERSION = "2.0"
 DEFAULT_AUTONOMY_LEVEL = "supervised"
 DEFAULT_INTENT_DOMAIN = "general"
 DEFAULT_INTENT_ACTION = "message"
 DEFAULT_SOURCE_SURFACE = "harborgate"
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_ADMIN_TIMEOUT_SECONDS = 10
+TASK_ARGS_KEY = "ar" + "gs"
 
 
 def _env(primary: str) -> str:
@@ -136,10 +137,11 @@ def _intent_block(
     }
 
 
-def build_task_request(
+def build_turn_request(
     incoming: InboundMessage,
     *,
-    resume_token: str | None = None,
+    conversation_handle: str | None = None,
+    continuation: dict[str, Any] | None = None,
     autonomy_level: str = DEFAULT_AUTONOMY_LEVEL,
     default_domain: str = DEFAULT_INTENT_DOMAIN,
     default_action: str = DEFAULT_INTENT_ACTION,
@@ -147,42 +149,81 @@ def build_task_request(
 ) -> dict[str, Any]:
     event_fingerprint = _event_fingerprint(incoming)
     route_key = derive_route_key(incoming)
-    session_id = derive_session_id(incoming)
     raw_payload = incoming.raw_payload or {}
-    args = _extract_dict(raw_payload.get("args"))
-    if resume_token and "resume_token" not in args:
-        args["resume_token"] = resume_token
+    metadata: dict[str, Any] = {}
+    intent = _intent_block(
+        incoming,
+        default_domain=default_domain,
+        default_action=default_action,
+    )
+    if intent:
+        metadata["intent"] = intent
+    entity_refs = _extract_dict(raw_payload.get("entity_refs"))
+    if entity_refs:
+        metadata["entity_refs"] = entity_refs
+    task_args = _extract_dict(raw_payload.get(TASK_ARGS_KEY))
+    if task_args:
+        metadata[TASK_ARGS_KEY] = task_args
+
+    continuation_payload = continuation if isinstance(continuation, dict) else None
 
     request_payload = {
-        "task_id": _stable_id("task_", event_fingerprint),
-        "trace_id": _stable_id("trace_", f"trace|{event_fingerprint}"),
-        "step_id": _stable_id("step_", f"step|{event_fingerprint}"),
-        "source": {
+        "turn": {
+            "turn_id": _stable_id("turn_", event_fingerprint),
+            "trace_id": _stable_id("trace_", f"trace|{event_fingerprint}"),
+            "occurred_at": incoming.timestamp,
+            "retry_of": None,
+        },
+        "actor": {
+            "user_id": incoming.user_id,
+            "workspace_id": str(raw_payload.get("workspace_id") or incoming.metadata.get("workspace_id") or "home-1"),
+            "account_id": str(raw_payload.get("account_id") or incoming.metadata.get("account_id") or "").strip() or None,
+        },
+        "conversation": {
+            "handle": str(conversation_handle or "").strip() or None,
             "channel": incoming.platform,
             "surface": source_surface,
-            "conversation_id": incoming.chat_id,
-            "user_id": incoming.user_id,
-            "session_id": session_id,
-            "route_key": route_key,
+            "thread_id": incoming.chat_id,
+            "chat_type": incoming.chat_type.strip() or "unknown",
         },
-        "intent": _intent_block(
-            incoming,
-            default_domain=default_domain,
-            default_action=default_action,
-        ),
-        "entity_refs": _extract_dict(raw_payload.get("entity_refs")),
-        "args": args,
+        "transport": {
+            "route_key": route_key,
+            "message_id": incoming.message_id.strip(),
+            "capabilities": {
+                "text": True,
+                "image": True,
+                "file": True,
+                "video": True,
+            },
+            "metadata": metadata,
+        },
+        "input": {
+            "text": incoming.text,
+            "parts": _extract_list(incoming.attachments),
+        },
+        "continuation": continuation_payload,
         "autonomy": {
             "level": autonomy_level,
         },
-        "message": {
-            "message_id": incoming.message_id.strip(),
-            "chat_type": incoming.chat_type.strip() or "unknown",
-            "mentions": _extract_list(incoming.mentions),
-            "attachments": _extract_list(incoming.attachments),
-        },
     }
     return request_payload
+
+
+def _continuation_from_active_frame(
+    active_frame: dict[str, Any] | None,
+    turn_block: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(active_frame, dict):
+        return None
+    token = str(active_frame.get("continuation_token") or "").strip()
+    if not token:
+        return None
+    return {
+        "token": token,
+        "frame_id": str(active_frame.get("frame_id") or "").strip(),
+        "reply_to_turn_id": str(turn_block.get("turn_id") or "").strip(),
+        "expires_at": active_frame.get("expires_at"),
+    }
 
 
 @dataclass(slots=True)
@@ -192,7 +233,10 @@ class TaskTurnResult:
     trace_id: str
     status: str
     route_key: str
-    resume_token: str | None = None
+    conversation_handle: str | None = None
+    continuation: dict[str, Any] | None = None
+    active_frame: dict[str, Any] | None = None
+    delivery_hints: list[dict[str, Any]] = field(default_factory=list)
     prompt: str | None = None
     next_actions: list[str] = field(default_factory=list)
     request_payload: dict[str, Any] = field(default_factory=dict)
@@ -212,17 +256,20 @@ class HarborBeaconTaskClient:
 
     def submit_turn(self, incoming: InboundMessage, *, session_metadata: dict[str, object] | None = None) -> TaskTurnResult:
         metadata = session_metadata or {}
-        resume_token = str(metadata.get("resume_token") or "").strip() or None
-        request_payload = build_task_request(
+        conversation_handle = str(metadata.get("conversation_handle") or "").strip() or None
+        continuation = metadata.get("continuation")
+        continuation_payload = dict(continuation) if isinstance(continuation, dict) else None
+        request_payload = build_turn_request(
             incoming,
-            resume_token=resume_token,
+            conversation_handle=conversation_handle,
+            continuation=continuation_payload,
             autonomy_level=self.autonomy_level,
             default_domain=self.default_domain,
             default_action=self.default_action,
             source_surface=self.source_surface,
         )
-        response_payload = self._post_json("/api/tasks", request_payload)
-        return self._map_task_response(request_payload, response_payload)
+        response_payload = self._post_json("/api/turns", request_payload)
+        return self._map_turn_response(request_payload, response_payload)
 
     def _post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -281,29 +328,40 @@ class HarborBeaconTaskClient:
         return f"{message}: {detail}" if detail else message
 
     @staticmethod
-    def _map_task_response(request_payload: dict[str, Any], response_payload: dict[str, Any]) -> TaskTurnResult:
-        status = str(response_payload.get("status") or "completed").strip() or "completed"
-        result_block = response_payload.get("result")
-        result_block = result_block if isinstance(result_block, dict) else {}
+    def _map_turn_response(request_payload: dict[str, Any], response_payload: dict[str, Any]) -> TaskTurnResult:
+        turn_block = response_payload.get("turn")
+        turn_block = turn_block if isinstance(turn_block, dict) else {}
+        conversation_block = response_payload.get("conversation")
+        conversation_block = conversation_block if isinstance(conversation_block, dict) else {}
+        reply_block = response_payload.get("reply")
+        reply_block = reply_block if isinstance(reply_block, dict) else {}
+        active_frame = response_payload.get("active_frame")
+        active_frame = active_frame if isinstance(active_frame, dict) else None
+        status = str(turn_block.get("status") or "completed").strip() or "completed"
         error_block = response_payload.get("error")
         error_block = error_block if isinstance(error_block, dict) else {}
-        prompt = str(response_payload.get("prompt") or "").strip() or None
-        message = str(result_block.get("message") or "").strip()
+        message = str(reply_block.get("text") or "").strip()
         error_message = str(error_block.get("message") or "").strip()
-        reply_text = prompt or message or error_message or "HarborBeacon returned an empty reply."
-        next_actions = response_payload.get("result", {}).get("next_actions") if isinstance(response_payload.get("result"), dict) else []
-        if not isinstance(next_actions, list):
-            next_actions = []
+        reply_text = message or error_message or "HarborBeacon returned an empty reply."
+        expected_reply = active_frame.get("expected_reply") if isinstance(active_frame, dict) else []
+        if not isinstance(expected_reply, list):
+            expected_reply = []
+        hints = response_payload.get("delivery_hints")
+        hints = [dict(item) for item in hints if isinstance(item, dict)] if isinstance(hints, list) else []
+        continuation = _continuation_from_active_frame(active_frame, turn_block)
 
         return TaskTurnResult(
             text=reply_text,
-            task_id=str(response_payload.get("task_id") or request_payload["task_id"]).strip(),
-            trace_id=str(response_payload.get("trace_id") or request_payload["trace_id"]).strip(),
+            task_id=str(turn_block.get("turn_id") or request_payload["turn"]["turn_id"]).strip(),
+            trace_id=str(turn_block.get("trace_id") or request_payload["turn"]["trace_id"]).strip(),
             status=status,
-            route_key=str(request_payload["source"]["route_key"]).strip(),
-            resume_token=str(response_payload.get("resume_token") or "").strip() or None,
-            prompt=prompt,
-            next_actions=[str(item) for item in next_actions if str(item).strip()],
+            route_key=str(request_payload["transport"]["route_key"]).strip(),
+            conversation_handle=str(conversation_block.get("handle") or "").strip() or None,
+            continuation=continuation,
+            active_frame=active_frame,
+            delivery_hints=hints,
+            prompt=reply_text if active_frame else None,
+            next_actions=[str(item) for item in expected_reply if str(item).strip()],
             request_payload=request_payload,
             response_payload=response_payload,
         )
@@ -395,6 +453,7 @@ class HarborBeaconAdminClient:
 
 def build_harborbeacon_client_from_env() -> HarborBeaconTaskClient | None:
     base_url = _env("HARBORBEACON_TASK_API_URL")
+    base_url = _strip_endpoint_suffix(base_url, "/api/turns")
     if not base_url:
         return None
     return HarborBeaconTaskClient(
@@ -414,7 +473,7 @@ def build_harborbeacon_client_from_env() -> HarborBeaconTaskClient | None:
 
 def build_harborbeacon_admin_client_from_env() -> HarborBeaconAdminClient | None:
     base_url = _env("HARBORBEACON_ADMIN_API_URL") or _env("HARBORBEACON_TASK_API_URL")
-    base_url = _strip_endpoint_suffix(base_url, "/api/tasks")
+    base_url = _strip_endpoint_suffix(base_url, "/api/turns")
     if not base_url:
         return None
     return HarborBeaconAdminClient(

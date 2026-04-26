@@ -368,13 +368,13 @@ class SetupPortalService:
         return transport
 
     @staticmethod
-    def _release_v1_delivery_policy() -> dict[str, str]:
+    def _release_v2_delivery_policy() -> dict[str, str]:
         return {
             "interactive_reply": "source_bound",
             "proactive_delivery": "user-default-configured",
         }
 
-    def _summarize_release_v1_status(
+    def _summarize_release_v2_status(
         self,
         *,
         feishu_ready: bool,
@@ -392,7 +392,7 @@ class SetupPortalService:
         proactive_health = delivery_health.get("proactive") if isinstance(delivery_health, dict) else {}
         proactive_health = proactive_health if isinstance(proactive_health, dict) else {}
         return {
-            "delivery_policy": self._release_v1_delivery_policy(),
+            "delivery_policy": self._release_v2_delivery_policy(),
             "feishu_rehearsal_ready": bool(feishu_ready),
             "weixin_rehearsal_ready": bool(weixin_ready),
             "parity_ready": bool(parity_ready),
@@ -405,7 +405,7 @@ class SetupPortalService:
             "proactive_delivery_health": dict(proactive_health),
             "latest_platform_live_gate_report_path": str(latest_live_gate_report.get("_report_path") or ""),
             "weixin_ingress_proof": dict(ingress_proof),
-            "release_v1_ready": bool(
+            "release_v2_ready": bool(
                 parity_ready
                 and bool(source_bound_health.get("ready"))
                 and bool(proactive_health.get("ready"))
@@ -578,16 +578,16 @@ class SetupPortalService:
         gateway_status = self.build_gateway_status_payload(request_host=request_host)
         delivery_health = self.gateway.store.summarize_delivery_health()
         live_gate_report = self._discover_latest_platform_live_gate_report()
-        release_v1 = self._summarize_release_v1_status(
+        release_v2 = self._summarize_release_v2_status(
             feishu_ready=bool(
                 bool(feishu_state.get("app_id"))
                 and bool(feishu_state.get("app_secret") or adapter.settings.app_secret)
                 and bool(adapter.transport_status().get("connected"))
             ),
             weixin_ready=bool(weixin.get("configured")) and not bool(weixin.get("blocker_category")),
-            parity_ready=bool(gateway_status.get("release_v1", {}).get("parity_ready")),
-            decision=str(live_gate_report.get("decision") or gateway_status.get("release_v1", {}).get("decision") or "").strip(),
-            decision_reason=str(live_gate_report.get("decision_reason") or gateway_status.get("release_v1", {}).get("decision_reason") or "").strip(),
+            parity_ready=bool(gateway_status.get("release_v2", {}).get("parity_ready")),
+            decision=str(live_gate_report.get("decision") or gateway_status.get("release_v2", {}).get("decision") or "").strip(),
+            decision_reason=str(live_gate_report.get("decision_reason") or gateway_status.get("release_v2", {}).get("decision_reason") or "").strip(),
             weixin_blocker_category=str(
                 weixin.get("ingress_blocker_category")
                 or weixin.get("blocker_category")
@@ -645,9 +645,9 @@ class SetupPortalService:
             "weixin": weixin,
             "gateway_status": gateway_status,
             "channels": gateway_status.get("channels", []),
-            "delivery_policy": self._release_v1_delivery_policy(),
+            "delivery_policy": self._release_v2_delivery_policy(),
             "delivery_health": delivery_health,
-            "release_v1": release_v1,
+            "release_v2": release_v2,
         }
 
     def build_gateway_status_payload(self, *, request_host: str = "") -> dict[str, Any]:
@@ -716,7 +716,7 @@ class SetupPortalService:
         delivery_observability = self.gateway.store.summarize_delivery_records()
         delivery_health = self.gateway.store.summarize_delivery_health()
         live_gate_report = self._discover_latest_platform_live_gate_report()
-        release_v1 = self._summarize_release_v1_status(
+        release_v2 = self._summarize_release_v2_status(
             feishu_ready=any(
                 bool(channel.get("connected")) and str(channel.get("platform") or "").lower() == "feishu"
                 for channel in channels
@@ -755,8 +755,8 @@ class SetupPortalService:
             },
             "delivery_observability": delivery_observability,
             "delivery_health": delivery_health,
-            "delivery_policy": self._release_v1_delivery_policy(),
-            "release_v1": release_v1,
+            "delivery_policy": self._release_v2_delivery_policy(),
+            "release_v2": release_v2,
         }
 
     def build_setup_page(self, *, request_host: str = "") -> str:
@@ -805,11 +805,11 @@ class SetupPortalService:
                     f'<br /><span class="hint">connected={connected}, transport={transport_status or "unknown"}</span></div>'
                 )
         gateway_version = _html_escape(str(gateway_status.get("gateway_version") or __version__))
-        release_v1 = status.get("release_v1") if isinstance(status.get("release_v1"), dict) else {}
-        release_decision = _html_escape(str(release_v1.get("decision") or ""))
-        release_reason = _html_escape(str(release_v1.get("decision_reason") or ""))
-        source_bound_health = release_v1.get("source_bound_delivery_health") if isinstance(release_v1.get("source_bound_delivery_health"), dict) else {}
-        proactive_health = release_v1.get("proactive_delivery_health") if isinstance(release_v1.get("proactive_delivery_health"), dict) else {}
+        release_v2 = status.get("release_v2") if isinstance(status.get("release_v2"), dict) else {}
+        release_decision = _html_escape(str(release_v2.get("decision") or ""))
+        release_reason = _html_escape(str(release_v2.get("decision_reason") or ""))
+        source_bound_health = release_v2.get("source_bound_delivery_health") if isinstance(release_v2.get("source_bound_delivery_health"), dict) else {}
+        proactive_health = release_v2.get("proactive_delivery_health") if isinstance(release_v2.get("proactive_delivery_health"), dict) else {}
         source_bound_health_state = _html_escape(str(source_bound_health.get("health_state") or "unknown"))
         proactive_health_state = _html_escape(str(proactive_health.get("health_state") or "unknown"))
         return f"""<!DOCTYPE html>
@@ -889,7 +889,7 @@ class SetupPortalService:
       <div class="status">
         <div><strong>gateway_version：</strong>{gateway_version}</div>
         <div><strong>channels：</strong>{len(gateway_channels) if isinstance(gateway_channels, list) else 0}</div>
-        <div><strong>release_v1：</strong>{release_decision or "unknown"}<span class="hint"> / {release_reason or "n/a"}</span></div>
+        <div><strong>release_v2：</strong>{release_decision or "unknown"}<span class="hint"> / {release_reason or "n/a"}</span></div>
         <div><strong>source_bound_health：</strong>{source_bound_health_state}</div>
         <div><strong>proactive_health：</strong>{proactive_health_state}</div>
         {gateway_rows or '<div class="hint">当前还没有注册到网关的通道。</div>'}

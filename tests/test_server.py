@@ -283,7 +283,7 @@ class NotificationServerTests(unittest.TestCase):
                         "decision_reason": "feishu_and_weixin_rehearsal_ready",
                         "parity_ready": True,
                         "weixin_blocker_category": "",
-                        "release_v1": {
+                        "release_v2": {
                             "delivery_policy": {
                                 "interactive_reply": "source_bound",
                                 "proactive_delivery": "user-default-configured",
@@ -377,14 +377,14 @@ class NotificationServerTests(unittest.TestCase):
                 self.assertEqual(weixin_channel["transport"]["status"], "polling_idle")
                 self.assertIn("delivery_policy", data)
                 self.assertEqual(data["delivery_policy"]["interactive_reply"], "source_bound")
-                self.assertIn("release_v1", data)
-                self.assertEqual(data["release_v1"]["decision"], "dual_surface_ready")
-                self.assertTrue(data["release_v1"]["weixin_ingress_proof"]["provider_private_text_seen"])
+                self.assertIn("release_v2", data)
+                self.assertEqual(data["release_v2"]["decision"], "dual_surface_ready")
+                self.assertTrue(data["release_v2"]["weixin_ingress_proof"]["provider_private_text_seen"])
                 self.assertEqual(
                     data["gateway_status"]["delivery_policy"]["proactive_delivery"],
                     "user-default-configured",
                 )
-                self.assertTrue(data["gateway_status"]["release_v1"]["dual_surface_ready"])
+                self.assertTrue(data["gateway_status"]["release_v2"]["dual_surface_ready"])
             finally:
                 server.shutdown()
                 server.server_close()

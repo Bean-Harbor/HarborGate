@@ -281,6 +281,7 @@ def turn_observability(
     request_message_id: str,
 ) -> dict[str, Any]:
     metadata = response_metadata(response)
+    continuation = metadata.get("continuation")
     return {
         "request_message_id": request_message_id,
         "delivery_sent": bool(response.get("sent")),
@@ -291,7 +292,8 @@ def turn_observability(
         "task_id_present": bool(str(metadata.get("task_id") or "").strip()),
         "trace_id_present": bool(str(metadata.get("trace_id") or "").strip()),
         "route_key_present": bool(str(metadata.get("route_key") or "").strip()),
-        "resume_token_present": bool(str(metadata.get("resume_token") or "").strip()),
+        "continuation_present": isinstance(continuation, dict)
+        and bool(str(continuation.get("token") or "").strip()),
     }
 
 
@@ -507,7 +509,7 @@ def run_weixin_task_rehearsal(
         rehearsal_ready = bool(
             status_turn["status"] == "completed"
             and restart_turn["status"] == "needs_input"
-            and restart_turn["resume_token_present"]
+            and restart_turn["continuation_present"]
             and resume_turn["status"] == "completed"
             and restart_turn["route_key_present"]
             and resume_turn["route_key_present"]
@@ -651,7 +653,7 @@ def run_feishu_task_rehearsal(
         rehearsal_ready = bool(
             status_turn["status"] == "completed"
             and restart_turn["status"] == "needs_input"
-            and restart_turn["resume_token_present"]
+            and restart_turn["continuation_present"]
             and resume_turn["status"] == "completed"
             and files_turn["status"] == "completed"
             and status_turn["task_id_present"]
@@ -969,7 +971,7 @@ def summarize_decision(report: dict[str, Any]) -> None:
         "proactive_delivery": "user-default-configured",
     }
     report["delivery_health"] = delivery_health
-    report["release_v1"] = {
+    report["release_v2"] = {
         "delivery_policy": report["delivery_policy"],
         "feishu_rehearsal_ready": bool(report["feishu"]["rehearsal_ready"]),
         "weixin_rehearsal_ready": bool(report["weixin"]["rehearsal_ready"]),
@@ -982,7 +984,7 @@ def summarize_decision(report: dict[str, Any]) -> None:
         "proactive_delivery_health": dict(proactive_health),
         "delivery_health": delivery_health,
         "weixin_ingress_proof": dict(weixin.get("ingress_probe") or {}),
-        "release_v1_ready": bool(
+        "release_v2_ready": bool(
             bool(report["parity_ready"])
             and bool(source_bound_health.get("ready"))
             and bool(proactive_health.get("ready"))
@@ -1004,8 +1006,8 @@ def summarize_decision(report: dict[str, Any]) -> None:
                 ]
                 if part
         ) or "no_live_surface_ready"
-    report["release_v1"]["decision"] = str(report.get("decision") or "")
-    report["release_v1"]["decision_reason"] = str(report.get("decision_reason") or "")
+    report["release_v2"]["decision"] = str(report.get("decision") or "")
+    report["release_v2"]["decision_reason"] = str(report.get("decision_reason") or "")
 
 
 def parse_args() -> argparse.Namespace:

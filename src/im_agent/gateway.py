@@ -113,6 +113,9 @@ def _render_retrieval_entry(record: dict[str, object], *, kind: str) -> str:
 
 
 def _coerce_artifact_candidates(response_payload: dict[str, object]) -> list[dict[str, object]]:
+    top_level_artifacts = response_payload.get("artifacts")
+    if isinstance(top_level_artifacts, list):
+        return _coerce_record_list(top_level_artifacts)
     result = response_payload.get("result")
     result = result if isinstance(result, dict) else {}
     return _coerce_record_list(
@@ -156,6 +159,9 @@ def _normalize_outbound_attachment(record: dict[str, object]) -> dict[str, objec
 
 
 def _result_data_block(response_payload: dict[str, object]) -> dict[str, object]:
+    data = response_payload.get("data")
+    if isinstance(data, dict):
+        return data
     result = response_payload.get("result")
     result = result if isinstance(result, dict) else {}
     data = result.get("data")
@@ -163,6 +169,13 @@ def _result_data_block(response_payload: dict[str, object]) -> dict[str, object]
 
 
 def _clip_delivery_instruction(response_payload: dict[str, object]) -> dict[str, object] | None:
+    hints = response_payload.get("delivery_hints")
+    if isinstance(hints, list):
+        for hint in hints:
+            if not isinstance(hint, dict):
+                continue
+            if str(hint.get("kind") or "").strip() == "native_video":
+                return hint
     instruction = _result_data_block(response_payload).get("clip_delivery")
     if not isinstance(instruction, dict):
         return None
@@ -274,18 +287,18 @@ def _ingress_profile(
     }
 
 
-def _message_task_ids(session_metadata: dict[str, object]) -> dict[str, str]:
-    raw = session_metadata.get("message_task_ids")
+def _message_turn_ids(session_metadata: dict[str, object]) -> dict[str, str]:
+    raw = session_metadata.get("message_turn_ids")
     if not isinstance(raw, dict):
         return {}
 
-    message_task_ids: dict[str, str] = {}
-    for message_id, task_id in raw.items():
+    message_turn_ids: dict[str, str] = {}
+    for message_id, turn_id in raw.items():
         normalized_message_id = str(message_id or "").strip()
-        normalized_task_id = str(task_id or "").strip()
-        if normalized_message_id and normalized_task_id:
-            message_task_ids[normalized_message_id] = normalized_task_id
-    return message_task_ids
+        normalized_turn_id = str(turn_id or "").strip()
+        if normalized_message_id and normalized_turn_id:
+            message_turn_ids[normalized_message_id] = normalized_turn_id
+    return message_turn_ids
 
 
 def _adapter_profile(adapter: PlatformAdapter) -> dict[str, object]:
@@ -364,8 +377,8 @@ class GatewayService:
         adapter_profile = _adapter_profile(adapter)
         history = self.store.load_history(inbound.platform, inbound.chat_id)
         session_metadata = self.store.load_metadata(inbound.platform, inbound.chat_id)
-        known_message_tasks = _message_task_ids(session_metadata)
-        replayed_task_id = known_message_tasks.get(inbound.message_id.strip(), "")
+        known_message_turns = _message_turn_ids(session_metadata)
+        replayed_turn_id = known_message_turns.get(inbound.message_id.strip(), "")
         resolved_route_key = inbound.route_key or str(session_metadata.get("route_key") or "").strip() or derive_route_key(inbound)
         resolved_session_id = inbound.session_id or derive_session_id(inbound)
         ingress_profile = _ingress_profile(
@@ -395,38 +408,42 @@ class GatewayService:
                 "session_id": resolved_session_id,
             }
             preserve_latest_pointer = bool(
-                replayed_task_id
-                and replayed_task_id != str(session_metadata.get("last_task_id") or "").strip()
+                replayed_turn_id
+                and replayed_turn_id != str(session_metadata.get("last_turn_id") or "").strip()
             )
             if not preserve_latest_pointer:
-                next_metadata["last_task_id"] = task_result.task_id
+                next_metadata["last_turn_id"] = task_result.task_id
                 next_metadata["last_trace_id"] = task_result.trace_id
                 if inbound.message_id.strip():
                     next_metadata["last_message_id"] = inbound.message_id.strip()
-                if task_result.resume_token:
-                    next_metadata["resume_token"] = task_result.resume_token
+                if task_result.conversation_handle:
+                    next_metadata["conversation_handle"] = task_result.conversation_handle
+                if task_result.continuation:
+                    next_metadata["continuation"] = task_result.continuation
                 else:
-                    next_metadata.pop("resume_token", None)
+                    next_metadata.pop("continuation", None)
             if inbound.message_id.strip():
-                next_metadata["message_task_ids"] = {
-                    **known_message_tasks,
+                next_metadata["message_turn_ids"] = {
+                    **known_message_turns,
                     inbound.message_id.strip(): task_result.task_id,
                 }
             self.store.set_metadata(inbound.platform, inbound.chat_id, next_metadata)
             outbound_metadata.update(
                 {
                     "source": "harborbeacon",
+                    "turn_id": task_result.task_id,
                     "task_id": task_result.task_id,
                     "trace_id": task_result.trace_id,
                     "status": task_result.status,
                     "route_key": resolved_route_key,
+                    "conversation_handle": task_result.conversation_handle,
+                    "active_frame": task_result.active_frame,
+                    "continuation": task_result.continuation,
                     "next_actions": task_result.next_actions,
                     "retrieval_render": retrieval_summary,
                     "native_attachment_count": len(outbound_attachments),
                 }
             )
-            if task_result.resume_token:
-                outbound_metadata["resume_token"] = task_result.resume_token
             if task_result.prompt:
                 outbound_metadata["prompt"] = task_result.prompt
             _log_observation(

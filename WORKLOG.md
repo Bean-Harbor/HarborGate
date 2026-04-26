@@ -125,3 +125,26 @@ pytest tests/test_platform_live_gate.py tests/test_gateway.py tests/test_weixin_
 - Verified that a real user DM entered the gateway, created a Feishu session file, and was normalized into the internal message flow.
 - Verified outbound delivery back to the same Feishu route through the IM-side notification delivery endpoint, including a successful provider message ID from the Feishu Open Platform API.
 - Closed the day with Feishu in `connected` websocket state, live send enabled, and the mobile setup portal aligned with the long-connection-first workflow.
+
+### 2026-04-26 v2.0 Turn Client Closeout
+
+- Preserved the v2.0 control pack as a separate commit.
+- Switched the active HarborBeacon client default to `X-Contract-Version: 2.0`
+  and `POST /api/turns`.
+- Replaced request-time `resume_token` metadata with opaque `continuation`
+  storage.
+- Kept Weixin native video/file delivery in Gate, now driven by v2
+  `delivery_hints`.
+- Renamed local release observability from `release_v1` to `release_v2`.
+- Changed files: `src/im_agent/harborbeacon.py`, `src/im_agent/gateway.py`,
+  `src/im_agent/setup_portal.py`, `tools/run_platform_live_gate.py`, and
+  related tests.
+- Tests run: `python -m pytest tests/test_v20_control_pack.py -q`,
+  `python -m pytest tests/test_v20_control_pack.py tests/test_harborbeacon.py tests/test_gateway.py tests/test_weixin_adapter.py tests/test_platform_live_gate.py tests/test_server.py -q`,
+  `python -m pytest`, and `git diff --check`.
+- Drift check: Gate v2.0 guard passed; active client no longer posts
+  `/api/tasks` or emits `args.resume_token`.
+- Blockers: `.182` live Weixin validation is still pending target-registry
+  confirmation.
+- Next exact step: confirm `.182`, then run the Weixin private-DM v2.0 matrix
+  through the updated Gate client.
