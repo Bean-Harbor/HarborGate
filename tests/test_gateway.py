@@ -384,6 +384,52 @@ class FakeImageReplyTaskClient:
         )
 
 
+class FakeMultiImageReplyTaskClient:
+    def __init__(self, image_paths: list[str]) -> None:
+        self.image_paths = image_paths
+        self.calls: list[dict[str, object]] = []
+
+    def submit_turn(self, incoming, *, session_metadata=None):  # type: ignore[no-untyped-def]
+        metadata = dict(session_metadata or {})
+        self.calls.append({"incoming": incoming, "session_metadata": metadata})
+        artifacts = [
+            {
+                "kind": "image",
+                "label": f"春天图片 {index}",
+                "mime_type": "image/jpeg",
+                "media_asset_id": f"asset-spring-{index}",
+                "path": image_path,
+                "url": None,
+                "metadata": {"artifact_role": "rag_image_hit"},
+            }
+            for index, image_path in enumerate(self.image_paths, start=1)
+        ]
+        return TaskTurnResult(
+            text="找到 4 张和春天相关的照片，先发最相关的 3 张。",
+            task_id="task_spring_image_rag",
+            trace_id="trace_spring_image_rag",
+            status="completed",
+            route_key="gw_route_weixin_room1",
+            response_payload={
+                "task_id": "task_spring_image_rag",
+                "trace_id": "trace_spring_image_rag",
+                "status": "completed",
+                "result": {
+                    "message": "找到 4 张和春天相关的照片，先发最相关的 3 张。",
+                    "artifacts": artifacts,
+                },
+                "delivery_hints": [
+                    {
+                        "kind": "native_image",
+                        "artifact_id": "asset-spring-1",
+                        "fallback": "text",
+                        "metadata": {"max_items": 3},
+                    }
+                ],
+            },
+        )
+
+
 class FakeClipDeliveryTaskClient:
     def __init__(self, video_path: str) -> None:
         self.video_path = video_path
@@ -1450,6 +1496,46 @@ class GatewayServiceTests(unittest.TestCase):
                 self.assertNotIn("附件", response["text"])
             finally:
                 image_path.close()
+
+    def test_source_bound_weixin_native_image_hint_allows_up_to_three_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_paths = [
+                tempfile.NamedTemporaryFile(dir=tmp, suffix=f"-{index}.jpg", delete=False)
+                for index in range(4)
+            ]
+            try:
+                for image_path in image_paths:
+                    image_path.write(b"fake-jpeg")
+                    image_path.close()
+                gateway = GatewayService(
+                    store=FileSessionStore(tmp, max_turns=10),
+                    brain=RuleBasedBrain(),
+                    task_client=FakeMultiImageReplyTaskClient([item.name for item in image_paths]),
+                )
+                gateway.register_adapter(FakeNativeWeixinAdapter())
+
+                response = gateway.handle_inbound(
+                    "weixin",
+                    {
+                        "chat_id": "wx-user-1",
+                        "user_id": "wx-user-1",
+                        "text": "找到和春天相关的照片",
+                        "message_id": "wx-msg-native-image-rag-1",
+                    },
+                )
+
+                self.assertEqual(response["text"], "找到 4 张和春天相关的照片，先发最相关的 3 张。")
+                self.assertEqual(response["metadata"]["retrieval_render"]["content_kind"], "plain_reply")
+                self.assertEqual(response["metadata"]["native_attachment_count"], 3)
+                self.assertEqual(len(response["attachments"]), 3)
+                self.assertEqual([item["kind"] for item in response["attachments"]], ["image", "image", "image"])
+                self.assertEqual(response["attachments"][0]["path"], image_paths[0].name)
+                self.assertEqual(response["attachments"][2]["path"], image_paths[2].name)
+                self.assertNotIn(image_paths[3].name, [item["path"] for item in response["attachments"]])
+                self.assertNotIn("附件", response["text"])
+            finally:
+                for image_path in image_paths:
+                    image_path.close()
 
     def test_source_bound_weixin_clip_delivery_uses_video_attachment_without_synthetic_artifact_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

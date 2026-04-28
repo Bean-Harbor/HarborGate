@@ -447,6 +447,82 @@ class WeixinAdapterTests(unittest.TestCase):
             finally:
                 image_path.close()
 
+    def test_send_outbound_native_image_sends_multiple_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            image_paths = [
+                tempfile.NamedTemporaryFile(dir=tmp, suffix=f"-{index}.jpg", delete=False)
+                for index in range(2)
+            ]
+            try:
+                for image_path in image_paths:
+                    image_path.write(b"fake-jpeg")
+                    image_path.close()
+                adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+                assert adapter._context_tokens is not None
+                adapter._context_tokens.set("wx-user-1", "ctx-123")
+                uploaded_image = type(
+                    "UploadedImage",
+                    (),
+                    {
+                        "original_download_param": "orig-download-param",
+                        "thumbnail_download_param": "thumb-download-param",
+                        "aeskey_hex": "0123456789abcdef0123456789abcdef",
+                        "original_ciphertext_size": 112,
+                        "thumbnail_ciphertext_size": 64,
+                    },
+                )()
+                with patch(
+                    "im_agent.platforms.weixin._upload_image_artifact_to_weixin",
+                    return_value=uploaded_image,
+                ) as mocked_upload, patch("im_agent.platforms.weixin.post_json", return_value={}) as mocked_post:
+                    response = adapter.send_outbound(
+                        OutboundMessage(
+                            platform="weixin",
+                            chat_id="wx-user-1",
+                            text="找到和春天相关的照片。",
+                            attachments=[
+                                {
+                                    "kind": "image",
+                                    "mime_type": "image/jpeg",
+                                    "path": image_paths[0].name,
+                                },
+                                {
+                                    "kind": "image",
+                                    "mime_type": "image/jpeg",
+                                    "path": image_paths[1].name,
+                                },
+                            ],
+                            metadata={"source": "harborbeacon"},
+                        )
+                    )
+
+                transport = adapter.transport_status()
+                caption_payload = mocked_post.call_args_list[0].args[2]
+                first_image_payload = mocked_post.call_args_list[1].args[2]
+                second_image_payload = mocked_post.call_args_list[2].args[2]
+                self.assertTrue(response["sent"])
+                self.assertEqual(mocked_upload.call_count, 2)
+                self.assertEqual(mocked_post.call_count, 3)
+                self.assertEqual(caption_payload["msg"]["item_list"][0]["type"], 1)
+                self.assertEqual(first_image_payload["msg"]["item_list"][0]["type"], 2)
+                self.assertEqual(second_image_payload["msg"]["item_list"][0]["type"], 2)
+                self.assertEqual(transport["last_send_status"], "sent")
+                self.assertEqual(transport["last_send_content_kind"], "text+image")
+                self.assertEqual(transport["last_send_attachment_count"], 2)
+                self.assertEqual(transport["last_send_chunk_count"], 3)
+                self.assertEqual(response["metadata"]["attachment_count"], 2)
+                self.assertEqual(response["metadata"]["native_attachment_count"], 2)
+                self.assertTrue(response["metadata"]["native_image_reply"])
+            finally:
+                for image_path in image_paths:
+                    image_path.close()
+
     def test_send_outbound_native_image_accepts_original_only_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             save_weixin_account(
