@@ -11,6 +11,6 @@ def main() -> None:
     if result is None:
         raise SystemExit(1)
 
-    print("\n下一步请设置环境变量后再启动 runner：")
-    print(f"$env:WEIXIN_ACCOUNT_ID='{result.account_id}'")
+    print("\n登录已保存到本机 Weixin state dir。下一步启动 runner：")
     print("harborgate-weixin-runner")
+    print(f"account_id={result.account_id}")

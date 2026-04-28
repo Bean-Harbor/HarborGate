@@ -42,6 +42,12 @@ DEFAULT_TIMEOUT_SECONDS = 45
 DEFAULT_POLL_TIMEOUT_MS = 35_000
 MAX_TEXT_CHUNK_LENGTH = 900
 CDN_UPLOAD_MAX_RETRIES = 3
+IGNORED_ACCOUNT_STATE_SUFFIXES = (
+    ".sync.json",
+    ".context_tokens.json",
+    ".processed_messages.json",
+    ".runtime.json",
+)
 
 
 def utc_now_iso() -> str:
@@ -142,11 +148,64 @@ def save_weixin_account(
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def clear_weixin_account_state(state_dir: str | Path, account_id: str) -> list[str]:
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        return []
+
+    deleted: list[str] = []
+    for path in (
+        _account_file(state_dir, normalized_account_id),
+        _sync_file(state_dir, normalized_account_id),
+        _context_file(state_dir, normalized_account_id),
+        _processed_file(state_dir, normalized_account_id),
+        _transport_state_file(state_dir, normalized_account_id),
+    ):
+        try:
+            path.unlink()
+            deleted.append(path.name)
+        except FileNotFoundError:
+            continue
+    return deleted
+
+
 def load_weixin_account(state_dir: str | Path, account_id: str) -> dict[str, Any] | None:
     path = _account_file(state_dir, account_id)
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def discover_weixin_account(state_dir: str | Path, account_id: str = "") -> dict[str, Any] | None:
+    normalized_account_id = str(account_id or "").strip()
+    if normalized_account_id:
+        return load_weixin_account(state_dir, normalized_account_id)
+
+    accounts_dir = Path(state_dir) / "accounts"
+    if not accounts_dir.exists():
+        return None
+
+    candidates: list[tuple[float, str, dict[str, Any]]] = []
+    for path in accounts_dir.glob("*.json"):
+        if any(path.name.endswith(suffix) for suffix in IGNORED_ACCOUNT_STATE_SUFFIXES):
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - tolerate stale or partial state files
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if not (str(payload.get("account_id") or "").strip() and str(payload.get("token") or "").strip()):
+            continue
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            modified_at = 0.0
+        candidates.append((modified_at, path.name, payload))
+
+    if not candidates:
+        return None
+    return dict(max(candidates, key=lambda item: (item[0], item[1]))[2])
 
 
 def load_weixin_transport_state(state_dir: str | Path, account_id: str) -> dict[str, Any] | None:
@@ -646,12 +705,7 @@ def _should_send_native_attachment_reply(outbound: OutboundMessage) -> bool:
     return str(outbound.metadata.get("source") or "").strip() == "harborbeacon" and bool(outbound.attachments)
 
 
-def _resolve_native_media_attachment(outbound: OutboundMessage) -> NativeWeixinAttachment:
-    attachments = [item for item in outbound.attachments if isinstance(item, dict)]
-    if len(attachments) != 1:
-        raise RuntimeError("Weixin native media reply requires exactly one attachment")
-
-    attachment = attachments[0]
+def _native_media_attachment_from_record(attachment: dict[str, Any]) -> NativeWeixinAttachment:
     kind = str(attachment.get("kind") or attachment.get("type") or "").strip().lower()
     mime_type = str(attachment.get("mime_type") or "").strip().lower()
     path = _resolve_local_attachment_path(str(attachment.get("path") or ""))
@@ -676,6 +730,26 @@ def _resolve_native_media_attachment(outbound: OutboundMessage) -> NativeWeixinA
         mime_type=mime_type,
         file_name=file_name,
     )
+
+
+def _resolve_native_media_attachments(outbound: OutboundMessage) -> list[NativeWeixinAttachment]:
+    attachments = [item for item in outbound.attachments if isinstance(item, dict)]
+    if not attachments:
+        raise RuntimeError("Weixin native media reply requires at least one attachment")
+
+    resolved = [_native_media_attachment_from_record(attachment) for attachment in attachments]
+    if len(resolved) > 1:
+        if any(attachment.delivery_kind != "image" for attachment in resolved):
+            raise RuntimeError("Weixin multi-attachment native reply only supports images")
+        return resolved[:3]
+    return resolved
+
+
+def _resolve_native_media_attachment(outbound: OutboundMessage) -> NativeWeixinAttachment:
+    resolved = _resolve_native_media_attachments(outbound)
+    if len(resolved) != 1:
+        raise RuntimeError("Weixin native media reply requires exactly one attachment")
+    return resolved[0]
 
 
 def _send_message_items(
@@ -747,11 +821,27 @@ def post_json(
 
 
 @dataclass(slots=True)
+class QRChallenge:
+    qrcode: str
+    qrcode_img_content: str
+    bot_type: str = "3"
+
+
+@dataclass(slots=True)
 class QRLoginResult:
     account_id: str
     token: str
     base_url: str
     user_id: str = ""
+
+
+def request_weixin_qr_challenge(*, bot_type: str = "3") -> QRChallenge:
+    qr_resp = get_json(ILINK_BASE_URL, f"{EP_GET_BOT_QR}?bot_type={parse.quote(bot_type)}", token=None)
+    qrcode_value = str(qr_resp.get("qrcode") or "").strip()
+    qrcode_url = str(qr_resp.get("qrcode_img_content") or "").strip()
+    if not qrcode_value:
+        raise RuntimeError("Weixin QR response did not include qrcode")
+    return QRChallenge(qrcode=qrcode_value, qrcode_img_content=qrcode_url, bot_type=bot_type)
 
 
 def run_weixin_qr_login(
@@ -760,11 +850,9 @@ def run_weixin_qr_login(
     bot_type: str = "3",
     timeout_seconds: int = 480,
 ) -> QRLoginResult | None:
-    qr_resp = get_json(ILINK_BASE_URL, f"{EP_GET_BOT_QR}?bot_type={parse.quote(bot_type)}", token=None)
-    qrcode_value = str(qr_resp.get("qrcode") or "").strip()
-    qrcode_url = str(qr_resp.get("qrcode_img_content") or "").strip()
-    if not qrcode_value:
-        raise RuntimeError("Weixin QR response did not include qrcode")
+    challenge = request_weixin_qr_challenge(bot_type=bot_type)
+    qrcode_value = challenge.qrcode
+    qrcode_url = challenge.qrcode_img_content
 
     print("请使用微信扫描下面的二维码链接：")
     print(qrcode_url or qrcode_value)
@@ -840,6 +928,14 @@ class WeixinAdapter(PlatformAdapter):
         self.base_url = (base_url or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip() or ILINK_BASE_URL
         self.cdn_base_url = str(os.getenv("WEIXIN_CDN_BASE_URL", DEFAULT_CDN_BASE_URL)).strip() or DEFAULT_CDN_BASE_URL
         self.user_id = os.getenv("WEIXIN_USER_ID", "").strip()
+
+        saved = discover_weixin_account(self.state_dir, self.account_id)
+        if isinstance(saved, dict) and (not self.account_id or not self.token):
+            self.account_id = str(saved.get("account_id") or self.account_id).strip()
+            self.token = str(saved.get("token") or self.token).strip()
+            self.base_url = str(saved.get("base_url") or self.base_url).strip() or ILINK_BASE_URL
+            self.user_id = str(saved.get("user_id") or self.user_id).strip()
+
         self._transport_state: dict[str, Any] = {
             "mode": "polling",
             "status": "waiting_for_credentials" if not self.configured else "polling_idle",
@@ -869,13 +965,6 @@ class WeixinAdapter(PlatformAdapter):
             "last_inbound_message_id": "",
             "last_inbound_chat_id": "",
         }
-
-        if self.account_id and not self.token:
-            saved = load_weixin_account(self.state_dir, self.account_id)
-            if saved:
-                self.token = str(saved.get("token") or "").strip()
-                self.base_url = str(saved.get("base_url") or self.base_url).strip() or ILINK_BASE_URL
-                self.user_id = str(saved.get("user_id") or self.user_id).strip()
 
         self._context_tokens = ContextTokenStore(self.state_dir, self.account_id) if self.account_id else None
         self._processed_messages = ProcessedMessageStore(self.state_dir, self.account_id) if self.account_id else None
@@ -1073,19 +1162,28 @@ class WeixinAdapter(PlatformAdapter):
                 "Send a DM from WeChat first so the gateway can learn the session token."
             )
 
-        native_attachment = (
-            _resolve_native_media_attachment(outbound)
+        native_attachments = (
+            _resolve_native_media_attachments(outbound)
             if _should_send_native_attachment_reply(outbound)
-            else None
+            else []
         )
-        chunks = split_text_for_weixin(outbound.text) if native_attachment is None else []
-        if native_attachment is None and not chunks:
+        has_native_attachments = bool(native_attachments)
+        native_attachment = native_attachments[0] if len(native_attachments) == 1 else None
+        chunks = split_text_for_weixin(outbound.text) if not has_native_attachments else []
+        if not has_native_attachments and not chunks:
             raise RuntimeError("Outbound Weixin message is empty")
         native_caption = outbound.text.strip()
         send_unit_count = len(chunks)
-        if native_attachment is not None:
-            send_unit_count = 1 + (1 if native_caption else 0)
-        delivered_attachment_kind = native_attachment.delivery_kind if native_attachment is not None else ""
+        if has_native_attachments:
+            send_unit_count = len(native_attachments) + (1 if native_caption else 0)
+        delivered_attachment_kind = ""
+        if has_native_attachments:
+            delivered_attachment_kind = (
+                "image"
+                if all(attachment.delivery_kind == "image" for attachment in native_attachments)
+                else native_attachments[0].delivery_kind
+            )
+        native_attachment_count = len(native_attachments) if has_native_attachments else len(outbound.attachments)
         attachment_fallback_used = False
 
         observed_at = utc_now_iso()
@@ -1101,21 +1199,26 @@ class WeixinAdapter(PlatformAdapter):
             last_send_retryable=False,
             last_send_provider_message_id="",
             last_send_context_token_used=True,
-            last_send_attachment_count=len(outbound.attachments),
+            last_send_attachment_count=native_attachment_count,
             last_send_content_kind=(
-                f"text+{native_attachment.delivery_kind}" if native_attachment is not None else "text"
+                f"text+{delivered_attachment_kind}" if has_native_attachments else "text"
             ),
         )
         last_client_id = ""
         try:
-            if native_attachment is not None and native_attachment.delivery_kind == "image":
-                uploaded_image = _upload_image_artifact_to_weixin(
-                    image_path=native_attachment.path,
-                    to_user_id=outbound.chat_id,
-                    base_url=self.base_url,
-                    token=self.token,
-                    cdn_base_url=self.cdn_base_url,
-                )
+            if has_native_attachments and all(
+                attachment.delivery_kind == "image" for attachment in native_attachments
+            ):
+                uploaded_images = [
+                    _upload_image_artifact_to_weixin(
+                        image_path=attachment.path,
+                        to_user_id=outbound.chat_id,
+                        base_url=self.base_url,
+                        token=self.token,
+                        cdn_base_url=self.cdn_base_url,
+                    )
+                    for attachment in native_attachments
+                ]
                 if native_caption:
                     last_client_id = _send_message_items(
                         base_url=self.base_url,
@@ -1124,13 +1227,14 @@ class WeixinAdapter(PlatformAdapter):
                         context_token=context_token,
                         item_list=[_build_text_message_item(native_caption)],
                     )
-                last_client_id = _send_message_items(
-                    base_url=self.base_url,
-                    token=self.token,
-                    to_user_id=outbound.chat_id,
-                    context_token=context_token,
-                    item_list=[_build_native_image_message_item(uploaded_image)],
-                )
+                for uploaded_image in uploaded_images:
+                    last_client_id = _send_message_items(
+                        base_url=self.base_url,
+                        token=self.token,
+                        to_user_id=outbound.chat_id,
+                        context_token=context_token,
+                        item_list=[_build_native_image_message_item(uploaded_image)],
+                    )
             elif native_attachment is not None and native_attachment.delivery_kind == "video":
                 try:
                     uploaded_video = _upload_media_artifact_to_weixin(
@@ -1241,11 +1345,12 @@ class WeixinAdapter(PlatformAdapter):
                 last_error=error_text,
                 last_send_status="failed",
                 last_send_error=error_text,
-                last_send_retryable=False if native_attachment is not None else True,
+                last_send_retryable=False if has_native_attachments else True,
                 last_send_provider_message_id=last_client_id,
                 last_send_context_token_used=True,
+                last_send_attachment_count=native_attachment_count,
                 last_send_content_kind=(
-                    f"text+{delivered_attachment_kind}" if native_attachment is not None else "text"
+                    f"text+{delivered_attachment_kind}" if has_native_attachments else "text"
                 ),
             )
             raise
@@ -1260,11 +1365,14 @@ class WeixinAdapter(PlatformAdapter):
             last_send_retryable=False,
             last_send_provider_message_id=last_client_id,
             last_send_context_token_used=True,
-            last_send_attachment_count=len(outbound.attachments),
+            last_send_attachment_count=native_attachment_count,
             last_send_content_kind=(
-                f"text+{delivered_attachment_kind}" if native_attachment is not None else "text"
+                f"text+{delivered_attachment_kind}" if has_native_attachments else "text"
             ),
         )
+        response_attachments = [dict(item) for item in outbound.attachments if isinstance(item, dict)]
+        if has_native_attachments:
+            response_attachments = response_attachments[:native_attachment_count]
         return {
             "platform": "weixin",
             "chat_id": outbound.chat_id,
@@ -1274,13 +1382,14 @@ class WeixinAdapter(PlatformAdapter):
             "sent": True,
             "message_id": last_client_id,
             "provider_message_id": last_client_id,
-            "attachments": [dict(item) for item in outbound.attachments if isinstance(item, dict)],
+            "attachments": response_attachments,
             "metadata": {
                 **outbound.metadata,
                 "context_token_used": True,
                 "chunk_count": send_unit_count,
-                "attachment_count": len(outbound.attachments),
-                "native_image_reply": native_attachment is not None and delivered_attachment_kind == "image",
+                "attachment_count": native_attachment_count,
+                "native_image_reply": has_native_attachments and delivered_attachment_kind == "image",
+                "native_attachment_count": len(native_attachments),
                 "native_attachment_kind": delivered_attachment_kind,
                 "native_attachment_fallback": attachment_fallback_used,
             },
