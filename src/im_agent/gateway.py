@@ -182,6 +182,30 @@ def _clip_delivery_instruction(response_payload: dict[str, object]) -> dict[str,
     return instruction if str(instruction.get("kind") or "").strip() == "clip_delivery" else None
 
 
+def _native_image_instruction(response_payload: dict[str, object]) -> dict[str, object] | None:
+    hints = response_payload.get("delivery_hints")
+    if isinstance(hints, list):
+        for hint in hints:
+            if not isinstance(hint, dict):
+                continue
+            if str(hint.get("kind") or "").strip() in {"native_image", "native_images"}:
+                return hint
+    return None
+
+
+def _native_image_limit(instruction: dict[str, object] | None) -> int:
+    if not instruction:
+        return 1
+    metadata = instruction.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    raw_limit = instruction.get("max_items") or metadata.get("max_items") or metadata.get("limit")
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        limit = 3
+    return max(1, min(3, limit))
+
+
 def _native_source_bound_attachments(
     *,
     adapter_name: str,
@@ -198,24 +222,34 @@ def _native_source_bound_attachments(
         )
         if attachment is not None
     ]
-    if len(normalized) != 1:
+    if not normalized:
         return []
 
-    attachment = normalized[0]
     if _clip_delivery_instruction(response_payload) is not None:
+        if len(normalized) != 1:
+            return []
+        attachment = normalized[0]
         if attachment["kind"] not in {"video", "file"}:
             return []
         if not str(attachment.get("path") or "").strip():
             return []
         return [attachment]
 
-    if attachment["kind"] != "image":
+    image_attachments = [
+        attachment
+        for attachment in normalized
+        if attachment["kind"] == "image"
+        and str(attachment.get("mime_type") or "").startswith("image/")
+        and str(attachment.get("path") or "").strip()
+    ]
+    if not image_attachments:
         return []
-    if not str(attachment.get("mime_type") or "").startswith("image/"):
-        return []
-    if not str(attachment.get("path") or "").strip():
-        return []
-    return [attachment]
+    image_instruction = _native_image_instruction(response_payload)
+    if image_instruction is not None:
+        return image_attachments[: _native_image_limit(image_instruction)]
+    if len(normalized) == 1 and normalized[0] is image_attachments[0]:
+        return image_attachments
+    return []
 
 
 def _render_retrieval_reply(

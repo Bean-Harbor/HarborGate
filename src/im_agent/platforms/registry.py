@@ -11,7 +11,7 @@ from im_agent.platforms.placeholder import (
     build_placeholder_adapter,
 )
 from im_agent.platforms.webhook import WebhookAdapter
-from im_agent.platforms.weixin import WeixinAdapter
+from im_agent.platforms.weixin import WeixinAdapter, discover_weixin_account
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +23,10 @@ class AdapterRegistration:
 
 
 def _weixin_enabled() -> bool:
-    return bool(os.getenv("WEIXIN_ACCOUNT_ID", "").strip())
+    if os.getenv("WEIXIN_ACCOUNT_ID", "").strip():
+        return True
+    state_dir = os.getenv("WEIXIN_STATE_DIR", "data/weixin")
+    return discover_weixin_account(state_dir) is not None
 
 
 def _feishu_enabled() -> bool:

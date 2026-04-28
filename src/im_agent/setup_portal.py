@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import socket
 import threading
@@ -19,12 +20,18 @@ from im_agent import __version__
 from im_agent.gateway import GatewayService
 from im_agent.platforms.feishu import FeishuAdapter, FeishuSettings
 from im_agent.platforms.weixin import (
+    EP_GET_QR_STATUS,
+    ILINK_BASE_URL,
     WeixinAdapter,
+    clear_weixin_account_state,
+    get_json,
     is_weixin_dns_resolution_error,
     is_weixin_provider_auth_error,
     load_weixin_account,
     load_weixin_context_tokens,
     load_weixin_transport_state,
+    request_weixin_qr_challenge,
+    save_weixin_account,
 )
 
 
@@ -42,6 +49,59 @@ def _mask_secret(value: str) -> str:
     if len(text) <= 6:
         return "*" * len(text)
     return f"{text[:4]}***{text[-2:]}"
+
+
+_SENSITIVE_STATUS_KEYS = {
+    "api_key",
+    "app_secret",
+    "access_token",
+    "tenant_access_token",
+    "bot_token",
+    "context_token",
+    "verification_token",
+    "encrypt_key",
+    "authorization",
+    "token",
+    "secret",
+}
+
+
+def _redact_known_secrets(value: str, *secrets: str) -> str:
+    redacted = str(value or "")
+    for secret in secrets:
+        normalized_secret = str(secret or "").strip()
+        if normalized_secret:
+            redacted = redacted.replace(normalized_secret, "[REDACTED]")
+    redacted = re.sub(r"(?i)Bearer\s+\S+", "Bearer [REDACTED]", redacted)
+
+    def _replace_assignment(match: re.Match[str]) -> str:
+        return f"{match.group(1)}=[REDACTED]"
+
+    redacted = re.sub(
+        r"(?i)\b(api_key|app_secret|access_token|tenant_access_token|bot_token|context_token|authorization|token|secret)\s*[:=]\s*([^\s,;]+)",
+        _replace_assignment,
+        redacted,
+    )
+    return redacted
+
+
+def _redact_status_payload(value: Any, *secrets: str) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            key_text = str(key).strip().lower()
+            if key_text in _SENSITIVE_STATUS_KEYS:
+                redacted[key] = "[REDACTED]" if str(item or "").strip() else ""
+                continue
+            redacted[key] = _redact_status_payload(item, *secrets)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_status_payload(item, *secrets) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_status_payload(item, *secrets) for item in value)
+    if isinstance(value, str):
+        return _redact_known_secrets(value, *secrets)
+    return value
 
 
 def _html_escape(value: str) -> str:
@@ -178,6 +238,24 @@ class FileSetupPortalStore:
             self._write_state(state)
             return dict(state["feishu"])
 
+    def load_weixin_login_state(self) -> dict[str, Any]:
+        state = self.load_state()
+        login = state.get("weixin_login")
+        return dict(login) if isinstance(login, dict) else {}
+
+    def save_weixin_login_state(self, next_login: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if not self.path.exists():
+                state = self._bootstrap_state({})
+            else:
+                with self.path.open("r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                state = self._bootstrap_state(payload if isinstance(payload, dict) else {})
+            state["weixin_login"] = dict(next_login)
+            state["updated_at"] = _now_utc()
+            self._write_state(state)
+            return dict(state["weixin_login"])
+
     def current_session_code(self) -> str:
         state = self.load_state()
         return str(state.get("session_code") or "")
@@ -190,6 +268,8 @@ class FileSetupPortalStore:
         state["session_code"] = session_code
         feishu = state.get("feishu")
         state["feishu"] = dict(feishu) if isinstance(feishu, dict) else {}
+        weixin_login = state.get("weixin_login")
+        state["weixin_login"] = dict(weixin_login) if isinstance(weixin_login, dict) else {}
         state.setdefault("updated_at", "")
         return state
 
@@ -285,6 +365,247 @@ class SetupPortalService:
                 return payload
         return {}
 
+    def unbind_weixin_account(self) -> dict[str, Any]:
+        record = self._discover_weixin_account_state()
+        adapter = self.gateway.get_adapter("weixin")
+        account_id = str(record.get("account_id") or getattr(adapter, "account_id", "") or "").strip()
+        deleted = clear_weixin_account_state(self.weixin_state_dir, account_id)
+
+        if isinstance(adapter, WeixinAdapter):
+            adapter.disconnect()
+            adapter.account_id = ""
+            adapter.token = ""
+            adapter.user_id = ""
+            adapter._context_tokens = None  # type: ignore[attr-defined]
+            adapter._processed_messages = None  # type: ignore[attr-defined]
+            adapter._transport_state = {  # type: ignore[attr-defined]
+                "mode": "polling",
+                "status": "waiting_for_credentials",
+                "connected": False,
+                "last_error": "",
+                "last_poll_outcome": "unbound",
+                "last_poll_at": "",
+                "last_getupdates_at": "",
+                "last_getupdates_buf": "",
+                "last_getupdates_count": 0,
+                "last_private_text_message_count": 0,
+                "last_private_text_message_at": "",
+                "last_getupdates_message_ids": [],
+                "last_getupdates_private_message_ids": [],
+                "last_getupdates_error": "",
+                "last_context_token_at": "",
+                "last_send_at": "",
+                "last_send_chunk_count": 0,
+                "last_send_status": "",
+                "last_send_error": "",
+                "last_send_retryable": False,
+                "last_send_provider_message_id": "",
+                "last_send_context_token_used": False,
+                "last_send_attachment_count": 0,
+                "last_send_content_kind": "",
+                "last_inbound_at": "",
+                "last_inbound_message_id": "",
+                "last_inbound_chat_id": "",
+            }
+
+        next_status = self._build_weixin_status_payload()
+        return {
+            "ok": True,
+            "platform": "weixin",
+            "account_id_configured": bool(account_id),
+            "account_id_masked": _mask_secret(account_id) if account_id else "",
+            "deleted_state_files": deleted,
+            "configured": bool(next_status.get("configured")),
+            "status": str(next_status.get("status") or ""),
+        }
+
+    def _project_weixin_login_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        status = str(payload.get("status") or "").strip()
+        qrcode_url = str(payload.get("qrcode_img_content") or payload.get("qrcode_url") or "").strip()
+        qrcode_value = str(payload.get("qrcode") or "").strip()
+        expires_at_epoch = payload.get("expires_at_epoch")
+        try:
+            expires_in_seconds = max(0, int(float(expires_at_epoch) - time.time()))
+        except (TypeError, ValueError):
+            expires_in_seconds = 0
+        return {
+            "status": status or "not_started",
+            "started_at": str(payload.get("started_at") or ""),
+            "last_checked_at": str(payload.get("last_checked_at") or ""),
+            "expires_in_seconds": expires_in_seconds,
+            "qrcode_url": qrcode_url,
+            "qrcode_available": bool(qrcode_value),
+            "qr_svg_url": "/setup/weixin/qr.svg" if qrcode_value else "",
+            "account_id_masked": _mask_secret(str(payload.get("account_id") or "")),
+            "user_id_masked": _mask_secret(str(payload.get("user_id") or "")),
+            "last_error": _redact_known_secrets(str(payload.get("last_error") or "")),
+        }
+
+    def build_weixin_login_qr_svg(self) -> str:
+        login = self.store.load_weixin_login_state()
+        qrcode_target = str(login.get("qrcode_img_content") or login.get("qrcode") or "").strip()
+        if not qrcode_target:
+            return _qr_to_svg("HarborGate Weixin login has not started")
+        return _qr_to_svg(qrcode_target)
+
+    def start_weixin_login(self, *, bot_type: str = "3") -> tuple[int, dict[str, Any]]:
+        normalized_bot_type = str(bot_type or "3").strip() or "3"
+        try:
+            challenge = request_weixin_qr_challenge(bot_type=normalized_bot_type)
+        except Exception as exc:  # noqa: BLE001 - setup API should return a usable blocker
+            state = self.store.save_weixin_login_state(
+                {
+                    "status": "error",
+                    "bot_type": normalized_bot_type,
+                    "started_at": _now_utc(),
+                    "last_checked_at": _now_utc(),
+                    "last_error": str(exc),
+                }
+            )
+            return 502, {
+                "ok": False,
+                "message": "failed to request Weixin login QR",
+                "weixin_login": self._project_weixin_login_state(state),
+            }
+
+        state = self.store.save_weixin_login_state(
+            {
+                "status": "wait",
+                "bot_type": normalized_bot_type,
+                "qrcode": challenge.qrcode,
+                "qrcode_img_content": challenge.qrcode_img_content,
+                "current_base_url": ILINK_BASE_URL,
+                "started_at": _now_utc(),
+                "last_checked_at": "",
+                "expires_at_epoch": time.time() + 480,
+                "last_error": "",
+            }
+        )
+        return 200, {
+            "ok": True,
+            "message": "Weixin login QR created",
+            "weixin_login": self._project_weixin_login_state(state),
+        }
+
+    def poll_weixin_login(self) -> tuple[int, dict[str, Any]]:
+        login = self.store.load_weixin_login_state()
+        qrcode_value = str(login.get("qrcode") or "").strip()
+        if not qrcode_value:
+            return 404, {
+                "ok": False,
+                "message": "Weixin login has not started",
+                "weixin_login": self._project_weixin_login_state(login),
+            }
+
+        expires_at_epoch = login.get("expires_at_epoch")
+        try:
+            expired = float(expires_at_epoch) <= time.time()
+        except (TypeError, ValueError):
+            expired = False
+        if expired:
+            login.update({"status": "expired", "last_checked_at": _now_utc()})
+            saved = self.store.save_weixin_login_state(login)
+            return 200, {
+                "ok": False,
+                "message": "Weixin login QR expired",
+                "weixin_login": self._project_weixin_login_state(saved),
+            }
+
+        current_base_url = str(login.get("current_base_url") or ILINK_BASE_URL).strip() or ILINK_BASE_URL
+        try:
+            status = get_json(
+                current_base_url,
+                f"{EP_GET_QR_STATUS}?qrcode={parse.quote(qrcode_value)}",
+                token=None,
+                timeout_seconds=8,
+            )
+        except Exception as exc:  # noqa: BLE001 - expose redacted setup blocker
+            error_text = str(exc)
+            if "timed out" in error_text.lower() or "timeout" in error_text.lower():
+                login.update(
+                    {
+                        "status": str(login.get("status") or "wait").strip() or "wait",
+                        "last_checked_at": _now_utc(),
+                        "last_error": "",
+                    }
+                )
+                saved = self.store.save_weixin_login_state(login)
+                return 200, {
+                    "ok": False,
+                    "message": "waiting for Weixin QR confirmation",
+                    "weixin_login": self._project_weixin_login_state(saved),
+                }
+            login.update(
+                {
+                    "status": "error",
+                    "last_checked_at": _now_utc(),
+                    "last_error": error_text,
+                }
+            )
+            saved = self.store.save_weixin_login_state(login)
+            return 200, {
+                "ok": False,
+                "message": "failed to poll Weixin QR status",
+                "weixin_login": self._project_weixin_login_state(saved),
+            }
+
+        qr_status = str(status.get("status") or "wait").strip() or "wait"
+        login.update(
+            {
+                "status": qr_status,
+                "last_checked_at": _now_utc(),
+                "last_error": "",
+            }
+        )
+        if qr_status == "scaned_but_redirect":
+            redirect_host = str(status.get("redirect_host") or "").strip()
+            if redirect_host:
+                login["current_base_url"] = f"https://{redirect_host}"
+        elif qr_status == "expired":
+            login["expires_at_epoch"] = time.time()
+        elif qr_status == "confirmed":
+            account_id = str(status.get("ilink_bot_id") or "").strip()
+            token = str(status.get("bot_token") or "").strip()
+            base_url = str(status.get("baseurl") or ILINK_BASE_URL).strip() or ILINK_BASE_URL
+            user_id = str(status.get("ilink_user_id") or "").strip()
+            if not (account_id and token):
+                login.update(
+                    {
+                        "status": "error",
+                        "last_error": "Weixin confirmed login but the credential payload was incomplete",
+                    }
+                )
+            else:
+                save_weixin_account(
+                    self.weixin_state_dir,
+                    account_id=account_id,
+                    token=token,
+                    base_url=base_url,
+                    user_id=user_id,
+                )
+                self.gateway.register_adapter(
+                    WeixinAdapter(
+                        state_dir=self.weixin_state_dir,
+                        account_id=account_id,
+                        token=token,
+                        base_url=base_url,
+                    )
+                )
+                login.update(
+                    {
+                        "account_id": account_id,
+                        "user_id": user_id,
+                        "current_base_url": base_url,
+                    }
+                )
+
+        saved = self.store.save_weixin_login_state(login)
+        return 200, {
+            "ok": str(saved.get("status") or "") == "confirmed",
+            "message": "Weixin login status updated",
+            "weixin_login": self._project_weixin_login_state(saved),
+        }
+
     def _discover_latest_json_report(self, report_path: Path) -> dict[str, Any]:
         if not report_path.exists():
             return {}
@@ -350,6 +671,24 @@ class SetupPortalService:
             if isinstance(persisted, dict):
                 transport.update(persisted)
                 transport["mode"] = str(transport.get("mode") or "polling").strip() or "polling"
+
+        token = str(record.get("token") or getattr(adapter, "token", "") or "").strip()
+        context_tokens: list[str] = []
+        if account_id:
+            context_data = load_weixin_context_tokens(self.weixin_state_dir, account_id)
+            context_tokens = [
+                str(value).strip()
+                for value in context_data.values()
+                if str(value or "").strip()
+            ]
+        for key in ("last_error", "last_getupdates_error", "last_send_error"):
+            transport[key] = _redact_known_secrets(
+                str(transport.get(key) or ""),
+                account_id,
+                token,
+                *context_tokens,
+            )
+        transport = _redact_status_payload(transport, account_id, token, *context_tokens)
 
         configured = bool(adapter.configured or record)
         if configured and not bool(transport.get("connected")):
@@ -429,14 +768,21 @@ class SetupPortalService:
                 adapter = WeixinAdapter(state_dir=self.weixin_state_dir)
 
         context_token_count = 0
+        context_tokens: list[str] = []
         if record:
             account_id = str(record.get("account_id") or "").strip()
             context_data = load_weixin_context_tokens(self.weixin_state_dir, account_id)
-            context_token_count = sum(1 for value in context_data.values() if str(value or "").strip())
+            context_tokens = [
+                str(value).strip()
+                for value in context_data.values()
+                if str(value or "").strip()
+            ]
+            context_token_count = len(context_tokens)
 
         transport = self._effective_weixin_transport(adapter=adapter, record=record)
         configured = bool(adapter.configured or record)
         account_id = str(record.get("account_id") or getattr(adapter, "account_id", "") or "").strip()
+        token = str(record.get("token") or getattr(adapter, "token", "") or "").strip()
         base_url = str(record.get("base_url") or getattr(adapter, "base_url", "") or "").strip()
         user_id = str(record.get("user_id") or getattr(adapter, "user_id", "") or "").strip()
         last_send_status = str(transport.get("last_send_status") or "").strip().lower()
@@ -458,11 +804,12 @@ class SetupPortalService:
                     "status": str(transport.get("status") or "").strip(),
                     "connected": bool(transport.get("connected")),
                     "last_poll_outcome": str(transport.get("last_poll_outcome") or "").strip(),
-                "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
-                "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
-                "last_private_text_message_at": str(transport.get("last_private_text_message_at") or "").strip(),
-            },
-        }
+                    "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
+                    "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
+                    "last_private_text_message_at": str(transport.get("last_private_text_message_at") or "").strip(),
+                },
+            }
+        ingress_proof = _redact_status_payload(ingress_proof, account_id, token, *context_tokens)
         poll_status = str(transport.get("status") or "").strip().lower()
         poll_outcome = str(transport.get("last_poll_outcome") or "").strip().lower()
         poll_error = str(transport.get("last_getupdates_error") or transport.get("last_error") or "").strip()
@@ -497,7 +844,9 @@ class SetupPortalService:
             "connected": bool(transport.get("connected")),
             "last_poll_at": str(transport.get("last_poll_at") or "").strip(),
             "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
-            "last_getupdates_buf": str(transport.get("last_getupdates_buf") or "").strip(),
+            "last_getupdates_buf": (
+                "[REDACTED]" if str(transport.get("last_getupdates_buf") or "").strip() else ""
+            ),
             "last_getupdates_count": int(transport.get("last_getupdates_count") or 0),
             "last_private_text_message_count": int(transport.get("last_private_text_message_count") or 0),
             "last_private_text_message_at": str(transport.get("last_private_text_message_at") or "").strip(),
@@ -538,7 +887,9 @@ class SetupPortalService:
                 "outcome": str(transport.get("last_poll_outcome") or "").strip(),
                 "last_poll_at": str(transport.get("last_poll_at") or "").strip(),
                 "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
-                "last_getupdates_buf": str(transport.get("last_getupdates_buf") or "").strip(),
+                "last_getupdates_buf": (
+                    "[REDACTED]" if str(transport.get("last_getupdates_buf") or "").strip() else ""
+                ),
                 "last_getupdates_count": int(transport.get("last_getupdates_count") or 0),
                 "last_private_text_message_count": int(transport.get("last_private_text_message_count") or 0),
                 "last_private_text_message_at": str(transport.get("last_private_text_message_at") or "").strip(),
@@ -566,6 +917,84 @@ class SetupPortalService:
         adapter = FeishuAdapter()
         self.gateway.register_adapter(adapter)
         return adapter
+
+    @staticmethod
+    def _redacted_feishu_transport(adapter: FeishuAdapter) -> dict[str, Any]:
+        transport = adapter.transport_status()
+        transport = dict(transport) if isinstance(transport, dict) else {}
+        return _redact_status_payload(
+            transport,
+            adapter.settings.app_id,
+            adapter.settings.app_secret,
+            adapter.settings.verification_token,
+            adapter.settings.encrypt_key,
+        )
+
+    @staticmethod
+    def _redacted_readiness(
+        *,
+        configured: bool,
+        connected: bool,
+        status: str,
+        blocked_reason: str = "",
+    ) -> dict[str, Any]:
+        normalized_status = str(status or "").strip()
+        normalized_blocked_reason = str(blocked_reason or "").strip()
+        if configured and connected and not normalized_blocked_reason:
+            state = "ready"
+            reason = ""
+        elif not configured:
+            state = "not_configured"
+            reason = normalized_blocked_reason or "credentials_missing"
+        elif normalized_blocked_reason:
+            state = "blocked"
+            reason = normalized_blocked_reason
+        elif normalized_status.lower() in {"error", "timeout", "send_failed"}:
+            state = "blocked"
+            reason = normalized_status
+        else:
+            state = "degraded"
+            reason = normalized_status or "not_connected"
+        return {
+            "ready": state == "ready",
+            "state": state,
+            "reason": reason,
+            "configured": bool(configured),
+            "connected": bool(connected),
+            "status": normalized_status,
+        }
+
+    @staticmethod
+    def _weixin_qr_status(weixin: dict[str, Any]) -> str:
+        blocker = str(
+            weixin.get("ingress_blocker_category")
+            or weixin.get("blocker_category")
+            or ""
+        ).strip()
+        if not bool(weixin.get("configured")) or blocker == "account_restore":
+            return "login_required"
+        if blocker in {"qr_recovery", "weixin_provider_auth_failed"}:
+            return "recovery_required"
+        return "configured"
+
+    def _platform_setup_urls(self, *, origin: str, session_code: str) -> dict[str, dict[str, str]]:
+        feishu_setup_url = self.build_feishu_setup_url(origin=origin, session_code=session_code)
+        return {
+            "feishu": {
+                "manage_url": f"{origin}/admin/im/feishu",
+                "setup_url": feishu_setup_url,
+                "static_setup_url": f"{origin}/setup/feishu",
+                "qr_page_url": f"{origin}/setup/feishu/qr",
+                "qr_svg_url": f"{origin}/setup/feishu/qr.svg",
+            },
+            "weixin": {
+                "manage_url": f"{origin}/admin/im/weixin",
+                "setup_url": f"{origin}/setup/weixin",
+                "static_setup_url": f"{origin}/setup/weixin",
+                "qr_page_url": "",
+                "qr_svg_url": "",
+            },
+        }
 
     def build_status_payload(self, *, request_host: str = "") -> dict[str, Any]:
         state = self.store.load_state()
@@ -601,20 +1030,48 @@ class SetupPortalService:
 
         origin = self.resolve_public_origin(request_host=request_host)
         session_code = str(state.get("session_code") or "")
+        platform_urls = self._platform_setup_urls(origin=origin, session_code=session_code)
+        feishu_urls = platform_urls["feishu"]
+        weixin_urls = platform_urls["weixin"]
         setup_url = self.build_setup_url(origin=origin, session_code=session_code)
+        static_setup_url = f"{origin}/setup"
+        manage_url = f"{origin}/admin/im"
+        qr_page_url = f"{origin}/setup/qr"
+        qr_svg_url = f"{origin}/setup/qr.svg"
         webhook_url = ""
         if adapter.settings.connection_mode == "webhook":
             webhook_url = parse.urljoin(f"{origin}/", adapter.webhook_path.lstrip("/"))
-        transport = adapter.transport_status()
+        transport = self._redacted_feishu_transport(adapter)
 
         current_app_id = str(feishu_state.get("app_id") or adapter.settings.app_id or "").strip()
         current_app_name = str(feishu_state.get("app_name") or adapter.settings.bot_name or "").strip()
         configured = bool(current_app_id and (feishu_state.get("app_secret") or adapter.settings.app_secret))
         connected = bool(transport.get("connected"))
         transport_status = str(transport.get("status") or ("waiting_for_credentials" if not configured else "ready")).strip()
+        feishu_readiness = self._redacted_readiness(
+            configured=configured,
+            connected=connected,
+            status=transport_status,
+            blocked_reason="" if configured else "credentials_missing",
+        )
+        weixin_readiness = self._redacted_readiness(
+            configured=bool(weixin.get("configured")),
+            connected=bool(weixin.get("connected")),
+            status=str(weixin.get("status") or ""),
+            blocked_reason=str(
+                weixin.get("ingress_blocker_category")
+                or weixin.get("blocker_category")
+                or ""
+            ),
+        )
+        weixin_login = self._project_weixin_login_state(self.store.load_weixin_login_state())
         return {
             "session_code": session_code,
             "setup_url": setup_url,
+            "static_setup_url": static_setup_url,
+            "manage_url": manage_url,
+            "qr_page_url": qr_page_url,
+            "qr_svg_url": qr_svg_url,
             "qr_page_path": "/setup/qr",
             "qr_svg_path": "/setup/qr.svg",
             "webhook_url": webhook_url,
@@ -641,8 +1098,22 @@ class SetupPortalService:
                 "verification_token_configured": bool(
                     str(feishu_state.get("verification_token") or adapter.settings.verification_token or "").strip()
                 ),
+                "api_key_configured": configured,
+                **feishu_urls,
+                "readiness": feishu_readiness,
             },
-            "weixin": weixin,
+            "weixin": {
+                **weixin,
+                "qr_status": self._weixin_qr_status(weixin),
+                "login": weixin_login,
+                "manage_status": "available",
+                **weixin_urls,
+                "readiness": weixin_readiness,
+            },
+            "connectors": {
+                "feishu": dict(feishu_urls),
+                "weixin": dict(weixin_urls),
+            },
             "gateway_status": gateway_status,
             "channels": gateway_status.get("channels", []),
             "delivery_policy": self._release_v2_delivery_policy(),
@@ -652,6 +1123,13 @@ class SetupPortalService:
 
     def build_gateway_status_payload(self, *, request_host: str = "") -> dict[str, Any]:
         origin = self.resolve_public_origin(request_host=request_host)
+        state = self.store.load_state()
+        session_code = str(state.get("session_code") or "")
+        platform_urls = self._platform_setup_urls(origin=origin, session_code=session_code)
+        feishu_state = state.get("feishu") or {}
+        if not isinstance(feishu_state, dict):
+            feishu_state = {}
+        feishu_adapter = self.ensure_feishu_adapter()
         self._bootstrap_weixin_adapter()
         weixin = self._build_weixin_status_payload(request_host=request_host)
         channels: list[dict[str, Any]] = []
@@ -659,9 +1137,12 @@ class SetupPortalService:
         for adapter_name, adapter in self.gateway._adapters.items():
             if isinstance(adapter, WeixinAdapter):
                 transport = self._effective_weixin_transport(adapter=adapter, record=weixin_record)
+            elif isinstance(adapter, FeishuAdapter):
+                transport = self._redacted_feishu_transport(adapter)
             else:
                 transport = adapter.transport_status() if hasattr(adapter, "transport_status") else {}
                 transport = transport if isinstance(transport, dict) else {}
+                transport = _redact_status_payload(transport)
             profile = adapter.get_profile() if hasattr(adapter, "get_profile") else {}
             profile = profile if isinstance(profile, dict) else {}
             adapter_settings = getattr(adapter, "settings", None)
@@ -704,6 +1185,7 @@ class SetupPortalService:
                     "update": False,
                     "attachments": False,
                 }
+                channel.update(platform_urls["feishu"])
             elif adapter_name == "webhook":
                 channel["display_name"] = "Webhook"
             else:
@@ -711,11 +1193,39 @@ class SetupPortalService:
                     str(profile.get("display_name") or "")
                     or str(getattr(adapter, "name", adapter_name) or adapter_name).strip().title()
                 )
+                platform_key = str(channel.get("platform") or adapter_name).strip().lower()
+                if platform_key in platform_urls:
+                    channel.update(platform_urls[platform_key])
             channels.append(channel)
 
         delivery_observability = self.gateway.store.summarize_delivery_records()
         delivery_health = self.gateway.store.summarize_delivery_health()
         live_gate_report = self._discover_latest_platform_live_gate_report()
+        current_app_id = str(feishu_state.get("app_id") or feishu_adapter.settings.app_id or "").strip()
+        current_app_secret_present = bool(feishu_state.get("app_secret") or feishu_adapter.settings.app_secret)
+        feishu_configured = bool(current_app_id and current_app_secret_present)
+        feishu_transport = self._redacted_feishu_transport(feishu_adapter)
+        feishu_connected = bool(feishu_transport.get("connected"))
+        feishu_status = str(
+            feishu_transport.get("status")
+            or ("waiting_for_credentials" if not feishu_configured else "ready")
+        ).strip()
+        feishu_readiness = self._redacted_readiness(
+            configured=feishu_configured,
+            connected=feishu_connected,
+            status=feishu_status,
+            blocked_reason="" if feishu_configured else "credentials_missing",
+        )
+        weixin_readiness = self._redacted_readiness(
+            configured=bool(weixin.get("configured")),
+            connected=bool(weixin.get("connected")),
+            status=str(weixin.get("status") or ""),
+            blocked_reason=str(
+                weixin.get("ingress_blocker_category")
+                or weixin.get("blocker_category")
+                or ""
+            ),
+        )
         release_v2 = self._summarize_release_v2_status(
             feishu_ready=any(
                 bool(channel.get("connected")) and str(channel.get("platform") or "").lower() == "feishu"
@@ -731,7 +1241,7 @@ class SetupPortalService:
             weixin_blocker_category=str(live_gate_report.get("weixin_blocker_category") or "").strip(),
             delivery_health=delivery_health,
             latest_live_gate_report=live_gate_report,
-            ingress_proof=self._discover_latest_weixin_ingress_probe(),
+            ingress_proof=weixin.get("ingress_proof") if isinstance(weixin.get("ingress_proof"), dict) else {},
         )
 
         return {
@@ -739,13 +1249,45 @@ class SetupPortalService:
             "gateway_version": __version__,
             "gateway_base_url": origin,
             "manage_url": f"{origin}/admin/im",
+            "setup_url": self.build_setup_url(
+                origin=origin,
+                session_code=session_code,
+            ),
+            "static_setup_url": f"{origin}/setup",
+            "qr_page_url": f"{origin}/setup/qr",
+            "qr_svg_url": f"{origin}/setup/qr.svg",
             "channels": channels,
+            "connectors": {
+                "feishu": dict(platform_urls["feishu"]),
+                "weixin": dict(platform_urls["weixin"]),
+            },
+            "feishu": {
+                "configured": feishu_configured,
+                "api_key_configured": feishu_configured,
+                "connected": feishu_connected,
+                "status": feishu_status,
+                "credential_status": str(
+                    feishu_state.get("status")
+                    or ("validated" if feishu_configured else "not_configured")
+                ).strip(),
+                "connection_mode": feishu_adapter.settings.connection_mode,
+                "enable_live_send": bool(feishu_adapter.settings.enable_live_send),
+                "display_name": str(feishu_adapter.settings.bot_name or "Feishu").strip(),
+                "app_id_masked": _mask_secret(current_app_id) if current_app_id else "",
+                **platform_urls["feishu"],
+                "readiness": feishu_readiness,
+            },
             "weixin": {
                 "configured": bool(weixin.get("configured")),
                 "connected": bool(weixin.get("connected")),
                 "status": str(weixin.get("status") or "").strip(),
                 "blocker_category": str(weixin.get("blocker_category") or "").strip(),
                 "ingress_blocker_category": str(weixin.get("ingress_blocker_category") or "").strip(),
+                "qr_status": self._weixin_qr_status(weixin),
+                "login": self._project_weixin_login_state(self.store.load_weixin_login_state()),
+                "manage_status": "available",
+                **platform_urls["weixin"],
+                "readiness": weixin_readiness,
                 "poll": dict(weixin.get("poll") or {}) if isinstance(weixin.get("poll"), dict) else {},
                 "delivery_observability": (
                     dict(weixin.get("delivery_observability") or {})
@@ -765,8 +1307,8 @@ class SetupPortalService:
         weixin = status["weixin"]
         gateway_status = status["gateway_status"] if isinstance(status.get("gateway_status"), dict) else {}
         gateway_channels = gateway_status.get("channels") if isinstance(gateway_status, dict) else []
-        setup_url = _html_escape(str(status["setup_url"]))
-        qr_path = _html_escape("/setup/qr.svg")
+        setup_url = _html_escape(str(feishu.get("setup_url") or status["setup_url"]))
+        qr_path = _html_escape("/setup/feishu/qr.svg")
         session_code = _html_escape(str(status["session_code"]))
         app_name = _html_escape(str(feishu["app_name"]))
         app_id_masked = _html_escape(str(feishu["app_id_masked"]))
@@ -929,9 +1471,164 @@ class SetupPortalService:
 </body>
 </html>"""
 
+    def build_weixin_setup_page(self, *, request_host: str = "", unbound: bool = False) -> str:
+        status = self.build_status_payload(request_host=request_host)
+        weixin = status["weixin"]
+        qr_status = _html_escape(str(weixin.get("qr_status") or "unknown"))
+        state_text = _html_escape(str(weixin.get("status") or "unknown"))
+        account_id = _html_escape(str(weixin.get("account_id_masked") or "未配置"))
+        user_id = _html_escape(str(weixin.get("user_id_masked") or "未配置"))
+        blocker = _html_escape(str(weixin.get("ingress_blocker_category") or weixin.get("blocker_category") or "ready"))
+        last_poll = _html_escape(str((weixin.get("poll") or {}).get("last_getupdates_at") or "暂无"))
+        private_count = _html_escape(str((weixin.get("poll") or {}).get("last_private_text_message_count") or 0))
+        context_count = _html_escape(str(weixin.get("context_token_count") or 0))
+        last_error = _html_escape(str(weixin.get("last_error") or (weixin.get("poll") or {}).get("error") or ""))
+        error_row = f"<div><strong>最近错误：</strong><code>{last_error}</code></div>" if last_error else ""
+        login_state_json = json.dumps(
+            self._project_weixin_login_state(self.store.load_weixin_login_state()),
+            ensure_ascii=False,
+        )
+        unbind_disabled = "" if bool(weixin.get("configured")) else " disabled"
+        unbound_notice = (
+            '<div class="notice ok"><strong>已解绑。</strong>本机保存的 Weixin 账号和轮询状态已清除，'
+            "请在本页重新生成二维码并完成扫码登录。</div>"
+            if unbound
+            else ""
+        )
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HarborGate Weixin 配置</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
+    .wrap {{ max-width: 620px; margin: 0 auto; padding: 24px 18px 48px; }}
+    .card {{ background: rgba(255,255,255,0.92); border-radius: 20px; padding: 20px; box-shadow: 0 18px 48px rgba(51,36,18,0.12); }}
+    h1 {{ margin: 0 0 8px; font-size: 28px; }}
+    p {{ line-height: 1.55; }}
+    .meta {{ color: #6b5a49; font-size: 14px; margin-bottom: 18px; }}
+    .status {{ margin: 16px 0; padding: 12px 14px; border-radius: 14px; background: #f6f2ec; }}
+    .hint {{ font-size: 13px; color: #766757; }}
+    .ok {{ color: #1f7a6f; }}
+    .err {{ color: #b94739; }}
+    .notice {{ margin: 14px 0; padding: 12px 14px; border-radius: 14px; background: #edf7f3; }}
+    .login-panel {{ margin-top: 18px; padding: 14px; border-radius: 16px; background: #fbf8f2; border: 1px solid #e8ded1; }}
+    .login-qr {{ width: 260px; height: 260px; display: none; margin: 14px 0 6px; background: #f8f3ec; border-radius: 14px; }}
+    code {{ word-break: break-all; }}
+    form {{ margin: 18px 0 0; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }}
+    button {{ border: 0; border-radius: 999px; padding: 10px 16px; font-weight: 700; cursor: pointer; }}
+    button.primary {{ background: #1f7a6f; color: #fff; }}
+    button.danger {{ background: #b3261e; color: #fff; }}
+    button:disabled {{ background: #d7d2ca; color: #817a72; cursor: not-allowed; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="meta">HarborGate · Weixin 管理页</div>
+      <h1>微信配置与登录状态</h1>
+      <p>微信凭据和扫码登录由 HarborGate 的 Weixin adapter 管理。这个页面只展示脱敏状态，不接收或保存微信 token。</p>
+      {unbound_notice}
+      <div class="status">
+        <div><strong>连接状态：</strong>{state_text}</div>
+        <div><strong>扫码状态：</strong>{qr_status}</div>
+        <div><strong>账号：</strong>{account_id}</div>
+        <div><strong>用户：</strong>{user_id}</div>
+        <div><strong>阻塞项：</strong>{blocker}</div>
+        <div><strong>最近 getupdates：</strong>{last_poll}</div>
+        <div><strong>私聊消息：</strong>{private_count}</div>
+        <div><strong>context_token：</strong>{context_count}</div>
+        {error_row}
+      </div>
+      <div class="login-panel">
+        <button id="weixin-login-start" class="primary" type="button">生成微信扫码登录二维码</button>
+        <div id="weixin-login-status" class="hint" style="margin-top: 10px;">如果状态是 login_required，请点击按钮生成二维码。</div>
+        <img id="weixin-login-qr" class="login-qr" src="" alt="Weixin login QR" />
+        <div id="weixin-login-link" class="hint"></div>
+      </div>
+      <form method="post" action="/api/setup/weixin/unbind" onsubmit="return confirm('确认解绑当前本机 Weixin 状态？这会清除 HarborGate 本地保存的账号、context_token、polling 进度和运行状态。');">
+        <button class="danger" type="submit"{unbind_disabled}>解绑当前微信状态</button>
+        <span class="hint">解绑清除 HarborGate 本地 Weixin 状态；如果 systemd 环境变量仍固定账号，需要同步更新服务配置并重启 runner。</span>
+      </form>
+      <p class="hint">扫码成功后，HarborGate 会把账号凭据保存到本机 Weixin state dir；收消息进程使用 <code>harborgate-weixin-runner</code> 长轮询。HarborDesk 会从 <code>/api/gateway/status</code> 读取这里的脱敏状态。</p>
+    </div>
+  </div>
+  <script>
+    const initialLogin = {login_state_json};
+    const startButton = document.getElementById('weixin-login-start');
+    const statusEl = document.getElementById('weixin-login-status');
+    const qrEl = document.getElementById('weixin-login-qr');
+    const linkEl = document.getElementById('weixin-login-link');
+    let pollTimer = null;
+
+    function renderLogin(data) {{
+      const login = data.weixin_login || data || {{}};
+      const status = login.status || 'not_started';
+      const expires = Number(login.expires_in_seconds || 0);
+      const suffix = expires > 0 && ['wait', 'scaned', 'scaned_but_redirect'].includes(status)
+        ? `，剩余约 ${{expires}} 秒`
+        : '';
+      statusEl.className = status === 'error' || status === 'expired' ? 'hint err' : 'hint';
+      statusEl.textContent = `扫码状态：${{status}}${{suffix}}${{login.last_error ? ' / ' + login.last_error : ''}}`;
+      if (login.qrcode_available) {{
+        qrEl.style.display = 'block';
+        qrEl.src = `/setup/weixin/qr.svg?ts=${{Date.now()}}`;
+        linkEl.textContent = login.qrcode_url || '';
+      }} else {{
+        qrEl.style.display = 'none';
+        qrEl.removeAttribute('src');
+        linkEl.textContent = '';
+      }}
+      if (status === 'confirmed') {{
+        statusEl.className = 'hint ok';
+        statusEl.textContent = `扫码登录完成：${{login.account_id_masked || 'Weixin'}}。页面即将刷新。`;
+        window.setTimeout(() => window.location.reload(), 1200);
+      }}
+    }}
+
+    async function pollLogin() {{
+      window.clearTimeout(pollTimer);
+      const response = await fetch('/api/setup/weixin/login/status');
+      const data = await response.json();
+      renderLogin(data);
+      const status = (data.weixin_login || {{}}).status || '';
+      if (['wait', 'scaned', 'scaned_but_redirect', 'error'].includes(status)) {{
+        pollTimer = window.setTimeout(pollLogin, 2000);
+      }}
+    }}
+
+    startButton.addEventListener('click', async () => {{
+      startButton.disabled = true;
+      statusEl.className = 'hint';
+      statusEl.textContent = '正在向 Weixin 申请扫码二维码...';
+      try {{
+        const response = await fetch('/api/setup/weixin/login/start', {{ method: 'POST' }});
+        const data = await response.json();
+        renderLogin(data);
+        if (!response.ok || !data.ok) {{
+          throw new Error(data.message || '生成二维码失败');
+        }}
+        pollTimer = window.setTimeout(pollLogin, 1500);
+      }} catch (error) {{
+        statusEl.className = 'hint err';
+        statusEl.textContent = error.message;
+      }} finally {{
+        startButton.disabled = false;
+      }}
+    }});
+
+    if (initialLogin && initialLogin.qrcode_available && ['wait', 'scaned', 'scaned_but_redirect'].includes(initialLogin.status)) {{
+      renderLogin(initialLogin);
+      pollTimer = window.setTimeout(pollLogin, 1500);
+    }}
+  </script>
+</body>
+</html>"""
+
     def build_qr_page(self, *, request_host: str = "") -> str:
         status = self.build_status_payload(request_host=request_host)
-        setup_url = _html_escape(str(status["setup_url"]))
+        setup_url = _html_escape(str(status["feishu"].get("setup_url") or status["setup_url"]))
         return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -951,7 +1648,7 @@ class SetupPortalService:
     <div class="card">
       <h1>手机扫码配置 Feishu</h1>
       <p>扫下面这个二维码，打开本机 HarborGate 的 Feishu 配置页。</p>
-      <img src="/setup/qr.svg" alt="setup qr" />
+      <img src="/setup/feishu/qr.svg" alt="setup qr" />
       <p><code>{setup_url}</code></p>
     </div>
   </div>
@@ -960,7 +1657,7 @@ class SetupPortalService:
 
     def build_qr_svg(self, *, request_host: str = "") -> str:
         status = self.build_status_payload(request_host=request_host)
-        return _qr_to_svg(str(status["setup_url"]))
+        return _qr_to_svg(str(status["feishu"].get("setup_url") or status["setup_url"]))
 
     def configure_feishu(self, body: dict[str, Any], *, request_host: str = "") -> tuple[int, dict[str, Any]]:
         expected_session = self.store.current_session_code()
@@ -1060,6 +1757,9 @@ class SetupPortalService:
 
     def build_setup_url(self, *, origin: str, session_code: str) -> str:
         return f"{origin}/setup?session={parse.quote(session_code)}"
+
+    def build_feishu_setup_url(self, *, origin: str, session_code: str) -> str:
+        return f"{origin}/setup/feishu?session={parse.quote(session_code)}"
 
     @staticmethod
     def _discover_local_ip() -> str:
