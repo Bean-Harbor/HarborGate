@@ -8,6 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
+from urllib import parse
 
 from im_agent.errors import GatewayContractError
 from im_agent.gateway import GatewayService, build_default_gateway
@@ -26,11 +27,15 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
     setup_portal: SetupPortalService
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/health":
+        parsed_url = parse.urlsplit(self.path)
+        path = parsed_url.path
+        query = parse.parse_qs(parsed_url.query)
+
+        if path == "/health":
             self._send_json(HTTPStatus.OK, {"status": "ok"})
             return
 
-        if self.path == "/":
+        if path == "/":
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -39,7 +44,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                         "POST JSON to /messages/webhook to exercise the clean-room gateway. "
                         "Set HARBORBEACON_TASK_API_URL to route turns into HarborBeacon, or use "
                         "harborgate-weixin-login and harborgate-weixin-runner for personal WeChat. "
-                        "Open /setup/qr to scan the Feishu setup page from mobile. "
+                        "Open /setup to see Feishu setup, Weixin ingress status, and the redacted gateway snapshot. "
                         "Feishu defaults to long-connection receive mode, so no public webhook is required."
                     ),
                     "setup": self.setup_portal.build_status_payload(request_host=self.headers.get("Host", "")),
@@ -47,52 +52,127 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if self.path.startswith("/setup/qr.svg"):
+        if path in {"/setup/qr.svg", "/setup/feishu/qr.svg"}:
             self._send_svg(
                 HTTPStatus.OK,
                 self.setup_portal.build_qr_svg(request_host=self.headers.get("Host", "")),
             )
             return
 
-        if self.path.startswith("/setup/qr"):
+        if path in {"/setup/qr", "/setup/feishu/qr"}:
             self._send_html(
                 HTTPStatus.OK,
                 self.setup_portal.build_qr_page(request_host=self.headers.get("Host", "")),
             )
             return
 
-        if self.path.startswith("/setup"):
+        if path == "/setup/weixin/qr.svg":
+            self._send_svg(
+                HTTPStatus.OK,
+                self.setup_portal.build_weixin_login_qr_svg(),
+            )
+            return
+
+        if path in {"/setup/weixin", "/setup/weixin/qr"}:
+            self._send_html(
+                HTTPStatus.OK,
+                self.setup_portal.build_weixin_setup_page(
+                    request_host=self.headers.get("Host", ""),
+                    unbound=_query_flag(query, "unbound"),
+                ),
+            )
+            return
+
+        if path in {"/setup", "/setup/feishu"}:
             self._send_html(
                 HTTPStatus.OK,
                 self.setup_portal.build_setup_page(request_host=self.headers.get("Host", "")),
             )
             return
 
-        if self.path == "/api/setup/status":
+        if path in {"/admin/im/weixin", "/admin/im/feishu"}:
+            if path.endswith("/weixin"):
+                if _query_flag(query, "unbound"):
+                    self._redirect("/setup/weixin?unbound=1")
+                    return
+                self._send_html(
+                    HTTPStatus.OK,
+                    self.setup_portal.build_weixin_setup_page(request_host=self.headers.get("Host", "")),
+                )
+            else:
+                self._send_html(
+                    HTTPStatus.OK,
+                    self.setup_portal.build_setup_page(request_host=self.headers.get("Host", "")),
+                )
+            return
+
+        if path == "/admin/im":
+            platform = str((query.get("platform") or ["feishu"])[0] or "feishu").strip().lower()
+            if platform == "weixin":
+                if _query_flag(query, "unbound"):
+                    self._redirect("/setup/weixin?unbound=1")
+                    return
+                self._send_html(
+                    HTTPStatus.OK,
+                    self.setup_portal.build_weixin_setup_page(request_host=self.headers.get("Host", "")),
+                )
+                return
+            self._send_html(
+                HTTPStatus.OK,
+                self.setup_portal.build_setup_page(request_host=self.headers.get("Host", "")),
+            )
+            return
+
+        if path == "/api/setup/status":
             self._send_json(
                 HTTPStatus.OK,
                 self.setup_portal.build_status_payload(request_host=self.headers.get("Host", "")),
             )
             return
 
-        if self.path == "/api/gateway/status":
+        if path == "/api/setup/weixin/login/status":
+            status_code, payload = self.setup_portal.poll_weixin_login()
+            self._send_json(HTTPStatus(status_code), payload)
+            return
+
+        if path == "/api/gateway/status":
             try:
                 self._require_service_contract()
                 self._require_service_auth()
             except GatewayContractError as exc:
                 self._send_json(HTTPStatus(exc.status_code), exc.to_response())
                 return
-            self._send_json(HTTPStatus.OK, self.setup_portal.build_gateway_status_payload())
+            self._send_json(
+                HTTPStatus.OK,
+                self.setup_portal.build_gateway_status_payload(
+                    request_host=self.headers.get("Host", "")
+                ),
+            )
             return
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        path = parse.urlsplit(self.path).path
+        if path == "/api/setup/weixin/login/start":
+            status_code, payload = self.setup_portal.start_weixin_login()
+            self._send_json(HTTPStatus(status_code), payload)
+            return
+
+        if path == "/api/setup/weixin/unbind":
+            payload = self.setup_portal.unbind_weixin_account()
+            accept = self.headers.get("Accept", "")
+            if "text/html" in accept:
+                self._redirect("/setup/weixin?unbound=1")
+            else:
+                self._send_json(HTTPStatus.OK, payload)
+            return
+
         feishu_adapter = self.gateway.get_adapter("feishu")
         if (
             isinstance(feishu_adapter, FeishuAdapter)
             and feishu_adapter.settings.connection_mode == "webhook"
-            and self.path == feishu_adapter.webhook_path
+            and path == feishu_adapter.webhook_path
         ):
             payload = self._read_json_body()
             if payload is None:
@@ -115,7 +195,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"ok": True})
             return
 
-        if self.path == "/api/notifications/deliveries":
+        if path == "/api/notifications/deliveries":
             payload = self._read_json_body()
             if payload is None:
                 return
@@ -144,7 +224,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, response)
             return
 
-        if self.path == "/api/setup/feishu/configure":
+        if path == "/api/setup/feishu/configure":
             payload = self._read_json_body()
             if payload is None:
                 return
@@ -155,7 +235,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus(status_code), response)
             return
 
-        match = re.fullmatch(r"/messages/([^/]+)", self.path)
+        match = re.fullmatch(r"/messages/([^/]+)", path)
         if not match:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
@@ -199,7 +279,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return None
 
     def _require_service_contract(self) -> None:
-        expected = os.getenv("IM_AGENT_CONTRACT_VERSION", "1.5").strip() or "1.5"
+        expected = os.getenv("IM_AGENT_CONTRACT_VERSION", "2.0").strip() or "2.0"
         received = self.headers.get("X-Contract-Version", "").strip()
         if received != expected:
             raise GatewayContractError(
@@ -244,6 +324,14 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _redirect(self, location: str) -> None:
+        encoded = b""
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
 
 def build_handler(gateway: GatewayService, setup_portal: SetupPortalService) -> Callable[..., GatewayRequestHandler]:
     class BoundGatewayRequestHandler(GatewayRequestHandler):
@@ -252,6 +340,14 @@ def build_handler(gateway: GatewayService, setup_portal: SetupPortalService) -> 
     BoundGatewayRequestHandler.gateway = gateway
     BoundGatewayRequestHandler.setup_portal = setup_portal
     return BoundGatewayRequestHandler
+
+
+def _query_flag(query: dict[str, list[str]], key: str) -> bool:
+    values = query.get(key) or []
+    if not values:
+        return False
+    value = str(values[0] or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def main() -> None:
@@ -266,6 +362,7 @@ def main() -> None:
         bind_host=host,
         bind_port=port,
         public_origin=os.getenv("IM_AGENT_PUBLIC_ORIGIN", ""),
+        runtime_root=state_root,
     )
     setup_portal.bootstrap()
     gateway.start()

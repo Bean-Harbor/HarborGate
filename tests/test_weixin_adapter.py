@@ -1,20 +1,59 @@
+import os
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
+from urllib.error import URLError
 
 from im_agent.models import OutboundMessage
+from im_agent.weixin_ingress_probe import discover_account_id
 from im_agent.platforms.weixin import (
     ContextTokenStore,
     ProcessedMessageStore,
     WeixinAdapter,
+    _upload_image_artifact_to_weixin,
     build_send_message_payload,
     extract_weixin_message_id,
     extract_text_from_item_list,
+    is_weixin_dns_resolution_error,
+    load_sync_buf,
+    load_weixin_context_tokens,
+    load_weixin_transport_state,
     save_weixin_account,
+    save_weixin_context_tokens,
     split_text_for_weixin,
 )
 
 
 class WeixinHelpersTests(unittest.TestCase):
+    def test_discover_account_id_prefers_newest_saved_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            accounts_dir = Path(tmp) / "accounts"
+            accounts_dir.mkdir(parents=True, exist_ok=True)
+            old_account = accounts_dir / "26d88700bd27_im.bot.json"
+            new_account = accounts_dir / "d5ba3cf20a24_im.bot.json"
+            runtime_sidecar = accounts_dir / "z-sidecar.runtime.json"
+            old_account.write_text('{"account_id":"old@im.bot"}', encoding="utf-8")
+            new_account.write_text('{"account_id":"new@im.bot"}', encoding="utf-8")
+            runtime_sidecar.write_text('{"status":"stale"}', encoding="utf-8")
+            old_time = 1_700_000_000
+            new_time = 1_700_000_100
+            runtime_time = 1_700_000_200
+            os.utime(old_account, (old_time, old_time))
+            os.utime(new_account, (new_time, new_time))
+            os.utime(runtime_sidecar, (runtime_time, runtime_time))
+
+            self.assertEqual(discover_account_id(Path(tmp)), "new@im.bot")
+
+    def test_is_weixin_dns_resolution_error_matches_common_provider_failures(self) -> None:
+        self.assertTrue(
+            is_weixin_dns_resolution_error("<urlopen error [Errno 11001] getaddrinfo failed>")
+        )
+        self.assertTrue(
+            is_weixin_dns_resolution_error("HTTPSConnectionPool(...): NameResolutionError(...)")
+        )
+        self.assertFalse(is_weixin_dns_resolution_error("HTTP 403 forbidden"))
+
     def test_extract_text_from_item_list(self) -> None:
         text = extract_text_from_item_list(
             [
@@ -58,8 +97,114 @@ class WeixinHelpersTests(unittest.TestCase):
             self.assertTrue(restored.contains("msg-2"))
             self.assertTrue(restored.contains("msg-3"))
 
+    def test_context_token_helpers_use_safe_account_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_context_tokens(
+                tmp,
+                "d5ba3cf20a24@im.bot",
+                {"wx-user-1": "ctx-123"},
+            )
+
+            restored = load_weixin_context_tokens(tmp, "d5ba3cf20a24@im.bot")
+
+            self.assertEqual(restored, {"wx-user-1": "ctx-123"})
+            self.assertTrue((Path(tmp) / "accounts" / "d5ba3cf20a24_im.bot.context_tokens.json").exists())
+
 
 class WeixinAdapterTests(unittest.TestCase):
+    def test_adapter_restores_saved_account_and_poll_updates_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+                user_id="self-1",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+
+            self.assertTrue(adapter.configured)
+            self.assertEqual(adapter.base_url, "https://example.com")
+            self.assertEqual(adapter.user_id, "self-1")
+
+            with patch(
+                "im_agent.platforms.weixin.post_json",
+                return_value={
+                    "get_updates_buf": "cursor-next",
+                    "msgs": [
+                        {
+                            "msg_id": "wx-msg-1",
+                            "from_user_id": "wx-user-1",
+                            "item_list": [{"type": 1, "text_item": {"text": "hello"}}],
+                        }
+                    ],
+                },
+            ) as mocked_post:
+                messages = adapter.poll_updates(timeout_ms=1000)
+
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0]["msg_id"], "wx-msg-1")
+            self.assertEqual(load_sync_buf(tmp, "bot-1"), "cursor-next")
+            transport = adapter.transport_status()
+            self.assertEqual(transport["status"], "polling_idle")
+            self.assertTrue(transport["connected"])
+            self.assertEqual(transport["last_getupdates_buf"], "cursor-next")
+            self.assertEqual(transport["last_getupdates_count"], 1)
+            self.assertEqual(transport["last_getupdates_message_ids"], ["wx-msg-1"])
+            self.assertEqual(transport["last_getupdates_error"], "")
+            self.assertTrue(transport["last_private_text_message_at"])
+            mocked_post.assert_called_once()
+
+    def test_poll_updates_treats_idle_read_timeout_as_healthy_empty_poll(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+                user_id="self-1",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+
+            with patch(
+                "im_agent.platforms.weixin.post_json",
+                side_effect=TimeoutError("The read operation timed out"),
+            ):
+                messages = adapter.poll_updates(timeout_ms=1000)
+
+            self.assertEqual(messages, [])
+            transport = adapter.transport_status()
+            self.assertEqual(transport["status"], "polling_idle")
+            self.assertTrue(transport["connected"])
+            self.assertEqual(transport["last_poll_outcome"], "idle_timeout")
+            self.assertEqual(transport["last_getupdates_error"], "")
+            self.assertEqual(transport["last_getupdates_count"], 0)
+            self.assertEqual(transport["last_private_text_message_count"], 0)
+
+    def test_poll_updates_preserves_real_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+                user_id="self-1",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+
+            with patch(
+                "im_agent.platforms.weixin.post_json",
+                side_effect=URLError("network down"),
+            ):
+                with self.assertRaises(URLError):
+                    adapter.poll_updates(timeout_ms=1000)
+
+            transport = adapter.transport_status()
+            self.assertEqual(transport["status"], "error")
+            self.assertFalse(transport["connected"])
+            self.assertEqual(transport["last_poll_outcome"], "error")
+            self.assertIn("network down", transport["last_getupdates_error"])
+
     def test_normalize_inbound_stores_context_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             save_weixin_account(
@@ -82,6 +227,11 @@ class WeixinAdapterTests(unittest.TestCase):
             self.assertEqual(message.text, "你好")
             token_store = ContextTokenStore(tmp, "bot-1")
             self.assertEqual(token_store.get("wx-user-1"), "ctx-001")
+            transport = adapter.transport_status()
+            self.assertTrue(transport["last_private_text_message_at"])
+            self.assertEqual(transport["last_inbound_chat_id"], "wx-user-1")
+            self.assertEqual(transport["last_inbound_message_id"], "")
+            self.assertTrue(transport["last_inbound_at"])
 
     def test_normalize_inbound_rejects_groups_for_now(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -115,6 +265,545 @@ class WeixinAdapterTests(unittest.TestCase):
                     OutboundMessage(platform="weixin", chat_id="wx-user-1", text="reply")
                 )
 
+    def test_send_outbound_records_successful_delivery_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+            assert adapter._context_tokens is not None
+            adapter._context_tokens.set("wx-user-1", "ctx-123")
+            with patch("im_agent.platforms.weixin.post_json", return_value={}) as mocked_post:
+                response = adapter.send_outbound(
+                    OutboundMessage(platform="weixin", chat_id="wx-user-1", text="reply")
+                )
+
+            transport = adapter.transport_status()
+            self.assertTrue(response["sent"])
+            self.assertEqual(response["provider_message_id"], response["message_id"])
+            self.assertEqual(transport["last_send_status"], "sent")
+            self.assertEqual(transport["last_send_context_token_used"], True)
+            self.assertEqual(transport["last_send_error"], "")
+            self.assertTrue(transport["last_send_provider_message_id"])
+            self.assertEqual(mocked_post.call_count, 1)
+
+    def test_upload_image_artifact_to_weixin_uses_original_only_upload_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
+            try:
+                image_path.write(b"fake-jpeg-bytes")
+                image_path.close()
+                with patch(
+                    "im_agent.platforms.weixin.post_json",
+                    return_value={
+                        "upload_param": "orig-upload-param",
+                    },
+                ) as mocked_post, patch(
+                    "im_agent.platforms.weixin._upload_binary_to_cdn",
+                    return_value="orig-download-param",
+                ) as mocked_upload:
+                    uploaded = _upload_image_artifact_to_weixin(
+                        image_path=Path(image_path.name),
+                        to_user_id="wx-user-1",
+                        base_url="https://example.com",
+                        token="secret",
+                        cdn_base_url="https://cdn.example.com/c2c",
+                    )
+
+                request_payload = mocked_post.call_args.args[2]
+                self.assertEqual(mocked_post.call_args.args[1], "ilink/bot/getuploadurl")
+                self.assertEqual(request_payload["to_user_id"], "wx-user-1")
+                self.assertNotIn("thumb_rawsize", request_payload)
+                self.assertEqual(request_payload["no_need_thumb"], True)
+                self.assertEqual(mocked_upload.call_count, 1)
+                self.assertEqual(uploaded.original_download_param, "orig-download-param")
+                self.assertEqual(uploaded.thumbnail_download_param, "")
+            finally:
+                image_path.close()
+
+    def test_upload_image_artifact_to_weixin_ignores_unexpected_thumbnail_upload_param(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
+            try:
+                image_path.write(b"fake-jpeg-bytes")
+                image_path.close()
+                with patch(
+                    "im_agent.platforms.weixin.post_json",
+                    return_value={
+                        "upload_param": "orig-upload-param",
+                        "thumb_upload_param": "thumb-upload-param",
+                    },
+                ) as mocked_post, patch(
+                    "im_agent.platforms.weixin._upload_binary_to_cdn",
+                    return_value="orig-download-param",
+                ) as mocked_upload:
+                    uploaded = _upload_image_artifact_to_weixin(
+                        image_path=Path(image_path.name),
+                        to_user_id="wx-user-1",
+                        base_url="https://example.com",
+                        token="secret",
+                        cdn_base_url="https://cdn.example.com/c2c",
+                    )
+
+                request_payload = mocked_post.call_args.args[2]
+                self.assertEqual(request_payload["to_user_id"], "wx-user-1")
+                self.assertEqual(request_payload["no_need_thumb"], True)
+                self.assertEqual(mocked_upload.call_count, 1)
+                self.assertEqual(uploaded.original_download_param, "orig-download-param")
+                self.assertEqual(uploaded.thumbnail_download_param, "")
+                self.assertEqual(uploaded.thumbnail_size, 0)
+                self.assertEqual(uploaded.thumbnail_ciphertext_size, 0)
+            finally:
+                image_path.close()
+
+    def test_send_outbound_native_image_requires_context_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+            with self.assertRaises(RuntimeError):
+                adapter.send_outbound(
+                    OutboundMessage(
+                        platform="weixin",
+                        chat_id="wx-user-1",
+                        text="已抓拍 Tapo 231 当前画面。",
+                        attachments=[
+                            {
+                                "kind": "image",
+                                "mime_type": "image/jpeg",
+                                "path": "capture.jpg",
+                            }
+                        ],
+                        metadata={"source": "harborbeacon"},
+                    )
+                )
+
+    def test_send_outbound_native_image_records_successful_delivery_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
+            try:
+                image_path.write(b"fake-jpeg")
+                image_path.close()
+                adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+                assert adapter._context_tokens is not None
+                adapter._context_tokens.set("wx-user-1", "ctx-123")
+                with patch(
+                    "im_agent.platforms.weixin._upload_image_artifact_to_weixin",
+                    return_value=type(
+                        "UploadedImage",
+                        (),
+                        {
+                            "original_download_param": "orig-download-param",
+                            "thumbnail_download_param": "thumb-download-param",
+                            "aeskey_hex": "0123456789abcdef0123456789abcdef",
+                            "original_ciphertext_size": 112,
+                            "thumbnail_ciphertext_size": 64,
+                        },
+                    )(),
+                ), patch("im_agent.platforms.weixin.post_json", return_value={}) as mocked_post:
+                    response = adapter.send_outbound(
+                        OutboundMessage(
+                            platform="weixin",
+                            chat_id="wx-user-1",
+                            text="已抓拍 Tapo 231 当前画面。",
+                            attachments=[
+                                {
+                                    "kind": "image",
+                                    "mime_type": "image/jpeg",
+                                    "path": image_path.name,
+                                }
+                            ],
+                            metadata={"source": "harborbeacon"},
+                        )
+                    )
+
+                transport = adapter.transport_status()
+                first_payload = mocked_post.call_args_list[0].args[2]
+                second_payload = mocked_post.call_args_list[1].args[2]
+                self.assertTrue(response["sent"])
+                self.assertEqual(transport["last_send_status"], "sent")
+                self.assertEqual(transport["last_send_content_kind"], "text+image")
+                self.assertEqual(transport["last_send_attachment_count"], 1)
+                self.assertEqual(transport["last_send_chunk_count"], 2)
+                self.assertEqual(mocked_post.call_count, 2)
+                self.assertEqual(len(first_payload["msg"]["item_list"]), 1)
+                self.assertEqual(len(second_payload["msg"]["item_list"]), 1)
+                self.assertEqual(first_payload["msg"]["item_list"][0]["type"], 1)
+                self.assertEqual(second_payload["msg"]["item_list"][0]["type"], 2)
+                self.assertNotIn("thumb_media", second_payload["msg"]["item_list"][0]["image_item"])
+            finally:
+                image_path.close()
+
+    def test_send_outbound_native_image_sends_multiple_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            image_paths = [
+                tempfile.NamedTemporaryFile(dir=tmp, suffix=f"-{index}.jpg", delete=False)
+                for index in range(2)
+            ]
+            try:
+                for image_path in image_paths:
+                    image_path.write(b"fake-jpeg")
+                    image_path.close()
+                adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+                assert adapter._context_tokens is not None
+                adapter._context_tokens.set("wx-user-1", "ctx-123")
+                uploaded_image = type(
+                    "UploadedImage",
+                    (),
+                    {
+                        "original_download_param": "orig-download-param",
+                        "thumbnail_download_param": "thumb-download-param",
+                        "aeskey_hex": "0123456789abcdef0123456789abcdef",
+                        "original_ciphertext_size": 112,
+                        "thumbnail_ciphertext_size": 64,
+                    },
+                )()
+                with patch(
+                    "im_agent.platforms.weixin._upload_image_artifact_to_weixin",
+                    return_value=uploaded_image,
+                ) as mocked_upload, patch("im_agent.platforms.weixin.post_json", return_value={}) as mocked_post:
+                    response = adapter.send_outbound(
+                        OutboundMessage(
+                            platform="weixin",
+                            chat_id="wx-user-1",
+                            text="找到和春天相关的照片。",
+                            attachments=[
+                                {
+                                    "kind": "image",
+                                    "mime_type": "image/jpeg",
+                                    "path": image_paths[0].name,
+                                },
+                                {
+                                    "kind": "image",
+                                    "mime_type": "image/jpeg",
+                                    "path": image_paths[1].name,
+                                },
+                            ],
+                            metadata={"source": "harborbeacon"},
+                        )
+                    )
+
+                transport = adapter.transport_status()
+                caption_payload = mocked_post.call_args_list[0].args[2]
+                first_image_payload = mocked_post.call_args_list[1].args[2]
+                second_image_payload = mocked_post.call_args_list[2].args[2]
+                self.assertTrue(response["sent"])
+                self.assertEqual(mocked_upload.call_count, 2)
+                self.assertEqual(mocked_post.call_count, 3)
+                self.assertEqual(caption_payload["msg"]["item_list"][0]["type"], 1)
+                self.assertEqual(first_image_payload["msg"]["item_list"][0]["type"], 2)
+                self.assertEqual(second_image_payload["msg"]["item_list"][0]["type"], 2)
+                self.assertEqual(transport["last_send_status"], "sent")
+                self.assertEqual(transport["last_send_content_kind"], "text+image")
+                self.assertEqual(transport["last_send_attachment_count"], 2)
+                self.assertEqual(transport["last_send_chunk_count"], 3)
+                self.assertEqual(response["metadata"]["attachment_count"], 2)
+                self.assertEqual(response["metadata"]["native_attachment_count"], 2)
+                self.assertTrue(response["metadata"]["native_image_reply"])
+            finally:
+                for image_path in image_paths:
+                    image_path.close()
+
+    def test_send_outbound_native_image_accepts_original_only_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
+            try:
+                image_path.write(b"fake-jpeg")
+                image_path.close()
+                adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+                assert adapter._context_tokens is not None
+                adapter._context_tokens.set("wx-user-1", "ctx-123")
+                with patch(
+                    "im_agent.platforms.weixin._upload_image_artifact_to_weixin",
+                    return_value=type(
+                        "UploadedImage",
+                        (),
+                        {
+                            "original_download_param": "orig-download-param",
+                            "thumbnail_download_param": "",
+                            "aeskey_hex": "0123456789abcdef0123456789abcdef",
+                            "original_ciphertext_size": 112,
+                            "thumbnail_ciphertext_size": 0,
+                        },
+                    )(),
+                ), patch("im_agent.platforms.weixin.post_json", return_value={}) as mocked_post:
+                    response = adapter.send_outbound(
+                        OutboundMessage(
+                            platform="weixin",
+                            chat_id="wx-user-1",
+                            text="已抓拍 Tapo 231 当前画面。",
+                            attachments=[
+                                {
+                                    "kind": "image",
+                                    "mime_type": "image/jpeg",
+                                    "path": image_path.name,
+                                }
+                            ],
+                            metadata={"source": "harborbeacon"},
+                        )
+                    )
+
+                self.assertEqual(mocked_post.call_count, 2)
+                image_payload = mocked_post.call_args_list[1].args[2]
+                image_item = image_payload["msg"]["item_list"][0]["image_item"]
+                self.assertTrue(response["sent"])
+                self.assertEqual(image_item["mid_size"], 112)
+                self.assertNotIn("thumb_media", image_item)
+                self.assertNotIn("thumb_size", image_item)
+            finally:
+                image_path.close()
+
+    def test_send_outbound_native_video_records_successful_delivery_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            video_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".mp4", delete=False)
+            try:
+                video_path.write(b"fake-mp4")
+                video_path.close()
+                adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+                assert adapter._context_tokens is not None
+                adapter._context_tokens.set("wx-user-1", "ctx-123")
+                with patch(
+                    "im_agent.platforms.weixin._upload_media_artifact_to_weixin",
+                    return_value=type(
+                        "UploadedMedia",
+                        (),
+                        {
+                            "download_param": "video-download-param",
+                            "aeskey_hex": "0123456789abcdef0123456789abcdef",
+                            "plaintext_size": 4096,
+                            "ciphertext_size": 4112,
+                        },
+                    )(),
+                ) as mocked_upload, patch(
+                    "im_agent.platforms.weixin.post_json",
+                    return_value={},
+                ) as mocked_post:
+                    response = adapter.send_outbound(
+                        OutboundMessage(
+                            platform="weixin",
+                            chat_id="wx-user-1",
+                            text="完整回放如下",
+                            attachments=[
+                                {
+                                    "kind": "video",
+                                    "mime_type": "video/mp4",
+                                    "path": video_path.name,
+                                }
+                            ],
+                            metadata={"source": "harborbeacon"},
+                        )
+                    )
+
+                transport = adapter.transport_status()
+                first_payload = mocked_post.call_args_list[0].args[2]
+                second_payload = mocked_post.call_args_list[1].args[2]
+                self.assertTrue(response["sent"])
+                self.assertEqual(mocked_upload.call_count, 1)
+                self.assertEqual(mocked_post.call_count, 2)
+                self.assertEqual(mocked_upload.call_args.kwargs["media_type"], 2)
+                self.assertEqual(transport["last_send_status"], "sent")
+                self.assertEqual(transport["last_send_content_kind"], "text+video")
+                self.assertEqual(first_payload["msg"]["item_list"][0]["type"], 1)
+                self.assertEqual(second_payload["msg"]["item_list"][0]["type"], 5)
+                self.assertEqual(response["metadata"]["native_attachment_kind"], "video")
+                self.assertFalse(response["metadata"]["native_attachment_fallback"])
+            finally:
+                video_path.close()
+
+    def test_send_outbound_native_video_falls_back_to_file_when_video_transport_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            video_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".mp4", delete=False)
+            try:
+                video_path.write(b"fake-mp4")
+                video_path.close()
+                adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+                assert adapter._context_tokens is not None
+                adapter._context_tokens.set("wx-user-1", "ctx-123")
+                with patch(
+                    "im_agent.platforms.weixin._upload_media_artifact_to_weixin",
+                    side_effect=[
+                        RuntimeError("video unsupported"),
+                        type(
+                            "UploadedMedia",
+                            (),
+                            {
+                                "download_param": "file-download-param",
+                                "aeskey_hex": "0123456789abcdef0123456789abcdef",
+                                "plaintext_size": 4096,
+                                "ciphertext_size": 4112,
+                            },
+                        )(),
+                    ],
+                ) as mocked_upload, patch(
+                    "im_agent.platforms.weixin.post_json",
+                    return_value={},
+                ) as mocked_post:
+                    response = adapter.send_outbound(
+                        OutboundMessage(
+                            platform="weixin",
+                            chat_id="wx-user-1",
+                            text="完整回放如下",
+                            attachments=[
+                                {
+                                    "kind": "video",
+                                    "mime_type": "video/mp4",
+                                    "path": video_path.name,
+                                }
+                            ],
+                            metadata={"source": "harborbeacon"},
+                        )
+                    )
+
+                transport = adapter.transport_status()
+                text_payload = mocked_post.call_args_list[0].args[2]
+                file_payload = mocked_post.call_args_list[1].args[2]
+                self.assertTrue(response["sent"])
+                self.assertEqual(mocked_upload.call_count, 2)
+                self.assertEqual(mocked_upload.call_args_list[0].kwargs["media_type"], 2)
+                self.assertEqual(mocked_upload.call_args_list[1].kwargs["media_type"], 3)
+                self.assertEqual(text_payload["msg"]["item_list"][0]["text_item"]["text"], "完整回放如下（以文件发送）")
+                self.assertEqual(file_payload["msg"]["item_list"][0]["type"], 4)
+                self.assertEqual(transport["last_send_status"], "sent")
+                self.assertEqual(transport["last_send_content_kind"], "text+file")
+                self.assertEqual(response["metadata"]["native_attachment_kind"], "file")
+                self.assertTrue(response["metadata"]["native_attachment_fallback"])
+            finally:
+                video_path.close()
+
+    def test_send_outbound_native_image_fails_strictly_when_upload_step_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
+            try:
+                image_path.write(b"fake-jpeg")
+                image_path.close()
+                adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+                assert adapter._context_tokens is not None
+                adapter._context_tokens.set("wx-user-1", "ctx-123")
+                with patch(
+                    "im_agent.platforms.weixin._upload_image_artifact_to_weixin",
+                    side_effect=RuntimeError("getuploadurl failed"),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        adapter.send_outbound(
+                            OutboundMessage(
+                                platform="weixin",
+                                chat_id="wx-user-1",
+                                text="已抓拍 Tapo 231 当前画面。",
+                                attachments=[
+                                    {
+                                        "kind": "image",
+                                        "mime_type": "image/jpeg",
+                                        "path": image_path.name,
+                                    }
+                                ],
+                                metadata={"source": "harborbeacon"},
+                            )
+                        )
+
+                transport = adapter.transport_status()
+                self.assertEqual(transport["last_send_status"], "failed")
+                self.assertIn("getuploadurl failed", transport["last_send_error"])
+            finally:
+                image_path.close()
+
+    def test_send_outbound_native_image_fails_strictly_when_sendmessage_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
+            try:
+                image_path.write(b"fake-jpeg")
+                image_path.close()
+                adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+                assert adapter._context_tokens is not None
+                adapter._context_tokens.set("wx-user-1", "ctx-123")
+                with patch(
+                    "im_agent.platforms.weixin._upload_image_artifact_to_weixin",
+                    return_value=type(
+                        "UploadedImage",
+                        (),
+                        {
+                            "original_download_param": "orig-download-param",
+                            "thumbnail_download_param": "thumb-download-param",
+                            "aeskey_hex": "0123456789abcdef0123456789abcdef",
+                            "original_ciphertext_size": 112,
+                            "thumbnail_ciphertext_size": 64,
+                        },
+                    )(),
+                ), patch(
+                    "im_agent.platforms.weixin.post_json",
+                    side_effect=RuntimeError("sendmessage failed"),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        adapter.send_outbound(
+                            OutboundMessage(
+                                platform="weixin",
+                                chat_id="wx-user-1",
+                                text="已抓拍 Tapo 231 当前画面。",
+                                attachments=[
+                                    {
+                                        "kind": "image",
+                                        "mime_type": "image/jpeg",
+                                        "path": image_path.name,
+                                    }
+                                ],
+                                metadata={"source": "harborbeacon"},
+                            )
+                        )
+
+                transport = adapter.transport_status()
+                self.assertEqual(transport["last_send_status"], "failed")
+                self.assertIn("sendmessage failed", transport["last_send_error"])
+            finally:
+                image_path.close()
+
     def test_duplicate_update_tracking_is_persistent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             save_weixin_account(
@@ -136,6 +825,32 @@ class WeixinAdapterTests(unittest.TestCase):
 
             restored = WeixinAdapter(state_dir=tmp, account_id="bot-1")
             self.assertTrue(restored.is_duplicate_update(payload))
+
+    def test_transport_state_is_persisted_and_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            save_weixin_account(
+                tmp,
+                account_id="bot-1",
+                token="secret",
+                base_url="https://example.com",
+            )
+            adapter = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+
+            with patch(
+                "im_agent.platforms.weixin.post_json",
+                side_effect=TimeoutError("The read operation timed out"),
+            ):
+                adapter.poll_updates(timeout_ms=1000)
+
+            persisted = load_weixin_transport_state(tmp, "bot-1")
+            assert isinstance(persisted, dict)
+            self.assertEqual(persisted["last_poll_outcome"], "idle_timeout")
+            self.assertTrue(persisted["connected"])
+
+            restored = WeixinAdapter(state_dir=tmp, account_id="bot-1")
+            restored_transport = restored.transport_status()
+            self.assertEqual(restored_transport["last_poll_outcome"], "idle_timeout")
+            self.assertTrue(restored_transport["connected"])
 
 
 if __name__ == "__main__":

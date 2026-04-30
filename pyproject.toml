@@ -18,6 +18,7 @@ classifiers = [
   "Operating System :: OS Independent",
 ]
 dependencies = [
+  "cryptography>=44",
   "lark-oapi>=1.5.3",
   "qrcodegen>=1.8",
 ]
@@ -26,9 +27,11 @@ dependencies = [
 harborgate = "im_agent.server:main"
 harborgate-weixin-login = "im_agent.weixin_login:main"
 harborgate-weixin-runner = "im_agent.weixin_runner:main"
+harborgate-weixin-ingress-probe = "im_agent.weixin_ingress_probe:main"
 im-agent = "im_agent.server:main"
 im-agent-weixin-login = "im_agent.weixin_login:main"
 im-agent-weixin-runner = "im_agent.weixin_runner:main"
+im-agent-weixin-ingress-probe = "im_agent.weixin_ingress_probe:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

@@ -1,5 +1,12 @@
 # HarborBeacon HarborGate Agent Contract v1.5
 
+## Historical Status
+
+This document is historical after the 2026-04-26 decision to move the active
+HarborBeacon <-> HarborGate seam to Contract v2.0.
+
+Use `HarborBeacon-HarborGate-Agent-Contract-v2.0.md` for current work.
+
 ## Status
 
 This document supersedes the earlier v1.x drafts as the recommended working

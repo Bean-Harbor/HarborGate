@@ -1,5 +1,43 @@
 # HarborGate Work Log
 
+## 2026-04-26
+
+### v2.0 Control Pack Start
+
+- Switched the active cross-repo baseline to `HarborBeacon-HarborGate-Agent-Contract-v2.0.md`.
+- Marked v1.5 as historical reference only.
+- Added the HarborGate v2.0 upgrade runbook and cutover checklist.
+- Current focus is control-pack and drift-guard setup before business code migration.
+
+### Stop-The-Line Rules
+
+- Ask before adding public contract fields.
+- Ask before changing Beacon/Gate ownership.
+- Ask before adding v1.5 runtime compatibility.
+- Ask before adding group-chat scope.
+- Ask on live target, credential, DNS, or provider blockers.
+
+## 2026-04-19
+
+### Closeout Snapshot
+
+- Feishu baseline rehearsal is ready on the frozen HarborBeacon `v1.5` seam.
+- Weixin remains on the parity track with release-v1 ingress blockers only in the four fixed classes: `account_restore`, `qr_recovery`, `getupdates`, and `context_token_send`.
+- The redacted gateway status can now export a more specific transport `blocker_category` such as `weixin_dns_resolution` while `release_v1.weixin_blocker_category` stays on the coarse parity bucket.
+- `run_platform_live_gate.py` now keeps the latest real `ingress_probe` separate from `latest_successful_ingress_probe`, so a stale success report cannot hide the current blocker when Weixin is waiting for a new private text.
+- The closeout stayed within HarborGate-only docs and verification; no HarborBeacon contract or recipient-shape changes were made.
+
+### Validation Commands
+
+```powershell
+pytest tests/test_platform_live_gate.py tests/test_gateway.py tests/test_weixin_adapter.py
+```
+
+### Known Pending
+
+- Weixin private-DM ingress still needs one of the four fixed blockers cleared before it reaches parity with the Feishu rehearsal surface.
+- Group chats remain out of scope for this cutover and should not be used to widen the seam.
+
 ## 2026-04-18
 
 ### Contract Baseline Locked
@@ -28,7 +66,7 @@
 
 ### Repository Tracking
 
-- Created GitHub repository: `https://github.com/Bean-Harbor/harbornas-im-gateway`
+- Created GitHub repository: `https://github.com/Bean-Harbor/harborbeacon-im-gateway`
 - Local repo has been initialized and prepared for first push.
 - Added `.gitignore` protections so local runtime state under `data/` is not committed.
 - A dedicated GitHub Projects board is still pending because the current GitHub token does not include project scopes.
@@ -87,3 +125,33 @@
 - Verified that a real user DM entered the gateway, created a Feishu session file, and was normalized into the internal message flow.
 - Verified outbound delivery back to the same Feishu route through the IM-side notification delivery endpoint, including a successful provider message ID from the Feishu Open Platform API.
 - Closed the day with Feishu in `connected` websocket state, live send enabled, and the mobile setup portal aligned with the long-connection-first workflow.
+
+### 2026-04-26 v2.0 Turn Client Closeout
+
+- Preserved the v2.0 control pack as a separate commit.
+- Switched the active HarborBeacon client default to `X-Contract-Version: 2.0`
+  and `POST /api/turns`.
+- Replaced request-time `resume_token` metadata with opaque `continuation`
+  storage.
+- Added coverage that Gate preserves an opaque continuation when Beacon returns
+  a `completed` turn with an active frame, then clears it when Beacon omits the
+  frame and continuation.
+- Kept Weixin native video/file delivery in Gate, now driven by v2
+  `delivery_hints`.
+- Deployed the fresh Beacon frame-first bundle to `.182`; the direct
+  `/api/turns` matrix now proves clip-confirmation feedback and boundary turns
+  preserve continuation until playback or cancel.
+- Renamed local release observability from `release_v1` to `release_v2`.
+- Changed files: `src/im_agent/harborbeacon.py`, `src/im_agent/gateway.py`,
+  `src/im_agent/setup_portal.py`, `tools/run_platform_live_gate.py`, and
+  related tests.
+- Tests run: `python -m pytest tests/test_v20_control_pack.py -q`,
+  `python -m pytest tests/test_gateway.py::GatewayServiceTests::test_completed_active_frame_persists_and_reuses_continuation -q`,
+  `python -m pytest tests/test_v20_control_pack.py tests/test_harborbeacon.py tests/test_gateway.py tests/test_weixin_adapter.py tests/test_platform_live_gate.py tests/test_server.py -q`,
+  `python -m pytest`, and `git diff --check`.
+- Drift check: Gate v2.0 guard passed; active client no longer posts
+  `/api/tasks` or emits `args.resume_token`.
+- Blockers: `.182` live Weixin validation is still pending target-registry
+  confirmation.
+- Next exact step: run the Weixin private-DM v2.0 matrix through the updated
+  Gate client.

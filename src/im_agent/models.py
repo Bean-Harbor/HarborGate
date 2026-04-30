@@ -34,6 +34,7 @@ class OutboundMessage:
     platform: str
     chat_id: str
     text: str
+    attachments: list[dict[str, Any]] = field(default_factory=list)
     timestamp: str = field(default_factory=utc_now_iso)
     metadata: dict[str, Any] = field(default_factory=dict)
 

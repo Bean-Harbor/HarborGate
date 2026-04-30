@@ -7,7 +7,9 @@ import logging
 from im_agent.brain import Brain, build_brain_from_env
 from im_agent.errors import GatewayContractError
 from im_agent.harborbeacon import (
+    HarborBeaconAdminClient,
     HarborBeaconTaskClient,
+    build_harborbeacon_admin_client_from_env,
     build_harborbeacon_client_from_env,
     derive_route_key,
     derive_session_id,
@@ -18,6 +20,12 @@ from im_agent.platforms.registry import build_enabled_adapters
 from im_agent.session_store import FileSessionStore
 
 logger = logging.getLogger(__name__)
+
+SYNCABLE_NOTIFICATION_TARGET_PLATFORMS = frozenset({"feishu", "weixin"})
+PLATFORM_DISPLAY_NAMES = {
+    "feishu": "Feishu",
+    "weixin": "Weixin",
+}
 
 
 def _log_observation(event: str, fields: dict[str, object]) -> None:
@@ -104,7 +112,152 @@ def _render_retrieval_entry(record: dict[str, object], *, kind: str) -> str:
     return primary or secondary or "未命名附件"
 
 
-def _render_retrieval_reply(base_text: str, response_payload: dict[str, object]) -> tuple[str, dict[str, object]]:
+def _coerce_artifact_candidates(response_payload: dict[str, object]) -> list[dict[str, object]]:
+    top_level_artifacts = response_payload.get("artifacts")
+    if isinstance(top_level_artifacts, list):
+        return _coerce_record_list(top_level_artifacts)
+    result = response_payload.get("result")
+    result = result if isinstance(result, dict) else {}
+    return _coerce_record_list(
+        result.get("artifacts")
+        or result.get("attachments")
+        or result.get("evidence")
+    )
+
+
+def _normalize_outbound_attachment(record: dict[str, object]) -> dict[str, object] | None:
+    kind = str(record.get("kind") or record.get("type") or "").strip().lower()
+    mime_type = str(record.get("mime_type") or "").strip().lower()
+    label = str(record.get("label") or record.get("name") or record.get("title") or "").strip()
+    media_asset_id = str(record.get("media_asset_id") or "").strip()
+    path = str(record.get("path") or "").strip()
+    url = str(record.get("url") or "").strip()
+    metadata = dict(record.get("metadata") or {}) if isinstance(record.get("metadata"), dict) else {}
+
+    if not kind:
+        if mime_type.startswith("image/"):
+            kind = "image"
+        elif mime_type.startswith("video/"):
+            kind = "video"
+        elif url:
+            kind = "link"
+        else:
+            kind = "text"
+
+    if not (path or url or media_asset_id):
+        return None
+
+    return {
+        "kind": kind,
+        "label": label,
+        "mime_type": mime_type,
+        "media_asset_id": media_asset_id,
+        "path": path,
+        "url": url,
+        "metadata": metadata,
+    }
+
+
+def _result_data_block(response_payload: dict[str, object]) -> dict[str, object]:
+    data = response_payload.get("data")
+    if isinstance(data, dict):
+        return data
+    result = response_payload.get("result")
+    result = result if isinstance(result, dict) else {}
+    data = result.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _clip_delivery_instruction(response_payload: dict[str, object]) -> dict[str, object] | None:
+    hints = response_payload.get("delivery_hints")
+    if isinstance(hints, list):
+        for hint in hints:
+            if not isinstance(hint, dict):
+                continue
+            if str(hint.get("kind") or "").strip() == "native_video":
+                return hint
+    instruction = _result_data_block(response_payload).get("clip_delivery")
+    if not isinstance(instruction, dict):
+        return None
+    return instruction if str(instruction.get("kind") or "").strip() == "clip_delivery" else None
+
+
+def _native_image_instruction(response_payload: dict[str, object]) -> dict[str, object] | None:
+    hints = response_payload.get("delivery_hints")
+    if isinstance(hints, list):
+        for hint in hints:
+            if not isinstance(hint, dict):
+                continue
+            if str(hint.get("kind") or "").strip() in {"native_image", "native_images"}:
+                return hint
+    return None
+
+
+def _native_image_limit(instruction: dict[str, object] | None) -> int:
+    if not instruction:
+        return 1
+    metadata = instruction.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    raw_limit = instruction.get("max_items") or metadata.get("max_items") or metadata.get("limit")
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        limit = 3
+    return max(1, min(3, limit))
+
+
+def _native_source_bound_attachments(
+    *,
+    adapter_name: str,
+    response_payload: dict[str, object],
+) -> list[dict[str, object]]:
+    if adapter_name != "weixin":
+        return []
+
+    normalized = [
+        attachment
+        for attachment in (
+            _normalize_outbound_attachment(record)
+            for record in _coerce_artifact_candidates(response_payload)
+        )
+        if attachment is not None
+    ]
+    if not normalized:
+        return []
+
+    if _clip_delivery_instruction(response_payload) is not None:
+        if len(normalized) != 1:
+            return []
+        attachment = normalized[0]
+        if attachment["kind"] not in {"video", "file"}:
+            return []
+        if not str(attachment.get("path") or "").strip():
+            return []
+        return [attachment]
+
+    image_attachments = [
+        attachment
+        for attachment in normalized
+        if attachment["kind"] == "image"
+        and str(attachment.get("mime_type") or "").startswith("image/")
+        and str(attachment.get("path") or "").strip()
+    ]
+    if not image_attachments:
+        return []
+    image_instruction = _native_image_instruction(response_payload)
+    if image_instruction is not None:
+        return image_attachments[: _native_image_limit(image_instruction)]
+    if len(normalized) == 1 and normalized[0] is image_attachments[0]:
+        return image_attachments
+    return []
+
+
+def _render_retrieval_reply(
+    base_text: str,
+    response_payload: dict[str, object],
+    *,
+    suppress_artifact_entries: bool = False,
+) -> tuple[str, dict[str, object]]:
     result = response_payload.get("result")
     result = result if isinstance(result, dict) else {}
     citation_candidates = _coerce_record_list(
@@ -114,11 +267,7 @@ def _render_retrieval_reply(base_text: str, response_payload: dict[str, object])
         or result.get("top_hits")
         or result.get("hits")
     )
-    artifact_candidates = _coerce_record_list(
-        result.get("artifacts")
-        or result.get("attachments")
-        or result.get("evidence")
-    )
+    artifact_candidates = _coerce_artifact_candidates(response_payload)
 
     citation_entries = [_render_retrieval_entry(item, kind="citation") for item in citation_candidates[:3]]
     artifact_entries = [_render_retrieval_entry(item, kind="artifact") for item in artifact_candidates[:3]]
@@ -131,19 +280,20 @@ def _render_retrieval_reply(base_text: str, response_payload: dict[str, object])
         if len(citation_candidates) > len(citation_entries):
             citation_block = f"{citation_block}\n... 还有 {len(citation_candidates) - len(citation_entries)} 条引用"
         sections.append(f"引用\n{citation_block}")
-    if artifact_entries:
+    if artifact_entries and not suppress_artifact_entries:
         artifact_block = "\n".join(f"{index}. {entry}" for index, entry in enumerate(artifact_entries, start=1))
         if len(artifact_candidates) > len(artifact_entries):
             artifact_block = f"{artifact_block}\n... 还有 {len(artifact_candidates) - len(artifact_entries)} 个附件"
         sections.append(f"附件\n{artifact_block}")
 
+    has_rendered_retrieval = bool(citation_candidates or (artifact_candidates and not suppress_artifact_entries))
     retrieval_summary = {
-        "content_kind": "retrieval_reply" if (citation_candidates or artifact_candidates) else "plain_reply",
+        "content_kind": "retrieval_reply" if has_rendered_retrieval else "plain_reply",
         "citation_count": len(citation_candidates),
         "artifact_count": len(artifact_candidates),
         "rendered_sections": [section.split("\n", 1)[0] for section in sections[1:]],
     }
-    if citation_candidates or artifact_candidates:
+    if has_rendered_retrieval:
         header = f"检索结果（{len(citation_candidates)} 条引用，{len(artifact_candidates)} 个附件）"
         sections.insert(0, header)
 
@@ -171,18 +321,18 @@ def _ingress_profile(
     }
 
 
-def _message_task_ids(session_metadata: dict[str, object]) -> dict[str, str]:
-    raw = session_metadata.get("message_task_ids")
+def _message_turn_ids(session_metadata: dict[str, object]) -> dict[str, str]:
+    raw = session_metadata.get("message_turn_ids")
     if not isinstance(raw, dict):
         return {}
 
-    message_task_ids: dict[str, str] = {}
-    for message_id, task_id in raw.items():
+    message_turn_ids: dict[str, str] = {}
+    for message_id, turn_id in raw.items():
         normalized_message_id = str(message_id or "").strip()
-        normalized_task_id = str(task_id or "").strip()
-        if normalized_message_id and normalized_task_id:
-            message_task_ids[normalized_message_id] = normalized_task_id
-    return message_task_ids
+        normalized_turn_id = str(turn_id or "").strip()
+        if normalized_message_id and normalized_turn_id:
+            message_turn_ids[normalized_message_id] = normalized_turn_id
+    return message_turn_ids
 
 
 def _adapter_profile(adapter: PlatformAdapter) -> dict[str, object]:
@@ -218,10 +368,12 @@ class GatewayService:
         store: FileSessionStore,
         brain: Brain,
         task_client: HarborBeaconTaskClient | None = None,
+        notification_target_client: HarborBeaconAdminClient | None = None,
     ) -> None:
         self.store = store
         self.brain = brain
         self.task_client = task_client
+        self.notification_target_client = notification_target_client
         self._adapters: dict[str, PlatformAdapter] = {}
         self._started = False
 
@@ -259,8 +411,8 @@ class GatewayService:
         adapter_profile = _adapter_profile(adapter)
         history = self.store.load_history(inbound.platform, inbound.chat_id)
         session_metadata = self.store.load_metadata(inbound.platform, inbound.chat_id)
-        known_message_tasks = _message_task_ids(session_metadata)
-        replayed_task_id = known_message_tasks.get(inbound.message_id.strip(), "")
+        known_message_turns = _message_turn_ids(session_metadata)
+        replayed_turn_id = known_message_turns.get(inbound.message_id.strip(), "")
         resolved_route_key = inbound.route_key or str(session_metadata.get("route_key") or "").strip() or derive_route_key(inbound)
         resolved_session_id = inbound.session_id or derive_session_id(inbound)
         ingress_profile = _ingress_profile(
@@ -275,44 +427,57 @@ class GatewayService:
         if self.task_client is not None:
             task_result = self.task_client.submit_turn(inbound, session_metadata=session_metadata)
             resolved_route_key = task_result.route_key or resolved_route_key
-            reply_text, retrieval_summary = _render_retrieval_reply(task_result.text, task_result.response_payload)
+            outbound_attachments = _native_source_bound_attachments(
+                adapter_name=adapter_name,
+                response_payload=task_result.response_payload,
+            )
+            reply_text, retrieval_summary = _render_retrieval_reply(
+                task_result.text,
+                task_result.response_payload,
+                suppress_artifact_entries=bool(outbound_attachments),
+            )
             next_metadata = {
                 **session_metadata,
                 "route_key": resolved_route_key,
                 "session_id": resolved_session_id,
             }
             preserve_latest_pointer = bool(
-                replayed_task_id
-                and replayed_task_id != str(session_metadata.get("last_task_id") or "").strip()
+                replayed_turn_id
+                and replayed_turn_id != str(session_metadata.get("last_turn_id") or "").strip()
             )
             if not preserve_latest_pointer:
-                next_metadata["last_task_id"] = task_result.task_id
+                next_metadata["last_turn_id"] = task_result.task_id
                 next_metadata["last_trace_id"] = task_result.trace_id
                 if inbound.message_id.strip():
                     next_metadata["last_message_id"] = inbound.message_id.strip()
-                if task_result.resume_token:
-                    next_metadata["resume_token"] = task_result.resume_token
+                if task_result.conversation_handle:
+                    next_metadata["conversation_handle"] = task_result.conversation_handle
+                if task_result.continuation:
+                    next_metadata["continuation"] = task_result.continuation
                 else:
-                    next_metadata.pop("resume_token", None)
+                    next_metadata.pop("continuation", None)
             if inbound.message_id.strip():
-                next_metadata["message_task_ids"] = {
-                    **known_message_tasks,
+                next_metadata["message_turn_ids"] = {
+                    **known_message_turns,
                     inbound.message_id.strip(): task_result.task_id,
                 }
             self.store.set_metadata(inbound.platform, inbound.chat_id, next_metadata)
             outbound_metadata.update(
                 {
                     "source": "harborbeacon",
+                    "turn_id": task_result.task_id,
                     "task_id": task_result.task_id,
                     "trace_id": task_result.trace_id,
                     "status": task_result.status,
                     "route_key": resolved_route_key,
+                    "conversation_handle": task_result.conversation_handle,
+                    "active_frame": task_result.active_frame,
+                    "continuation": task_result.continuation,
                     "next_actions": task_result.next_actions,
                     "retrieval_render": retrieval_summary,
+                    "native_attachment_count": len(outbound_attachments),
                 }
             )
-            if task_result.resume_token:
-                outbound_metadata["resume_token"] = task_result.resume_token
             if task_result.prompt:
                 outbound_metadata["prompt"] = task_result.prompt
             _log_observation(
@@ -427,9 +592,117 @@ class GatewayService:
             platform=inbound.platform,
             chat_id=inbound.chat_id,
             text=reply_text,
+            attachments=outbound_attachments if self.task_client is not None else [],
             metadata=outbound_metadata,
         )
-        return adapter.send_outbound(outbound)
+        adapter_response = adapter.send_outbound(outbound)
+        self._sync_notification_target_if_needed(
+            adapter=adapter,
+            inbound=inbound,
+            route_key=resolved_route_key,
+            session_metadata=session_metadata,
+        )
+        return adapter_response
+
+    def _sync_notification_target_if_needed(
+        self,
+        *,
+        adapter: PlatformAdapter,
+        inbound: InboundMessage,
+        route_key: str,
+        session_metadata: dict[str, object],
+    ) -> None:
+        registration = self._notification_target_registration(
+            adapter=adapter,
+            inbound=inbound,
+            route_key=route_key,
+            session_metadata=session_metadata,
+        )
+        if registration is None or self.notification_target_client is None:
+            return
+
+        try:
+            response_payload = self.notification_target_client.upsert_notification_target(
+                label=registration["label"],
+                route_key=registration["route_key"],
+                platform_hint=registration["platform_hint"],
+            )
+            next_metadata = self.store.load_metadata(inbound.platform, inbound.chat_id)
+            next_metadata["notification_target_synced_route_key"] = registration["route_key"]
+            next_metadata["notification_target_label"] = registration["label"]
+            self.store.set_metadata(inbound.platform, inbound.chat_id, next_metadata)
+            targets = response_payload.get("targets")
+            target_count = len(targets) if isinstance(targets, list) else 0
+            _log_observation(
+                "notification_target_synced",
+                {
+                    "platform": inbound.platform,
+                    "chat_id": inbound.chat_id,
+                    "route_key": registration["route_key"],
+                    "platform_hint": registration["platform_hint"],
+                    "label": registration["label"],
+                    "target_count": target_count,
+                },
+            )
+        except Exception as exc:
+            _log_observation(
+                "notification_target_sync_failed",
+                {
+                    "platform": inbound.platform,
+                    "chat_id": inbound.chat_id,
+                    "route_key": registration["route_key"],
+                    "platform_hint": registration["platform_hint"],
+                    "label": registration["label"],
+                    "error": str(exc),
+                },
+            )
+
+    def _notification_target_registration(
+        self,
+        *,
+        adapter: PlatformAdapter,
+        inbound: InboundMessage,
+        route_key: str,
+        session_metadata: dict[str, object],
+    ) -> dict[str, str] | None:
+        if self.notification_target_client is None:
+            return None
+
+        normalized_route_key = route_key.strip()
+        if not normalized_route_key:
+            return None
+        if str(inbound.chat_type or "").strip().lower() != "p2p":
+            return None
+        if (
+            str(session_metadata.get("notification_target_synced_route_key") or "").strip()
+            == normalized_route_key
+        ):
+            return None
+
+        raw_profile = adapter.get_profile() if hasattr(adapter, "get_profile") else {}
+        raw_profile = raw_profile if isinstance(raw_profile, dict) else {}
+        if bool(raw_profile.get("placeholder")):
+            return None
+
+        platform_hint = str(
+            inbound.platform
+            or raw_profile.get("surface_family")
+            or getattr(adapter, "name", "")
+        ).strip().lower()
+        if platform_hint not in SYNCABLE_NOTIFICATION_TARGET_PLATFORMS:
+            return None
+
+        platform_display = str(
+            raw_profile.get("display_name")
+            or PLATFORM_DISPLAY_NAMES.get(platform_hint)
+            or platform_hint.title()
+        ).strip()
+        label_suffix = normalized_route_key[-6:] if len(normalized_route_key) > 6 else normalized_route_key
+        return {
+            "label": f"{platform_display} DM {label_suffix}",
+            "route_key": normalized_route_key,
+            "platform_hint": platform_hint,
+        }
 
     def handle_notification_delivery(self, payload: dict) -> dict:
         trace_id = str(payload.get("trace_id") or "").strip()
@@ -501,35 +774,49 @@ class GatewayService:
                 )
             response_payload = record.get("response_payload")
             if isinstance(response_payload, dict):
+                classification = record.get("classification")
+                classification = classification if isinstance(classification, dict) else {}
                 _log_observation(
                     "delivery_replayed",
                     {
                         "notification_id": notification_id,
                         "trace_id": trace_id,
                         "route_key": route_key,
+                        "route_mode": str(classification.get("route_mode") or "unknown"),
+                        "route_source": str(classification.get("route_source") or "unknown"),
                         "delivery.idempotency_key": idempotency_key,
                         "platform": str(response_payload.get("platform") or route.get("platform") or adapter_name),
                         "status": str(response_payload.get("status") or ""),
                         "provider_message_id": response_payload.get("provider_message_id"),
+                        "failure_class": str(classification.get("failure_class") or ""),
+                        "queue_state": str(classification.get("queue_state") or ""),
                     },
                 )
                 return dict(response_payload)
 
         outbound_text = self._build_notification_text(content)
+        attachments = [
+            dict(item)
+            for item in (content.get("attachments") or [])
+            if isinstance(item, dict)
+        ]
         outbound = OutboundMessage(
             platform=str(route.get("platform") or adapter_name),
             chat_id=str(route.get("chat_id") or ""),
             text=outbound_text,
+            attachments=attachments,
             metadata={
                 "source": "notification_delivery",
                 "notification_id": notification_id,
                 "trace_id": trace_id,
                 "delivery_mode": mode,
                 "route_key": route_key,
+                "route_mode": str(route.get("route_mode") or "unknown"),
+                "route_source": str(route.get("route_source") or "unknown"),
                 "reply_to_message_id": reply_to_message_id,
                 "update_message_id": update_message_id,
                 "payload_format": str(content.get("payload_format") or "plain_text").strip() or "plain_text",
-                "attachments": content.get("attachments") if isinstance(content.get("attachments"), list) else [],
+                "attachments": attachments,
                 "structured_payload": content.get("structured_payload") if isinstance(content.get("structured_payload"), dict) else {},
             },
         )
@@ -542,17 +829,22 @@ class GatewayService:
                 or adapter_response.get("provider_message_id")
                 or ""
             ).strip() or None
+            placeholder_status = str(
+                adapter_response.get("placeholder_status") or ""
+            ).strip()
             response_payload: dict[str, object] = {
                 "delivery_id": delivery_id,
                 "notification_id": notification_id,
                 "trace_id": trace_id,
                 "ok": True,
-                "status": "sent",
+                "status": placeholder_status or "sent",
                 "platform": str(route.get("platform") or adapter_name),
                 "provider_message_id": provider_message_id,
                 "retryable": False,
                 "error": None,
             }
+            if adapter_response.get("placeholder"):
+                response_payload["placeholder"] = True
         except Exception as exc:
             error_code, retryable = self._map_delivery_failure(exc)
             response_payload = {
@@ -570,10 +862,15 @@ class GatewayService:
                 },
             }
 
+        classification = self._classify_delivery_attempt(
+            route=route,
+            response_payload=response_payload,
+        )
         self.store.save_delivery_record(
             idempotency_key,
             request_fingerprint=request_fingerprint,
             response_payload=response_payload,
+            classification=classification,
         )
         _log_observation(
             "delivery_attempted",
@@ -581,12 +878,16 @@ class GatewayService:
                 "notification_id": notification_id,
                 "trace_id": trace_id,
                 "route_key": route_key,
+                "route_mode": classification["route_mode"],
+                "route_source": classification["route_source"],
                 "delivery.idempotency_key": idempotency_key,
                 "platform": str(route.get("platform") or adapter_name),
                 "status": str(response_payload.get("status") or ""),
                 "provider_message_id": response_payload.get("provider_message_id"),
                 "retryable": response_payload.get("retryable"),
                 "ok": response_payload.get("ok"),
+                "failure_class": classification["failure_class"],
+                "queue_state": classification["queue_state"],
             },
         )
         return response_payload
@@ -636,15 +937,27 @@ class GatewayService:
                 raise GatewayContractError(404, "ROUTE_NOT_FOUND", f"route_key not found: {route_key}", trace_id)
             if str(route.get("status") or "active").strip().lower() == "expired":
                 raise GatewayContractError(410, "ROUTE_EXPIRED", f"route_key expired: {route_key}", trace_id)
+            route = dict(route)
+            route["route_mode"] = "source_bound"
+            route["route_source"] = "route_key"
+            route.setdefault("adapter_name", str(route.get("platform") or "").strip())
+            route.setdefault("platform", str(route.get("platform") or "").strip())
+            route.setdefault("chat_id", str(route.get("chat_id") or "").strip())
             return route
 
         platform = str(destination.get("platform") or "").strip()
         chat_id = str(destination.get("id") or "").strip()
+        recipient = destination.get("recipient")
+        recipient = recipient if isinstance(recipient, dict) else {}
+        if not chat_id:
+            chat_id = str(recipient.get("recipient_id") or "").strip()
+        if not platform:
+            platform = str(recipient.get("platform") or "").strip()
         if not platform or not chat_id:
             raise GatewayContractError(
                 422,
                 "VALIDATION_ERROR",
-                "destination.route_key is preferred; otherwise destination.platform and destination.id are required",
+                "destination.route_key is preferred; otherwise destination.platform with destination.id or destination.recipient is required",
                 trace_id,
             )
         return {
@@ -652,6 +965,8 @@ class GatewayService:
             "chat_id": chat_id,
             "adapter_name": platform,
             "status": "active",
+            "route_mode": "proactive",
+            "route_source": "platform_id" if str(destination.get("id") or "").strip() else "recipient",
         }
 
     @staticmethod
@@ -672,6 +987,31 @@ class GatewayService:
         if "unsupported" in message:
             return ("UNSUPPORTED_CONTENT", False)
         return ("PLATFORM_UNAVAILABLE", True)
+
+    @staticmethod
+    def _classify_delivery_attempt(
+        *,
+        route: dict[str, object],
+        response_payload: dict[str, object],
+    ) -> dict[str, object]:
+        route_mode = str(route.get("route_mode") or "unknown").strip().lower() or "unknown"
+        route_source = str(route.get("route_source") or "unknown").strip().lower() or "unknown"
+        ok = bool(response_payload.get("ok"))
+        retryable = bool(response_payload.get("retryable"))
+        error_block = response_payload.get("error")
+        error_block = error_block if isinstance(error_block, dict) else {}
+        failure_class = ""
+        if not ok:
+            failure_class = str(error_block.get("code") or "").strip() or "INTERNAL_ERROR"
+        queue_state = "complete" if ok else ("retry_queue" if retryable else "terminal_failure")
+        return {
+            "route_mode": route_mode,
+            "route_source": route_source,
+            "outcome": "sent" if ok else "failed",
+            "failure_class": failure_class,
+            "queue_state": queue_state,
+            "retryable": retryable,
+        }
 
     @staticmethod
     def _fingerprint_payload(payload: dict) -> str:
@@ -706,6 +1046,7 @@ def build_default_gateway(data_root: str = "data/sessions") -> GatewayService:
         store=store,
         brain=build_brain_from_env(),
         task_client=build_harborbeacon_client_from_env(),
+        notification_target_client=build_harborbeacon_admin_client_from_env(),
     )
     for adapter in build_enabled_adapters():
         gateway.register_adapter(adapter)

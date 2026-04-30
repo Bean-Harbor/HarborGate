@@ -1,4 +1,4 @@
-# HarborNAS IM Gateway Agent Contract v1.3
+# HarborBeacon IM Gateway Agent Contract v1.3
 
 ## Status
 
@@ -6,7 +6,7 @@ This document supersedes the earlier v1.x drafts as the recommended working
 contract for first independent implementation across:
 
 - the external IM Gateway repo
-- the HarborNAS backend repo
+- the HarborBeacon backend repo
 
 Recommended disposition:
 
@@ -19,7 +19,7 @@ Recommended disposition:
 This contract freezes the boundary between:
 
 - IM Gateway, which owns all IM-platform concerns
-- HarborNAS backend, which owns all business and task concerns
+- HarborBeacon backend, which owns all business and task concerns
 
 Both sides communicate only through HTTP/JSON contracts.
 
@@ -28,19 +28,19 @@ Both sides communicate only through HTTP/JSON contracts.
 v1.3 freezes exactly two cross-repo interfaces:
 
 1. inbound task interface
-   - IM Gateway -> HarborNAS
+   - IM Gateway -> HarborBeacon
    - based on existing `POST /api/tasks`
 2. outbound notification delivery interface
-   - HarborNAS -> IM Gateway
+   - HarborBeacon -> IM Gateway
    - hosted by IM Gateway
 
 ## Hard Boundary Rules
 
-- IM Gateway MUST NOT import `harborbeacon.*`, `orchestrator.*`, or any HarborNAS runtime code.
-- HarborNAS MUST NOT import IM Gateway adapter, runtime, or platform client code.
-- The repos MUST NOT share `.harbornas/*.json` or any other runtime state files.
+- IM Gateway MUST NOT import `harborbeacon.*`, `orchestrator.*`, or any HarborBeacon runtime code.
+- HarborBeacon MUST NOT import IM Gateway adapter, runtime, or platform client code.
+- The repos MUST NOT share `.harborbeacon/*.json` or any other runtime state files.
 - IM platform credentials such as `app_id`, `app_secret`, bot token, websocket ticket, webhook secret, and refresh tokens MUST live only in IM Gateway.
-- HarborNAS remains the source of truth for:
+- HarborBeacon remains the source of truth for:
   - business session state
   - resumable workflow state
   - approval state
@@ -52,8 +52,8 @@ v1.3 freezes exactly two cross-repo interfaces:
   - route registry
   - context token
   - temporary delivery cache
-- HarborNAS MUST NOT directly deliver platform messages after cutover of the notification interface.
-- HarborNAS MUST NOT remain the long-term owner of platform credential validation. If HarborNAS needs connection status in UI or setup flow, it should obtain a redacted status result from IM Gateway instead of storing and validating raw platform credentials itself.
+- HarborBeacon MUST NOT directly deliver platform messages after cutover of the notification interface.
+- HarborBeacon MUST NOT remain the long-term owner of platform credential validation. If HarborBeacon needs connection status in UI or setup flow, it should obtain a redacted status result from IM Gateway instead of storing and validating raw platform credentials itself.
 
 ## Ownership Split
 
@@ -66,7 +66,7 @@ v1.3 freezes exactly two cross-repo interfaces:
   - platform payload formatting
   - platform credential storage
   - route key generation and lookup
-- HarborNAS owns:
+- HarborBeacon owns:
   - `assistant_task_api`
   - task execution
   - business state
@@ -99,11 +99,11 @@ v1.3 freezes exactly two cross-repo interfaces:
 
 ### Timeout and Retry Ownership
 
-- `IM Gateway -> HarborNAS`
+- `IM Gateway -> HarborBeacon`
   - request timeout SHOULD default to 15 seconds
   - retry only on transport failure or 5xx
-  - do not retry on explicit business failure returned by HarborNAS
-- `HarborNAS -> IM Gateway`
+  - do not retry on explicit business failure returned by HarborBeacon
+- `HarborBeacon -> IM Gateway`
   - request timeout SHOULD default to 10 seconds
   - retry only when the delivery response declares `retryable=true`
 - IM Gateway idempotency key retention TTL SHOULD be at least 24 hours.
@@ -124,7 +124,7 @@ Both repos MUST log, when available:
 
 ### Content Ownership
 
-- HarborNAS owns business semantics.
+- HarborBeacon owns business semantics.
 - IM Gateway MAY adapt formatting for platform constraints, but it MUST NOT reinterpret, summarize, or rewrite business meaning contained in `TaskResponse` or notification payloads.
 
 ### Long-Running Task Policy
@@ -214,7 +214,7 @@ IM-specific metadata does not leak into `args`.
     "mentions": [
       {
         "id": "ou_bot_xxx",
-        "name": "HarborNAS Bot"
+        "name": "HarborBeacon Bot"
       }
     ],
     "attachments": []
@@ -226,9 +226,9 @@ IM-specific metadata does not leak into `args`.
 
 - `source.channel`, `source.surface`, `source.conversation_id`, `source.user_id`, and `source.route_key` are required for IM Gateway callers.
 - `source.route_key` is an opaque IM Gateway-owned route handle.
-- HarborNAS MUST treat `source.route_key` as write-only routing metadata.
-- HarborNAS SHOULD persist `source.route_key` in its business conversation state so later notifications can target the same IM route without HarborNAS storing platform-native recipient semantics.
-- `source.session_id` is ingress runtime metadata only. It MUST NOT be treated as the source of truth for HarborNAS business workflow state.
+- HarborBeacon MUST treat `source.route_key` as write-only routing metadata.
+- HarborBeacon SHOULD persist `source.route_key` in its business conversation state so later notifications can target the same IM route without HarborBeacon storing platform-native recipient semantics.
+- `source.session_id` is ingress runtime metadata only. It MUST NOT be treated as the source of truth for HarborBeacon business workflow state.
 
 ### `message` Block Contract
 
@@ -281,17 +281,17 @@ IM-specific metadata does not leak into `args`.
   - `channel`
   - `unknown`
 - `message.attachments` may be empty.
-- HarborNAS MUST treat `download.url` and access metadata as opaque transport contract details.
-- HarborNAS MUST NOT assume local filesystem access or platform-native file identifiers.
+- HarborBeacon MUST treat `download.url` and access metadata as opaque transport contract details.
+- HarborBeacon MUST NOT assume local filesystem access or platform-native file identifiers.
 
 ### Intent Ownership Rule
 
 v1.3 adopts the transitional compatibility model:
 
 - IM Gateway MUST populate `intent.domain` and `intent.action`
-- HarborNAS remains the owner of execution semantics, state, approvals, artifacts, and audit
+- HarborBeacon remains the owner of execution semantics, state, approvals, artifacts, and audit
 - this does not transfer business semantics ownership to IM Gateway
-- moving business intent resolution fully into HarborNAS is a future-version concern
+- moving business intent resolution fully into HarborBeacon is a future-version concern
 
 ### Inbound Idempotency Rule
 
@@ -303,12 +303,12 @@ v1.3 adopts the transitional compatibility model:
 - A new `task_id` means a new business task, even if `trace_id` is unchanged.
 - IM Gateway SHOULD derive or persist `task_id` from stable inbound event identity, such as platform plus conversation plus message id.
 - If no platform message id exists, IM Gateway MUST generate the `task_id` once and persist the mapping so retries reuse the same value.
-- HarborNAS MUST treat repeated `POST /api/tasks` calls with the same `task_id` as idempotent replays of the same task intent, not as a new business turn.
+- HarborBeacon MUST treat repeated `POST /api/tasks` calls with the same `task_id` as idempotent replays of the same task intent, not as a new business turn.
 
 ### Inbound Idempotency Conflict Rule
 
-If HarborNAS receives a repeated `task_id`, it MUST compare the new request
-against the original request identity. At minimum, HarborNAS MUST compare:
+If HarborBeacon receives a repeated `task_id`, it MUST compare the new request
+against the original request identity. At minimum, HarborBeacon MUST compare:
 
 - `source.route_key`
 - `source.conversation_id`
@@ -320,18 +320,18 @@ against the original request identity. At minimum, HarborNAS MUST compare:
 - normalized `args`
 
 If the repeated `task_id` is accompanied by a materially different request
-identity, HarborNAS MUST reject it with:
+identity, HarborBeacon MUST reject it with:
 
 - HTTP 409
 - error code `IDEMPOTENCY_CONFLICT`
 
-HarborNAS MUST NOT silently overwrite the previously accepted business task
+HarborBeacon MUST NOT silently overwrite the previously accepted business task
 identity for an existing `task_id`.
 
 ### Backward Compatibility
 
 - Legacy non-IM callers may omit `message` and `source.route_key`.
-- HarborNAS may initially treat those fields as optional during rollout for legacy callers only.
+- HarborBeacon may initially treat those fields as optional during rollout for legacy callers only.
 - Once IM Gateway is the primary IM caller, `message` and `source.route_key` should be treated as required for IM surfaces.
 
 ### Response Contract
@@ -386,9 +386,9 @@ Failure shape:
 
 ### Response Rules
 
-- For supported turns, HarborNAS SHOULD return HTTP 200 with a business `TaskResponse`, even when `status=failed`.
+- For supported turns, HarborBeacon SHOULD return HTTP 200 with a business `TaskResponse`, even when `status=failed`.
 - 4xx and 5xx are reserved for contract, auth, idempotency, or infrastructure failures.
-- `status=needs_input` with `prompt` and `resume_token` continues the same HarborNAS-owned business flow.
+- `status=needs_input` with `prompt` and `resume_token` continues the same HarborBeacon-owned business flow.
 
 ### Gateway Reply Mapping
 
@@ -401,9 +401,9 @@ IM Gateway should map `TaskResponse` to user-visible replies as follows:
 - `result.next_actions`
   - optional suggestion chips or appended text
 - `status=needs_input` with `prompt` and `resume_token`
-  - continue the same HarborNAS-owned business flow
+  - continue the same HarborBeacon-owned business flow
 - `status=failed`
-  - render failure message without reinterpreting HarborNAS business semantics
+  - render failure message without reinterpreting HarborBeacon business semantics
 
 ## Interface 2: Outbound Notification Delivery Interface
 
@@ -420,7 +420,7 @@ This endpoint is hosted by IM Gateway.
   "notification_id": "notif_01JABC...",
   "trace_id": "trace_01JABC...",
   "source": {
-    "service": "harbornas",
+    "service": "harborbeacon",
     "module": "task_api",
     "event_type": "task.completed"
   },
@@ -457,25 +457,25 @@ This endpoint is hosted by IM Gateway.
 
 - `destination.route_key` is the preferred outbound routing identifier in v1.3.
 - `route_key` is opaque and owned only by IM Gateway.
-- HarborNAS MUST treat `route_key` as write-only routing metadata and MUST NOT infer platform semantics from it.
-- If HarborNAS is replying into the same IM conversation that produced an inbound task request, it SHOULD reuse the previously persisted `source.route_key` as `destination.route_key`.
+- HarborBeacon MUST treat `route_key` as write-only routing metadata and MUST NOT infer platform semantics from it.
+- If HarborBeacon is replying into the same IM conversation that produced an inbound task request, it SHOULD reuse the previously persisted `source.route_key` as `destination.route_key`.
 - Routing fallback priority SHOULD be:
   1. `destination.route_key`
   2. `{destination.platform, destination.id}`
   3. explicit `destination.recipient`
-- HarborNAS SHOULD NOT depend on platform-native identifiers once `route_key` is available.
+- HarborBeacon SHOULD NOT depend on platform-native identifiers once `route_key` is available.
 
 ### Route Lifetime Rule
 
 - IM Gateway owns route key lifecycle and registry.
 - If a `route_key` is no longer usable, IM Gateway MUST return a machine-readable failure such as `ROUTE_NOT_FOUND` or `ROUTE_EXPIRED`.
-- HarborNAS MAY fall back to explicit legacy recipient fields only when they are present and only during migration.
+- HarborBeacon MAY fall back to explicit legacy recipient fields only when they are present and only during migration.
 
 ### Notification Rules
 
-- HarborNAS produces notification intent only.
+- HarborBeacon produces notification intent only.
 - IM Gateway performs actual platform delivery.
-- HarborNAS MUST NOT attach platform credentials to this request.
+- HarborBeacon MUST NOT attach platform credentials to this request.
 - `delivery.mode` MUST be one of:
   - `send`
   - `reply`
@@ -572,8 +572,8 @@ two frozen core interfaces above.
 
 ### Purpose
 
-This endpoint allows HarborNAS UI or setup flows to read redacted IM Gateway
-status without requiring HarborNAS to store raw platform credentials.
+This endpoint allows HarborBeacon UI or setup flows to read redacted IM Gateway
+status without requiring HarborBeacon to store raw platform credentials.
 
 ### Recommended Response Shape
 
@@ -586,7 +586,7 @@ status without requiring HarborNAS to store raw platform credentials.
       "platform": "feishu",
       "enabled": true,
       "connected": true,
-      "display_name": "HarborNAS Bot",
+      "display_name": "HarborBeacon Bot",
       "capabilities": {
         "reply": true,
         "update": true,
@@ -601,28 +601,28 @@ Rules:
 
 - the response MUST be redacted
 - raw platform credentials MUST NOT be returned
-- HarborNAS MAY consume this endpoint for UI status only
+- HarborBeacon MAY consume this endpoint for UI status only
 - this endpoint MUST NOT be treated as a replacement for either frozen business interface
 
 ## Business Session Truth
 
-HarborNAS persists business conversation state in `.harbornas/task-api-conversations.json`.
+HarborBeacon persists business conversation state in `.harborbeacon/task-api-conversations.json`.
 
 That means:
 
-- resumable workflow truth stays in HarborNAS
+- resumable workflow truth stays in HarborBeacon
 - IM Gateway may keep only transport session helpers
 - IM Gateway MUST NOT become the source of truth for workflow or business state
 
 ## Credential and Setup Boundary
 
-- HarborNAS direct platform delivery is transitional and must be removed after rollout of the notification interface.
-- HarborNAS direct platform credential validation is also transitional and should be removed from long-term architecture.
-- If HarborNAS needs to show "connected" or "credential verified" in UI, the preferred long-term model is:
+- HarborBeacon direct platform delivery is transitional and must be removed after rollout of the notification interface.
+- HarborBeacon direct platform credential validation is also transitional and should be removed from long-term architecture.
+- If HarborBeacon needs to show "connected" or "credential verified" in UI, the preferred long-term model is:
   - IM Gateway stores and validates platform credentials
   - IM Gateway exposes a redacted status result or admin API
-  - HarborNAS consumes only connection status, app display name, or route capability metadata
-- HarborNAS SHOULD NOT remain the owner of raw `app_id`, `app_secret`, bot token, or equivalent platform credentials after full cutover.
+  - HarborBeacon consumes only connection status, app display name, or route capability metadata
+- HarborBeacon SHOULD NOT remain the owner of raw `app_id`, `app_secret`, bot token, or equivalent platform credentials after full cutover.
 
 ## Recommended Private Models
 
@@ -633,7 +633,7 @@ These are private implementation details, not shared cross-repo contracts.
   - internal `OutboundMessage`
   - adapter runtime state
   - route registry records
-- HarborNAS private models:
+- HarborBeacon private models:
   - `TaskRequest`
   - `TaskResponse`
   - `NotificationRequest`
@@ -650,7 +650,7 @@ These are private implementation details, not shared cross-repo contracts.
   - platform delivery
   - platform credential and config management
   - message normalization and reply formatting
-- Engineer B: HarborNAS repo
+- Engineer B: HarborBeacon repo
   - `assistant_task_api`
   - business and task state machine
   - approval flow
@@ -661,17 +661,17 @@ These are private implementation details, not shared cross-repo contracts.
 ## Minimum Test Cases
 
 1. IM Gateway -> `POST /api/tasks` happy path with `source.route_key`, `message.message_id`, `chat_type`, `mentions`, and `attachments`.
-2. HarborNAS task resume path with `status=needs_input`, `prompt`, and `resume_token`.
+2. HarborBeacon task resume path with `status=needs_input`, `prompt`, and `resume_token`.
 3. Same inbound message retried with the same `task_id` does not create a second business task transition.
 4. Same inbound message retried with a different `task_id` is treated as a new task.
 5. Same `task_id` replayed with conflicting task identity is rejected with `409` and `IDEMPOTENCY_CONFLICT`.
-6. HarborNAS -> IM Gateway notification send using `destination.route_key` succeeds without HarborNAS providing platform-native recipient fields.
+6. HarborBeacon -> IM Gateway notification send using `destination.route_key` succeeds without HarborBeacon providing platform-native recipient fields.
 7. Notification retry with the same `idempotency_key` does not duplicate end-user delivery.
 8. Same `idempotency_key` replayed with conflicting notification payload is rejected with `409` and `IDEMPOTENCY_CONFLICT`.
 9. Expired or invalid attachment download metadata is rejected with a machine-readable error.
 10. Expired or missing `route_key` returns `ROUTE_NOT_FOUND` or `ROUTE_EXPIRED`.
 11. Invalid `delivery.mode` field combinations are rejected with `422` and `VALIDATION_ERROR`.
-12. HarborNAS build or contract test fails if direct IM platform credential usage remains in the notification delivery path after full cutover.
+12. HarborBeacon build or contract test fails if direct IM platform credential usage remains in the notification delivery path after full cutover.
 
 ## JSON Schema and Fixtures
 
@@ -689,10 +689,10 @@ These are private implementation details, not shared cross-repo contracts.
 
 1. First, make IM Gateway call `POST /api/tasks` and map `TaskResponse` back to user replies.
 2. In the same phase, ensure IM Gateway always provides stable `task_id`, `trace_id`, and `source.route_key` for retries of the same inbound event.
-3. Then, extract HarborNAS notification delivery behind the new HTTP notification interface.
-4. Then, persist and reuse `route_key` from HarborNAS business conversation state for follow-up notifications.
-5. Then, add the non-frozen redacted gateway status endpoint if HarborNAS UI needs connection state.
-6. Finally, remove HarborNAS direct IM platform delivery and direct platform credential validation so IM Gateway fully owns the IM layer.
+3. Then, extract HarborBeacon notification delivery behind the new HTTP notification interface.
+4. Then, persist and reuse `route_key` from HarborBeacon business conversation state for follow-up notifications.
+5. Then, add the non-frozen redacted gateway status endpoint if HarborBeacon UI needs connection state.
+6. Finally, remove HarborBeacon direct IM platform delivery and direct platform credential validation so IM Gateway fully owns the IM layer.
 
 ## Release Gate
 
@@ -700,9 +700,9 @@ A release is allowed only when:
 
 - both frozen interfaces have contract tests
 - one real IM round-trip passes through `IM Gateway -> /api/tasks -> TaskResponse -> user reply`
-- one real notification round-trip passes through `HarborNAS -> IM Gateway -> platform delivery`
+- one real notification round-trip passes through `HarborBeacon -> IM Gateway -> platform delivery`
 - same-message retry with the same `task_id` is proven idempotent
 - conflicting replay of the same `task_id` is proven rejected
 - conflicting replay of the same `delivery.idempotency_key` is proven rejected
-- HarborNAS no longer depends on platform credentials for IM notification delivery
-- the intended migration plan away from HarborNAS-owned platform credential validation is agreed and tracked
+- HarborBeacon no longer depends on platform credentials for IM notification delivery
+- the intended migration plan away from HarborBeacon-owned platform credential validation is agreed and tracked
