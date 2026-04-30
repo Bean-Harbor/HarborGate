@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -5,7 +6,7 @@ from unittest.mock import patch
 from im_agent.brain import RuleBasedBrain
 from im_agent.errors import GatewayContractError
 from im_agent.gateway import GatewayService
-from im_agent.harborbeacon import TaskTurnResult
+from im_agent.harborbeacon import HarborBeaconTaskClient, TaskTurnResult
 from im_agent.models import InboundMessage, OutboundMessage
 from im_agent.platforms.base import PlatformAdapter
 from im_agent.platforms.placeholder import (
@@ -1526,11 +1527,114 @@ class GatewayServiceTests(unittest.TestCase):
 
                 self.assertEqual(response["text"], "找到 4 张和春天相关的照片，先发最相关的 3 张。")
                 self.assertEqual(response["metadata"]["retrieval_render"]["content_kind"], "plain_reply")
+                self.assertEqual(response["metadata"]["retrieval_render"]["artifact_count"], 4)
                 self.assertEqual(response["metadata"]["native_attachment_count"], 3)
                 self.assertEqual(len(response["attachments"]), 3)
                 self.assertEqual([item["kind"] for item in response["attachments"]], ["image", "image", "image"])
                 self.assertEqual(response["attachments"][0]["path"], image_paths[0].name)
                 self.assertEqual(response["attachments"][2]["path"], image_paths[2].name)
+                self.assertNotIn(image_paths[3].name, [item["path"] for item in response["attachments"]])
+                self.assertNotIn("附件", response["text"])
+            finally:
+                for image_path in image_paths:
+                    image_path.close()
+
+    def test_v20_turn_response_with_four_weixin_images_keeps_contract_and_caps_native_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_paths = [
+                tempfile.NamedTemporaryFile(dir=tmp, suffix=f"-{index}.jpg", delete=False)
+                for index in range(4)
+            ]
+            try:
+                for image_path in image_paths:
+                    image_path.write(b"fake-jpeg")
+                    image_path.close()
+                artifacts = [
+                    {
+                        "kind": "image",
+                        "label": f"RAG image {index}",
+                        "mime_type": "image/jpeg",
+                        "media_asset_id": f"asset-rag-{index}",
+                        "path": image_path.name,
+                        "metadata": {"artifact_role": "rag_image_hit"},
+                    }
+                    for index, image_path in enumerate(image_paths, start=1)
+                ]
+                captured: dict[str, object] = {}
+
+                class FakeHttpResponse:
+                    def __enter__(self):  # type: ignore[no-untyped-def]
+                        return self
+
+                    def __exit__(self, exc_type, exc, tb):  # type: ignore[no-untyped-def]
+                        return False
+
+                    def read(self) -> bytes:
+                        return json.dumps(
+                            {
+                                "turn": {
+                                    "turn_id": "turn_mmrag_images",
+                                    "trace_id": "trace_mmrag_images",
+                                    "status": "completed",
+                                },
+                                "conversation": {"handle": "conv_mmrag_images"},
+                                "reply": {
+                                    "kind": "tool_result",
+                                    "text": "找到 4 张和春天相关的照片，先发最相关的 3 张。",
+                                },
+                                "artifacts": artifacts,
+                                "delivery_hints": [
+                                    {
+                                        "kind": "native_image",
+                                        "artifact_id": "asset-rag-1",
+                                        "fallback": "text",
+                                        "metadata": {"max_items": 4},
+                                    }
+                                ],
+                                "observability": {"artifact_count": 4},
+                                "error": None,
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+
+                def fake_urlopen(req, timeout):  # type: ignore[no-untyped-def]
+                    captured["url"] = req.full_url
+                    captured["selector"] = req.selector
+                    captured["contract_version"] = req.get_header("X-contract-version")
+                    captured["request_payload"] = json.loads(req.data.decode("utf-8"))
+                    captured["timeout"] = timeout
+                    return FakeHttpResponse()
+
+                gateway = GatewayService(
+                    store=FileSessionStore(tmp, max_turns=10),
+                    brain=RuleBasedBrain(),
+                    task_client=HarborBeaconTaskClient(
+                        base_url="http://harborbeacon.local",
+                        api_token="task-secret",
+                    ),
+                )
+                gateway.register_adapter(FakeNativeWeixinAdapter())
+
+                with patch("im_agent.harborbeacon.request.urlopen", side_effect=fake_urlopen):
+                    response = gateway.handle_inbound(
+                        "weixin",
+                        {
+                            "chat_id": "wx-user-1",
+                            "user_id": "wx-user-1",
+                            "text": "找到和春天相关的照片",
+                            "message_id": "wx-msg-native-image-rag-v20-1",
+                        },
+                    )
+
+                self.assertEqual(captured["selector"], "/api/turns")
+                self.assertEqual(captured["contract_version"], "2.0")
+                self.assertNotIn("/api/tasks", str(captured["url"]))
+                self.assertNotIn("resume_token", json.dumps(captured["request_payload"]))
+                self.assertEqual(response["text"], "找到 4 张和春天相关的照片，先发最相关的 3 张。")
+                self.assertEqual(response["metadata"]["retrieval_render"]["artifact_count"], 4)
+                self.assertEqual(response["metadata"]["native_attachment_count"], 3)
+                self.assertEqual(len(response["attachments"]), 3)
+                self.assertEqual([item["path"] for item in response["attachments"]], [item.name for item in image_paths[:3]])
                 self.assertNotIn(image_paths[3].name, [item["path"] for item in response["attachments"]])
                 self.assertNotIn("附件", response["text"])
             finally:
