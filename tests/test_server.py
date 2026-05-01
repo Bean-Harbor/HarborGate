@@ -1195,6 +1195,8 @@ class NotificationServerTests(unittest.TestCase):
 
                 self.assertEqual(response.status, 200)
                 self.assertIn("飞书连接", body)
+                self.assertIn('href="/ui/harbordesk"', body)
+                self.assertIn("返回 HarborDesk", body)
                 self.assertNotIn("Feishu 手机配置页", body)
             finally:
                 server.shutdown()
@@ -1228,6 +1230,8 @@ class NotificationServerTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertIn("微信连接", body)
                 self.assertIn("绑定微信", body)
+                self.assertIn('href="/ui/harbordesk"', body)
+                self.assertIn("返回 HarborDesk", body)
                 self.assertIn("/api/setup/weixin/unbind", body)
                 self.assertNotIn("HarborGate Weixin 配置", body)
                 self.assertNotIn("Feishu 手机配置页", body)
@@ -1573,6 +1577,8 @@ class NotificationServerTests(unittest.TestCase):
 
                 self.assertIn("飞书连接", feishu_body)
                 self.assertIn("微信连接", weixin_body)
+                self.assertIn("返回 HarborDesk", feishu_body)
+                self.assertIn("返回 HarborDesk", weixin_body)
                 self.assertNotIn("Feishu 手机配置页", weixin_body)
                 self.assertNotIn("扫码后直接填飞书凭证", weixin_body)
             finally:
@@ -1624,6 +1630,8 @@ class NotificationServerTests(unittest.TestCase):
                     ) as response:
                         body = response.read().decode("utf-8")
 
+                    self.assertIn('href="/ui/harbordesk"', body)
+                    self.assertIn("返回 HarborDesk", body)
                     visible = _visible_html_text(body)
                     for term in forbidden:
                         self.assertNotIn(term, visible, path)

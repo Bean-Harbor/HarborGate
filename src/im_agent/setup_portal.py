@@ -143,6 +143,24 @@ body {
   padding: 28px 18px 52px;
 }
 .wrap.narrow { max-width: 560px; text-align: center; }
+.topbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 14px;
+}
+.back-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: #fff;
+  border: 1px solid var(--primary);
+  color: var(--primary);
+  font-weight: 700;
+  text-decoration: none;
+}
+.back-link:hover { background: var(--surface-soft); }
 .card {
   background: rgba(255, 255, 255, 0.96);
   border: 1px solid var(--border);
@@ -254,6 +272,9 @@ def _portal_document(*, title: str, body: str, narrow: bool = False) -> str:
 </head>
 <body>
   <main class="{wrap_class}">
+    <nav class="topbar" aria-label="页面导航">
+      <a class="back-link" href="/ui/harbordesk">返回 HarborDesk</a>
+    </nav>
     {body}
   </main>
 </body>
