@@ -33,11 +33,12 @@ Management documents:
 - a small adapter registry so platforms are plugged into one gateway flow
 - a generic `WebhookAdapter` that we can use immediately
 - a first-pass `WeixinAdapter` for personal WeChat text messages
-- a `FeishuAdapter` with websocket-first receive mode and real text send
+- a `FeishuAdapter` with websocket-first receive mode, real text send, native image send, and card-action normalization
 - a file-based session store
 - a default rule-based brain for local testing
 - an optional OpenAI-compatible backend through environment variables
-- a tiny HTTP server using the Python standard library
+- a Python fallback runtime for rollback
+- a Rust HarborGate runtime (`harborgate`) for setup/admin pages, Feishu, Weixin, webhook, delivery, and runtime supervision
 
 ## Hermes-style platform coverage
 
@@ -95,6 +96,28 @@ python -m im_agent.server
 ```
 
 The server starts on `127.0.0.1:8787` by default.
+
+## Rust runtime
+
+Rust is the default HarborGate runtime. Python remains packaged as an explicit
+rollback fallback:
+
+```powershell
+cargo test
+cargo build --release --bin harborgate
+$env:HARBORGATE_RUNTIME='rust'
+.\target\release\harborgate.exe
+```
+
+The release bundle can also use the `harborgate` binary alias because HarborBeacon
+copies the Rust gateway into `harborgate/bin/harborgate`.
+
+Important runtime defaults:
+
+- `HARBORGATE_RUNTIME=rust` is the release default.
+- `HARBORGATE_RUNTIME=python` is reserved for rollback.
+- `HARBORGATE_RUNTIME=auto` may still select Rust when the binary is present.
+- `HARBORGATE_RUST_FEISHU_WEBSOCKET=0` can disable Feishu websocket receive when needed.
 
 PowerShell:
 
@@ -425,16 +448,16 @@ Current Feishu scope:
 - runs Feishu in websocket / long-connection mode by default
 - accepts Feishu-style webhook callbacks for `im.message.receive_v1` when explicitly switched to webhook mode
 - handles `url_verification` challenge callbacks
-- normalizes direct-message text events into the internal model
+- normalizes direct-message text, image, and card-action events into the internal model
 - leaves group-message gates at the adapter boundary
 - enforces explicit `@mention` for group events
-- can send real text messages through the Feishu Open Platform API when live send is enabled
+- can send real text and native image messages through the Feishu Open Platform API when live send is enabled
+- keeps an interactive-card send path for card-mode delivery
 - supports mobile configuration through `/setup` and `/setup/qr`
 - starts and stops the live Feishu transport from the unified `GatewayService`
 
 Current Feishu limitations:
 
-- no media/card/reaction handling yet
 - no message update support yet
 
 Recommended Feishu setup:
