@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 from im_agent import weixin_runner
@@ -88,3 +89,20 @@ class WeixinRunnerModuleTests(unittest.TestCase):
                     path.unlink()
 
                 self.assertTrue(weixin_runner._weixin_adapter_should_reload(adapter))
+
+    def test_run_loop_can_stop_while_waiting_for_credentials(self) -> None:
+        stop_event = Event()
+        sleep_calls = []
+        gateway = _FakeGateway(adapter=None)
+
+        def stop_after_first_sleep(seconds: int) -> None:
+            sleep_calls.append(seconds)
+            stop_event.set()
+
+        weixin_runner.run_loop(
+            stop_event=stop_event,
+            gateway=gateway,
+            sleep_fn=stop_after_first_sleep,
+        )
+
+        self.assertEqual(sleep_calls, [5])

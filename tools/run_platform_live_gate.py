@@ -1034,7 +1034,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--task-api-url",
         default="",
-        help="Optional HarborBeacon task API URL to run synthetic gateway -> HarborBeacon rehearsal.",
+        help="Optional HarborBeacon web API URL to run synthetic gateway -> HarborBeacon rehearsal.",
     )
     parser.add_argument(
         "--task-api-token",

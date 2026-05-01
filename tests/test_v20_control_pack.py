@@ -20,7 +20,8 @@ def test_v20_control_pack_documents_exist_and_are_active() -> None:
     assert not missing
 
     contract = _read(ROOT / "HarborBeacon-HarborGate-Agent-Contract-v2.0.md")
-    assert "POST /api/turns" in contract
+    assert "POST /api/web/turns" in contract
+    assert "`POST /api/turns` remains a deprecated compatibility alias" in contract
     assert "conversation.handle" in contract
     assert "active_frame" in contract
     assert "continuation" in contract

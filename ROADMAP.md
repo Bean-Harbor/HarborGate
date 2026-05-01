@@ -37,7 +37,7 @@ Exit criteria:
 
 Status: planned
 
-- Make HarborGate send canonical `POST /api/turns` requests.
+- Make HarborGate send canonical `POST /api/web/turns` requests.
 - Ensure stable inbound idempotency with `turn_id`, `trace_id`,
   `transport.message_id`, and `transport.route_key`.
 - Map HarborBeacon v2 turn responses back into user-visible IM replies without
@@ -46,7 +46,7 @@ Status: planned
 Exit criteria:
 
 - Real IM inbound round-trip passes through
-  `HarborGate -> /api/turns -> v2 turn response -> user reply`.
+  `HarborGate -> /api/web/turns -> v2 turn response -> user reply`.
 - Same-message retry with the same `turn_id` is proven idempotent.
 - Conflicting replay of the same `turn_id` is rejected.
 

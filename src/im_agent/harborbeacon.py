@@ -16,6 +16,7 @@ DEFAULT_INTENT_ACTION = "message"
 DEFAULT_SOURCE_SURFACE = "harborgate"
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_ADMIN_TIMEOUT_SECONDS = 10
+DEFAULT_TURN_ENDPOINT = "/api/web/turns"
 TASK_ARGS_KEY = "ar" + "gs"
 
 
@@ -247,6 +248,7 @@ class TaskTurnResult:
 class HarborBeaconTaskClient:
     base_url: str
     api_token: str = ""
+    turn_endpoint: str = DEFAULT_TURN_ENDPOINT
     contract_version: str = DEFAULT_CONTRACT_VERSION
     autonomy_level: str = DEFAULT_AUTONOMY_LEVEL
     default_domain: str = DEFAULT_INTENT_DOMAIN
@@ -268,7 +270,7 @@ class HarborBeaconTaskClient:
             default_action=self.default_action,
             source_surface=self.source_surface,
         )
-        response_payload = self._post_json("/api/turns", request_payload)
+        response_payload = self._post_json(self.turn_endpoint, request_payload)
         return self._map_turn_response(request_payload, response_payload)
 
     def _post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -452,13 +454,19 @@ class HarborBeaconAdminClient:
 
 
 def build_harborbeacon_client_from_env() -> HarborBeaconTaskClient | None:
-    base_url = _env("HARBORBEACON_TASK_API_URL")
+    turn_endpoint = _env("HARBORBEACON_TURN_ENDPOINT") or DEFAULT_TURN_ENDPOINT
+    if not turn_endpoint.startswith("/"):
+        turn_endpoint = f"/{turn_endpoint}"
+    base_url = _env("HARBORBEACON_WEB_API_URL") or _env("HARBORBEACON_TASK_API_URL")
+    base_url = _strip_endpoint_suffix(base_url, turn_endpoint)
+    base_url = _strip_endpoint_suffix(base_url, DEFAULT_TURN_ENDPOINT)
     base_url = _strip_endpoint_suffix(base_url, "/api/turns")
     if not base_url:
         return None
     return HarborBeaconTaskClient(
         base_url=base_url,
-        api_token=_env("HARBORBEACON_TASK_API_TOKEN"),
+        api_token=_env("HARBORBEACON_WEB_API_TOKEN") or _env("HARBORBEACON_TASK_API_TOKEN"),
+        turn_endpoint=turn_endpoint,
         contract_version=_env("HARBORBEACON_CONTRACT_VERSION") or DEFAULT_CONTRACT_VERSION,
         autonomy_level=_env("HARBORBEACON_AUTONOMY_LEVEL") or DEFAULT_AUTONOMY_LEVEL,
         default_domain=_env("HARBORBEACON_DEFAULT_DOMAIN") or DEFAULT_INTENT_DOMAIN,
@@ -472,7 +480,12 @@ def build_harborbeacon_client_from_env() -> HarborBeaconTaskClient | None:
 
 
 def build_harborbeacon_admin_client_from_env() -> HarborBeaconAdminClient | None:
-    base_url = _env("HARBORBEACON_ADMIN_API_URL") or _env("HARBORBEACON_TASK_API_URL")
+    base_url = (
+        _env("HARBORBEACON_ADMIN_API_URL")
+        or _env("HARBORBEACON_WEB_API_URL")
+        or _env("HARBORBEACON_TASK_API_URL")
+    )
+    base_url = _strip_endpoint_suffix(base_url, DEFAULT_TURN_ENDPOINT)
     base_url = _strip_endpoint_suffix(base_url, "/api/turns")
     if not base_url:
         return None
@@ -480,6 +493,7 @@ def build_harborbeacon_admin_client_from_env() -> HarborBeaconAdminClient | None
         base_url=base_url,
         api_token=(
             _env("HARBORBEACON_ADMIN_API_TOKEN")
+            or _env("HARBORBEACON_WEB_API_TOKEN")
             or _env("HARBORBEACON_TASK_API_TOKEN")
             or _env("IM_AGENT_SERVICE_TOKEN")
         ),

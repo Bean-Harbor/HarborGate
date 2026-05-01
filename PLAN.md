@@ -19,7 +19,7 @@ Build the HarborGate side of the v2.0 seam while keeping the boundary clean:
 
 ## Success Criteria
 
-- HarborGate receives a real IM message and sends a canonical `POST /api/turns`
+- HarborGate receives a real IM message and sends a canonical `POST /api/web/turns`
   request to HarborBeacon.
 - HarborBeacon returns a v2 turn response with user-renderable `reply.text`.
 - HarborGate stores `conversation.handle` and `continuation` opaquely.
@@ -43,7 +43,7 @@ Status: planned
 
 - Replace the historical task-client path with a v2 turn client.
 - Use `X-Contract-Version: 2.0`.
-- Send inbound IM turns to `/api/turns`.
+- Send inbound IM turns to `/api/web/turns`.
 - Replace `message_task_ids` with `message_turn_ids`.
 
 ### Phase 2: Continuation Cache
@@ -95,4 +95,4 @@ Stop and ask before continuing when:
 
 - `python -m pytest`
 - targeted: `python -m pytest tests/test_gateway.py tests/test_harborbeacon.py tests/test_weixin_adapter.py tests/test_platform_live_gate.py`
-- live: `python .\tools\run_platform_live_gate.py --task-api-url http://127.0.0.1:4175 --task-api-token <shared-token>` after target confirmation
+- live: `python .\tools\run_platform_live_gate.py --task-api-url http://127.0.0.1:4174 --task-api-token <shared-token>` after target confirmation

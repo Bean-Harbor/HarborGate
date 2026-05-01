@@ -245,7 +245,7 @@ class HarborBeaconContractTests(unittest.TestCase):
                 },
             )
 
-            self.assertEqual(CaptureHandler.request_path, "/api/turns")
+            self.assertEqual(CaptureHandler.request_path, "/api/web/turns")
             self.assertEqual(CaptureHandler.request_headers["X-Contract-Version"], "2.0")
             self.assertEqual(CaptureHandler.request_headers["Authorization"], "Bearer secret-token")
             self.assertEqual(CaptureHandler.request_payload["continuation"]["token"], "cont_previous")
@@ -336,17 +336,24 @@ class HarborBeaconContractTests(unittest.TestCase):
 
     def test_env_builder_reads_harborbeacon_settings_only(self) -> None:
         previous = {
+            "HARBORBEACON_WEB_API_URL": os.environ.get("HARBORBEACON_WEB_API_URL"),
+            "HARBORBEACON_WEB_API_TOKEN": os.environ.get("HARBORBEACON_WEB_API_TOKEN"),
             "HARBORBEACON_TASK_API_URL": os.environ.get("HARBORBEACON_TASK_API_URL"),
+            "HARBORBEACON_TURN_ENDPOINT": os.environ.get("HARBORBEACON_TURN_ENDPOINT"),
             "HARBORBEACON_SOURCE_SURFACE": os.environ.get("HARBORBEACON_SOURCE_SURFACE"),
         }
-        os.environ["HARBORBEACON_TASK_API_URL"] = "http://127.0.0.1:4175"
+        os.environ["HARBORBEACON_WEB_API_URL"] = "http://127.0.0.1:4174/api/web/turns"
+        os.environ.pop("HARBORBEACON_WEB_API_TOKEN", None)
+        os.environ["HARBORBEACON_TASK_API_URL"] = "http://127.0.0.1:4174"
+        os.environ.pop("HARBORBEACON_TURN_ENDPOINT", None)
         os.environ["HARBORBEACON_SOURCE_SURFACE"] = "im_gateway"
         self.addCleanup(self._restore_env, previous)
 
         client = build_harborbeacon_client_from_env()
         self.assertIsNotNone(client)
         assert client is not None
-        self.assertEqual(client.base_url, "http://127.0.0.1:4175")
+        self.assertEqual(client.base_url, "http://127.0.0.1:4174")
+        self.assertEqual(client.turn_endpoint, "/api/web/turns")
         self.assertEqual(client.source_surface, "im_gateway")
 
     def test_admin_client_posts_notification_target_with_service_auth(self) -> None:
@@ -392,13 +399,17 @@ class HarborBeaconContractTests(unittest.TestCase):
 
     def test_admin_env_builder_falls_back_to_task_api_url_and_token(self) -> None:
         previous = {
+            "HARBORBEACON_WEB_API_URL": os.environ.get("HARBORBEACON_WEB_API_URL"),
+            "HARBORBEACON_WEB_API_TOKEN": os.environ.get("HARBORBEACON_WEB_API_TOKEN"),
             "HARBORBEACON_TASK_API_URL": os.environ.get("HARBORBEACON_TASK_API_URL"),
             "HARBORBEACON_TASK_API_TOKEN": os.environ.get("HARBORBEACON_TASK_API_TOKEN"),
             "HARBORBEACON_ADMIN_API_URL": os.environ.get("HARBORBEACON_ADMIN_API_URL"),
             "HARBORBEACON_ADMIN_API_TOKEN": os.environ.get("HARBORBEACON_ADMIN_API_TOKEN"),
             "IM_AGENT_SERVICE_TOKEN": os.environ.get("IM_AGENT_SERVICE_TOKEN"),
         }
-        os.environ["HARBORBEACON_TASK_API_URL"] = "http://127.0.0.1:4175/api/turns"
+        os.environ["HARBORBEACON_WEB_API_URL"] = "http://127.0.0.1:4174/api/web/turns"
+        os.environ.pop("HARBORBEACON_WEB_API_TOKEN", None)
+        os.environ["HARBORBEACON_TASK_API_URL"] = "http://127.0.0.1:4174/api/web/turns"
         os.environ["HARBORBEACON_TASK_API_TOKEN"] = "task-token"
         os.environ.pop("HARBORBEACON_ADMIN_API_URL", None)
         os.environ.pop("HARBORBEACON_ADMIN_API_TOKEN", None)
@@ -408,17 +419,21 @@ class HarborBeaconContractTests(unittest.TestCase):
         client = build_harborbeacon_admin_client_from_env()
         self.assertIsNotNone(client)
         assert client is not None
-        self.assertEqual(client.base_url, "http://127.0.0.1:4175")
+        self.assertEqual(client.base_url, "http://127.0.0.1:4174")
         self.assertEqual(client.api_token, "task-token")
 
     def test_admin_env_builder_prefers_explicit_admin_url_and_token(self) -> None:
         previous = {
+            "HARBORBEACON_WEB_API_URL": os.environ.get("HARBORBEACON_WEB_API_URL"),
+            "HARBORBEACON_WEB_API_TOKEN": os.environ.get("HARBORBEACON_WEB_API_TOKEN"),
             "HARBORBEACON_TASK_API_URL": os.environ.get("HARBORBEACON_TASK_API_URL"),
             "HARBORBEACON_TASK_API_TOKEN": os.environ.get("HARBORBEACON_TASK_API_TOKEN"),
             "HARBORBEACON_ADMIN_API_URL": os.environ.get("HARBORBEACON_ADMIN_API_URL"),
             "HARBORBEACON_ADMIN_API_TOKEN": os.environ.get("HARBORBEACON_ADMIN_API_TOKEN"),
         }
-        os.environ["HARBORBEACON_TASK_API_URL"] = "http://127.0.0.1:4175/api/turns"
+        os.environ["HARBORBEACON_WEB_API_URL"] = "http://127.0.0.1:4174"
+        os.environ.pop("HARBORBEACON_WEB_API_TOKEN", None)
+        os.environ["HARBORBEACON_TASK_API_URL"] = "http://127.0.0.1:4174/api/web/turns"
         os.environ["HARBORBEACON_TASK_API_TOKEN"] = "task-token"
         os.environ["HARBORBEACON_ADMIN_API_URL"] = "http://127.0.0.1:4174"
         os.environ["HARBORBEACON_ADMIN_API_TOKEN"] = "admin-token"

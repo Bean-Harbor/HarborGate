@@ -1626,7 +1626,7 @@ class GatewayServiceTests(unittest.TestCase):
                         },
                     )
 
-                self.assertEqual(captured["selector"], "/api/turns")
+                self.assertEqual(captured["selector"], "/api/web/turns")
                 self.assertEqual(captured["contract_version"], "2.0")
                 self.assertNotIn("/api/tasks", str(captured["url"]))
                 self.assertNotIn("resume_token", json.dumps(captured["request_payload"]))

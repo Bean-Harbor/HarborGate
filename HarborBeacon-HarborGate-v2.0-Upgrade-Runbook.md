@@ -30,7 +30,7 @@ The v1.5 documents are historical references only.
 
 - Replace task-client request building with v2 turn request building.
 - Default to `X-Contract-Version: 2.0`.
-- Submit inbound IM turns to `/api/turns`.
+- Submit inbound IM turns to `/api/web/turns`.
 - Store Beacon-owned `conversation.handle` opaquely.
 
 ### Phase 3: Continuation Cache
@@ -90,7 +90,7 @@ Record:
 ## 2026-04-26 Closeout
 
 - Completed: active Gate client now emits v2.0 turn envelopes to
-  `/api/turns`, caches only opaque `conversation_handle` and `continuation`,
+  `/api/web/turns`, caches only opaque `conversation_handle` and `continuation`,
   keeps continuation for completed turns that still carry an active frame, and
   keeps Weixin native video/file delivery driven by `delivery_hints`.
 - Changed files: `src/im_agent/harborbeacon.py`, `src/im_agent/gateway.py`,

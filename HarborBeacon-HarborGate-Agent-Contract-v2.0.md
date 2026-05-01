@@ -61,7 +61,10 @@ non-200 error envelope and `CONTRACT_VERSION_MISMATCH`.
 
 ### Endpoint
 
-`POST /api/turns`
+`POST /api/web/turns`
+
+`POST /api/turns` remains a deprecated compatibility alias for the HarborBeacon
+single-port cutover window.
 
 This endpoint replaces HarborGate use of `POST /api/tasks`.
 

@@ -130,7 +130,7 @@ pytest tests/test_platform_live_gate.py tests/test_gateway.py tests/test_weixin_
 
 - Preserved the v2.0 control pack as a separate commit.
 - Switched the active HarborBeacon client default to `X-Contract-Version: 2.0`
-  and `POST /api/turns`.
+  and `POST /api/web/turns`.
 - Replaced request-time `resume_token` metadata with opaque `continuation`
   storage.
 - Added coverage that Gate preserves an opaque continuation when Beacon returns
@@ -139,7 +139,7 @@ pytest tests/test_platform_live_gate.py tests/test_gateway.py tests/test_weixin_
 - Kept Weixin native video/file delivery in Gate, now driven by v2
   `delivery_hints`.
 - Deployed the fresh Beacon frame-first bundle to `.182`; the direct
-  `/api/turns` matrix now proves clip-confirmation feedback and boundary turns
+  `/api/web/turns` matrix now proves clip-confirmation feedback and boundary turns
   preserve continuation until playback or cancel.
 - Renamed local release observability from `release_v1` to `release_v2`.
 - Changed files: `src/im_agent/harborbeacon.py`, `src/im_agent/gateway.py`,

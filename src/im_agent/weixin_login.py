@@ -11,6 +11,5 @@ def main() -> None:
     if result is None:
         raise SystemExit(1)
 
-    print("\n登录已保存到本机 Weixin state dir。下一步启动 runner：")
-    print("harborgate-weixin-runner")
+    print("\n登录已保存到本机 Weixin state dir。下一步重启或启动 harborgate.service；Weixin runtime 会在进程内启动。")
     print(f"account_id={result.account_id}")

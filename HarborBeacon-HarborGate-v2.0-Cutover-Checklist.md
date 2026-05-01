@@ -20,7 +20,7 @@ Control-pack readiness requires:
 ## Code Cutover Checklist
 
 - HarborGate defaults to `X-Contract-Version: 2.0`.
-- HarborGate submits inbound IM turns to `/api/turns`.
+- HarborGate submits inbound IM turns to `/api/web/turns`.
 - Gate stores Beacon-owned `conversation.handle` opaquely.
 - Gate stores continuation values opaquely.
 - Gate stops emitting `args.resume_token`.

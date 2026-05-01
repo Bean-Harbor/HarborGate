@@ -154,12 +154,12 @@ Supported contract:
 - `POST {LLM_BASE_URL}/chat/completions`
 - OpenAI-compatible JSON response shape
 
-## HarborBeacon task API mode
+## HarborBeacon web turn API mode
 
-If `HARBORBEACON_TASK_API_URL` is set, the current code still uses the historical v1.5 task client. This is now a v2.0 drift item and must be replaced by the `/api/turns` client before release.
+If `HARBORBEACON_WEB_API_URL` or `HARBORBEACON_TASK_API_URL` is set, HarborGate posts v2.0 turn envelopes to HarborBeacon. The default endpoint is `/api/web/turns`; `/api/turns` is accepted only as a deprecated compatibility alias during the Beacon single-port cutover.
 
 ```powershell
-$env:HARBORBEACON_TASK_API_URL='http://127.0.0.1:9000'
+$env:HARBORBEACON_WEB_API_URL='http://127.0.0.1:4174'
 $env:HARBORBEACON_TASK_API_TOKEN='replace-me'
 $env:HARBORBEACON_CONTRACT_VERSION='2.0'
 $env:HARBORBEACON_DEFAULT_DOMAIN='general'
@@ -167,14 +167,7 @@ $env:HARBORBEACON_DEFAULT_ACTION='message'
 $env:HARBORBEACON_AUTONOMY_LEVEL='supervised'
 ```
 
-Historical drift in this mode:
-
-- the current implementation still builds task requests instead of v2 turn requests
-- it still derives task-style identity instead of `turn.turn_id`
-- it still stores task-style continuation metadata
-- it must be replaced before the v2.0 release gate can pass
-
-If `HARBORBEACON_TASK_API_URL` is unset, the gateway falls back to the local rule-based brain or the OpenAI-compatible backend.
+If both HarborBeacon URLs are unset, the gateway falls back to the local rule-based brain or the OpenAI-compatible backend.
 
 ## Current prelaunch scope
 
@@ -184,7 +177,7 @@ This repo currently treats the cross-repo prelaunch rehearsal like this:
 - Weixin `1:1` private DM is the active live surface for v2.0 proof
 - the redacted gateway summary may export transport `blocker_category` such as `weixin_dns_resolution`, but contract readiness is judged by the v2.0 runbook
 - only when the v2.0 private-DM matrix passes do we call the result ready
-- HarborBeacon v2.0 work must move active ingress to `POST /api/turns` while keeping notification delivery in HarborGate
+- HarborBeacon v2.0 active ingress uses `POST /api/web/turns` while keeping notification delivery in HarborGate
 - Weixin group chats remain explicitly out of scope for this round
 
 Recommended live-gate collector:
@@ -197,7 +190,7 @@ Optional HarborBeacon-backed rehearsal, when a task API endpoint is already runn
 
 ```powershell
 python .\tools\run_platform_live_gate.py `
-  --task-api-url http://127.0.0.1:4175 `
+  --task-api-url http://127.0.0.1:4174 `
   --task-api-token your-shared-token
 ```
 
@@ -375,13 +368,13 @@ $env:WEIXIN_BASE_URL='https://ilinkai.weixin.qq.com'
 
 Normally you only need `WEIXIN_ACCOUNT_ID`, because the token and base URL can be restored from the saved account file.
 
-### 3. Start the WeChat runner
+### 3. Start HarborGate
 
 ```powershell
-harborgate-weixin-runner
+harborgate
 ```
 
-The runner will:
+The `harborgate.service` process starts the Weixin runtime internally. It will:
 
 1. long-poll WeChat updates
 2. normalize private text messages into the gateway

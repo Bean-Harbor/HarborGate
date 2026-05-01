@@ -1423,7 +1423,7 @@ class SetupPortalService:
         <div><strong>ingress_observability：</strong>{_html_escape(str(weixin["ingress_observability"]["last_getupdates_count"]))} / {_html_escape(str(weixin["ingress_observability"]["last_inbound_message_id"] or "暂无"))}</div>
         <div><strong>outbound_observability：</strong>{_html_escape(str(weixin["delivery_observability"]["last_send_status"] or "idle"))} / {_html_escape(str(weixin["delivery_observability"]["last_send_error"] or "无错误"))}</div>
       </div>
-      <p class="hint">登录入口：<code>harborgate-weixin-login</code>。收消息入口：<code>harborgate-weixin-runner</code>。排查 ingress 时用 <code>harborgate-weixin-ingress-probe</code>；长轮询空闲会表现为 <code>idle_timeout</code>，这不再视为故障。</p>
+      <p class="hint">登录入口：<code>harborgate-weixin-login</code>。收消息 runtime 由 <code>harborgate.service</code> 进程内 supervisor 启动；排查 ingress 时用 <code>harborgate-weixin-ingress-probe</code>。长轮询空闲会表现为 <code>idle_timeout</code>，这不再视为故障。</p>
     </div>
     <div class="card" style="margin-top: 18px;">
       <div class="meta">HarborGate · Gateway 状态</div>
@@ -1549,9 +1549,9 @@ class SetupPortalService:
       </div>
       <form method="post" action="/api/setup/weixin/unbind" onsubmit="return confirm('确认解绑当前本机 Weixin 状态？这会清除 HarborGate 本地保存的账号、context_token、polling 进度和运行状态。');">
         <button class="danger" type="submit"{unbind_disabled}>解绑当前微信状态</button>
-        <span class="hint">解绑清除 HarborGate 本地 Weixin 状态；如果 systemd 环境变量仍固定账号，需要同步更新服务配置并重启 runner。</span>
+        <span class="hint">解绑清除 HarborGate 本地 Weixin 状态；如果 systemd 环境变量仍固定账号，需要同步更新服务配置并重启 harborgate。</span>
       </form>
-      <p class="hint">扫码成功后，HarborGate 会把账号凭据保存到本机 Weixin state dir；收消息进程使用 <code>harborgate-weixin-runner</code> 长轮询。HarborDesk 会从 <code>/api/gateway/status</code> 读取这里的脱敏状态。</p>
+      <p class="hint">扫码成功后，HarborGate 会把账号凭据保存到本机 Weixin state dir；收消息由 <code>harborgate.service</code> 内部 runtime 长轮询。HarborDesk 会从 <code>/api/gateway/status</code> 读取这里的脱敏状态。</p>
     </div>
   </div>
   <script>

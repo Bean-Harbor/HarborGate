@@ -25,24 +25,36 @@ class PlatformRegistryTests(unittest.TestCase):
         )
 
     def test_webhook_and_placeholders_are_enabled_without_live_credentials(self) -> None:
-        with patch.dict(os.environ, {"WEIXIN_ACCOUNT_ID": "", "FEISHU_APP_ID": "", "FEISHU_APP_SECRET": ""}, clear=False):
-            adapters = build_enabled_adapters()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {
+                    "WEIXIN_ACCOUNT_ID": "",
+                    "WEIXIN_STATE_DIR": tmp,
+                    "FEISHU_APP_ID": "",
+                    "FEISHU_APP_SECRET": "",
+                },
+                clear=False,
+            ):
+                adapters = build_enabled_adapters()
         self.assertEqual(
             [adapter.name for adapter in adapters],
             ["webhook", "telegram", "discord", "slack", "whatsapp", "signal", "email", "wecom"],
         )
 
     def test_feishu_is_enabled_when_credentials_exist(self) -> None:
-        with patch.dict(
-            os.environ,
-            {
-                "WEIXIN_ACCOUNT_ID": "",
-                "FEISHU_APP_ID": "cli_xxx",
-                "FEISHU_APP_SECRET": "secret_xxx",
-            },
-            clear=False,
-        ):
-            adapters = build_enabled_adapters()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {
+                    "WEIXIN_ACCOUNT_ID": "",
+                    "WEIXIN_STATE_DIR": tmp,
+                    "FEISHU_APP_ID": "cli_xxx",
+                    "FEISHU_APP_SECRET": "secret_xxx",
+                },
+                clear=False,
+            ):
+                adapters = build_enabled_adapters()
         self.assertEqual(
             [adapter.name for adapter in adapters],
             [

@@ -13,6 +13,7 @@ from urllib import parse
 from im_agent.errors import GatewayContractError
 from im_agent.gateway import GatewayService, build_default_gateway
 from im_agent.platforms.feishu import FeishuAdapter
+from im_agent.runtime_supervisor import GatewayRuntimeSupervisor
 from im_agent.setup_portal import FileSetupPortalStore, SetupPortalService
 
 logging.basicConfig(
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 class GatewayRequestHandler(BaseHTTPRequestHandler):
     gateway: GatewayService
     setup_portal: SetupPortalService
+    runtime_supervisor: GatewayRuntimeSupervisor | None = None
 
     def do_GET(self) -> None:  # noqa: N802
         parsed_url = parse.urlsplit(self.path)
@@ -32,7 +34,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         query = parse.parse_qs(parsed_url.query)
 
         if path == "/health":
-            self._send_json(HTTPStatus.OK, {"status": "ok"})
+            payload = {"status": "ok"}
+            if self.runtime_supervisor is not None:
+                payload["runtime_supervisor"] = self.runtime_supervisor.status()
+            self._send_json(HTTPStatus.OK, payload)
             return
 
         if path == "/":
@@ -42,8 +47,8 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                     "name": "harborgate",
                     "message": (
                         "POST JSON to /messages/webhook to exercise the clean-room gateway. "
-                        "Set HARBORBEACON_TASK_API_URL to route turns into HarborBeacon, or use "
-                        "harborgate-weixin-login and harborgate-weixin-runner for personal WeChat. "
+                        "Set HARBORBEACON_WEB_API_URL to route turns into HarborBeacon, or use "
+                        "harborgate-weixin-login and the in-process harborgate runtime for personal WeChat. "
                         "Open /setup to see Feishu setup, Weixin ingress status, and the redacted gateway snapshot. "
                         "Feishu defaults to long-connection receive mode, so no public webhook is required."
                     ),
@@ -142,12 +147,12 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             except GatewayContractError as exc:
                 self._send_json(HTTPStatus(exc.status_code), exc.to_response())
                 return
-            self._send_json(
-                HTTPStatus.OK,
-                self.setup_portal.build_gateway_status_payload(
-                    request_host=self.headers.get("Host", "")
-                ),
+            payload = self.setup_portal.build_gateway_status_payload(
+                request_host=self.headers.get("Host", "")
             )
+            if self.runtime_supervisor is not None:
+                payload["runtime_supervisor"] = self.runtime_supervisor.status()
+            self._send_json(HTTPStatus.OK, payload)
             return
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
@@ -333,12 +338,17 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
 
-def build_handler(gateway: GatewayService, setup_portal: SetupPortalService) -> Callable[..., GatewayRequestHandler]:
+def build_handler(
+    gateway: GatewayService,
+    setup_portal: SetupPortalService,
+    runtime_supervisor: GatewayRuntimeSupervisor | None = None,
+) -> Callable[..., GatewayRequestHandler]:
     class BoundGatewayRequestHandler(GatewayRequestHandler):
         pass
 
     BoundGatewayRequestHandler.gateway = gateway
     BoundGatewayRequestHandler.setup_portal = setup_portal
+    BoundGatewayRequestHandler.runtime_supervisor = runtime_supervisor
     return BoundGatewayRequestHandler
 
 
@@ -365,9 +375,10 @@ def main() -> None:
         runtime_root=state_root,
     )
     setup_portal.bootstrap()
-    gateway.start()
+    runtime_supervisor = GatewayRuntimeSupervisor(gateway, data_root=data_root)
+    runtime_supervisor.start()
 
-    server = ThreadingHTTPServer((host, port), build_handler(gateway, setup_portal))
+    server = ThreadingHTTPServer((host, port), build_handler(gateway, setup_portal, runtime_supervisor))
     logger.info("HarborGate listening on http://%s:%s", host, port)
     logger.info("Feishu setup QR page available at http://%s:%s/setup/qr", host, port)
     try:
@@ -376,7 +387,7 @@ def main() -> None:
         logger.info("Shutting down server")
     finally:
         server.server_close()
-        gateway.stop()
+        runtime_supervisor.stop()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from threading import Event
 
 from im_agent.gateway import build_default_gateway
 from im_agent.platforms.weixin import WeixinAdapter, discover_weixin_account
@@ -14,17 +15,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _build_weixin_gateway_adapter():
-    gateway = build_default_gateway(data_root=os.getenv("IM_AGENT_DATA_DIR", "data/sessions"))
+def _stop_requested(stop_event: Event | None) -> bool:
+    return bool(stop_event is not None and stop_event.is_set())
+
+
+def _build_weixin_gateway_adapter(*, data_root: str | None = None, gateway=None):
+    if gateway is None:
+        gateway = build_default_gateway(data_root=data_root or os.getenv("IM_AGENT_DATA_DIR", "data/sessions"))
     return gateway, gateway.get_adapter("weixin")
 
 
-def _wait_for_configured_weixin_adapter():
-    gateway, adapter = _build_weixin_gateway_adapter()
+def _wait_for_configured_weixin_adapter(
+    *,
+    stop_event: Event | None = None,
+    data_root: str | None = None,
+    sleep_fn=time.sleep,
+    gateway=None,
+):
+    gateway, adapter = _build_weixin_gateway_adapter(data_root=data_root, gateway=gateway)
     while not isinstance(adapter, WeixinAdapter) or not adapter.configured:
+        if _stop_requested(stop_event):
+            return gateway, adapter
         logger.info("Weixin adapter is waiting for QR login credentials")
-        time.sleep(5)
-        gateway, adapter = _build_weixin_gateway_adapter()
+        sleep_fn(5)
+        gateway, adapter = _build_weixin_gateway_adapter(data_root=data_root, gateway=gateway)
     return gateway, adapter
 
 
@@ -58,15 +72,35 @@ def _weixin_adapter_should_reload(adapter) -> bool:
     return False
 
 
-def main() -> None:
-    gateway, adapter = _wait_for_configured_weixin_adapter()
+def run_loop(
+    *,
+    stop_event: Event | None = None,
+    data_root: str | None = None,
+    sleep_fn=time.sleep,
+    gateway=None,
+) -> None:
+    gateway, adapter = _wait_for_configured_weixin_adapter(
+        stop_event=stop_event,
+        data_root=data_root,
+        sleep_fn=sleep_fn,
+        gateway=gateway,
+    )
+    if _stop_requested(stop_event) or not isinstance(adapter, WeixinAdapter) or not adapter.configured:
+        return
 
     logger.info("Starting Weixin runner for account %s", adapter.account_id)
 
-    while True:
+    while not _stop_requested(stop_event):
         if _weixin_adapter_should_reload(adapter):
             logger.info("Weixin runner detected credential state change; reloading adapter")
-            gateway, adapter = _wait_for_configured_weixin_adapter()
+            gateway, adapter = _wait_for_configured_weixin_adapter(
+                stop_event=stop_event,
+                data_root=data_root,
+                sleep_fn=sleep_fn,
+                gateway=gateway,
+            )
+            if _stop_requested(stop_event) or not isinstance(adapter, WeixinAdapter) or not adapter.configured:
+                return
             logger.info("Starting Weixin runner for account %s", adapter.account_id)
             continue
         try:
@@ -85,7 +119,11 @@ def main() -> None:
             return
         except Exception as exc:
             logger.exception("Weixin runner loop failed: %s", exc)
-            time.sleep(3)
+            sleep_fn(3)
+
+
+def main() -> None:
+    run_loop()
 
 
 if __name__ == "__main__":
