@@ -1495,6 +1495,20 @@ class SetupPortalService:
             if unbound
             else ""
         )
+        weixin_configured = bool(weixin.get("configured"))
+        login_hint = (
+            "当前已绑定 Weixin 账号，收消息由 harborgate.service 内部 runtime 轮询。"
+            "如需换绑，再生成新的微信扫码登录二维码。"
+            if weixin_configured
+            else "如果状态是 login_required，请点击按钮生成二维码。"
+        )
+        login_button_text = "重新生成微信扫码登录二维码" if weixin_configured else "生成微信扫码登录二维码"
+        configured_notice = (
+            '<div class="notice ok"><strong>已绑定。</strong>HarborGate 已保存本机 Weixin 账号状态；'
+            "返回 HarborDesk 后应显示 polling/connected。需要更换账号时再使用下面的重新扫码入口。</div>"
+            if weixin_configured
+            else ""
+        )
         return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1530,6 +1544,7 @@ class SetupPortalService:
       <h1>微信配置与登录状态</h1>
       <p>微信凭据和扫码登录由 HarborGate 的 Weixin adapter 管理。这个页面只展示脱敏状态，不接收或保存微信 token。</p>
       {unbound_notice}
+      {configured_notice}
       <div class="status">
         <div><strong>连接状态：</strong>{state_text}</div>
         <div><strong>扫码状态：</strong>{qr_status}</div>
@@ -1542,8 +1557,8 @@ class SetupPortalService:
         {error_row}
       </div>
       <div class="login-panel">
-        <button id="weixin-login-start" class="primary" type="button">生成微信扫码登录二维码</button>
-        <div id="weixin-login-status" class="hint" style="margin-top: 10px;">如果状态是 login_required，请点击按钮生成二维码。</div>
+        <button id="weixin-login-start" class="primary" type="button">{login_button_text}</button>
+        <div id="weixin-login-status" class="hint" style="margin-top: 10px;">{login_hint}</div>
         <img id="weixin-login-qr" class="login-qr" src="" alt="Weixin login QR" />
         <div id="weixin-login-link" class="hint"></div>
       </div>

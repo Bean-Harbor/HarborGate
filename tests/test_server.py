@@ -1236,6 +1236,50 @@ class NotificationServerTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_weixin_setup_page_marks_configured_account_as_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            weixin_state_dir = Path(tmp) / "weixin"
+            save_weixin_account(
+                weixin_state_dir,
+                account_id="wx-bound-1",
+                token="wx-token-bound",
+                base_url="https://ilinkai.weixin.qq.com",
+                user_id="wx-user-bound",
+            )
+            gateway = GatewayService(
+                store=FileSessionStore(tmp, max_turns=10),
+                brain=RuleBasedBrain(),
+            )
+            setup_portal = SetupPortalService(
+                gateway=gateway,
+                store=FileSetupPortalStore(tmp),
+                bind_host="127.0.0.1",
+                bind_port=0,
+                weixin_state_dir=weixin_state_dir,
+            )
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(gateway, setup_portal))
+            setup_portal.bind_port = server.server_port
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with patch.dict(os.environ, {"WEIXIN_ACCOUNT_ID": ""}, clear=False):
+                    with request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/setup/weixin",
+                        timeout=5,
+                    ) as response:
+                        body = response.read().decode("utf-8")
+
+                self.assertEqual(response.status, 200)
+                self.assertIn("已绑定", body)
+                self.assertIn("重新生成微信扫码登录二维码", body)
+                self.assertIn("HarborGate 已保存本机 Weixin 账号状态", body)
+                self.assertNotIn("如果状态是 login_required，请点击按钮生成二维码。", body)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_admin_weixin_unbound_query_redirects_to_setup_notice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             gateway = GatewayService(
