@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 import threading
 import unittest
@@ -72,6 +73,14 @@ class FakeSetupFeishuHandler(BaseHTTPRequestHandler):
 class NoRedirectHandler(request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
         return None
+
+
+def _visible_html_text(html: str) -> str:
+    without_script = re.sub(r"(?is)<script.*?</script>", " ", html)
+    without_style = re.sub(r"(?is)<style.*?</style>", " ", without_script)
+    without_attrs = re.sub(r"\s(?:action|href|src|id|class|for|type|method|onsubmit)=\"[^\"]*\"", " ", without_style)
+    without_tags = re.sub(r"(?is)<[^>]+>", " ", without_attrs)
+    return re.sub(r"\s+", " ", without_tags)
 
 
 class NotificationServerTests(unittest.TestCase):
@@ -1185,7 +1194,8 @@ class NotificationServerTests(unittest.TestCase):
                     body = response.read().decode("utf-8")
 
                 self.assertEqual(response.status, 200)
-                self.assertIn("Feishu 手机配置页", body)
+                self.assertIn("飞书连接", body)
+                self.assertNotIn("Feishu 手机配置页", body)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1216,9 +1226,10 @@ class NotificationServerTests(unittest.TestCase):
                     body = response.read().decode("utf-8")
 
                 self.assertEqual(response.status, 200)
-                self.assertIn("HarborGate Weixin 配置", body)
-                self.assertIn("微信配置与登录状态", body)
+                self.assertIn("微信连接", body)
+                self.assertIn("绑定微信", body)
                 self.assertIn("/api/setup/weixin/unbind", body)
+                self.assertNotIn("HarborGate Weixin 配置", body)
                 self.assertNotIn("Feishu 手机配置页", body)
                 self.assertNotIn("扫码后直接填飞书凭证", body)
 
@@ -1229,7 +1240,7 @@ class NotificationServerTests(unittest.TestCase):
                     query_body = response.read().decode("utf-8")
 
                 self.assertEqual(response.status, 200)
-                self.assertIn("HarborGate Weixin 配置", query_body)
+                self.assertIn("微信连接", query_body)
                 self.assertNotIn("Feishu 手机配置页", query_body)
             finally:
                 server.shutdown()
@@ -1272,9 +1283,12 @@ class NotificationServerTests(unittest.TestCase):
 
                 self.assertEqual(response.status, 200)
                 self.assertIn("已绑定", body)
-                self.assertIn("重新生成微信扫码登录二维码", body)
-                self.assertIn("HarborGate 已保存本机 Weixin 账号状态", body)
-                self.assertNotIn("如果状态是 login_required，请点击按钮生成二维码。", body)
+                self.assertIn("重新绑定微信", body)
+                self.assertIn("可返回 HarborDesk 使用微信连接", body)
+                visible = _visible_html_text(body)
+                self.assertNotIn("HarborGate 已保存本机 Weixin 账号状态", visible)
+                self.assertNotIn("login_required", visible)
+                self.assertNotIn("harborgate.service", visible)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1411,7 +1425,7 @@ class NotificationServerTests(unittest.TestCase):
 
                     self.assertEqual(response.status, 200)
                     self.assertIn("已解绑", body)
-                    self.assertIn("生成微信扫码登录二维码", body)
+                    self.assertIn("绑定微信", body)
                     self.assertNotIn("Feishu 手机配置页", body)
             finally:
                 server.shutdown()
@@ -1557,10 +1571,62 @@ class NotificationServerTests(unittest.TestCase):
                 ) as response:
                     weixin_body = response.read().decode("utf-8")
 
-                self.assertIn("Feishu 手机配置页", feishu_body)
-                self.assertIn("微信配置与登录状态", weixin_body)
+                self.assertIn("飞书连接", feishu_body)
+                self.assertIn("微信连接", weixin_body)
                 self.assertNotIn("Feishu 手机配置页", weixin_body)
                 self.assertNotIn("扫码后直接填飞书凭证", weixin_body)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_setup_pages_hide_engineering_copy_from_visible_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gateway = GatewayService(
+                store=FileSessionStore(tmp, max_turns=10),
+                brain=RuleBasedBrain(),
+            )
+            setup_portal = SetupPortalService(
+                gateway=gateway,
+                store=FileSetupPortalStore(tmp),
+                bind_host="127.0.0.1",
+                bind_port=0,
+            )
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(gateway, setup_portal))
+            setup_portal.bind_port = server.server_port
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                forbidden = [
+                    "HarborGate",
+                    "adapter",
+                    "runtime",
+                    "harborgate.service",
+                    "state dir",
+                    "context_token",
+                    "getupdates",
+                    "Transport blocker",
+                    "Parity",
+                    "gateway_version",
+                    "release_v2",
+                    "source_bound",
+                    "proactive",
+                    "systemd",
+                    "polling",
+                    "connected",
+                    "login_required",
+                ]
+                for path in ("/setup/feishu", "/setup/weixin", "/setup/feishu/qr", "/admin/im/weixin"):
+                    with request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}{path}",
+                        timeout=5,
+                    ) as response:
+                        body = response.read().decode("utf-8")
+
+                    visible = _visible_html_text(body)
+                    for term in forbidden:
+                        self.assertNotIn(term, visible, path)
             finally:
                 server.shutdown()
                 server.server_close()

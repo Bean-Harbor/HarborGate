@@ -116,6 +116,181 @@ def _html_escape(value: str) -> str:
     return escaped
 
 
+_PORTAL_CSS = """
+:root {
+  --bg: #f7f4ff;
+  --surface: #ffffff;
+  --surface-soft: #f4efff;
+  --primary: #6715ff;
+  --primary-dark: #40108f;
+  --text: #201638;
+  --muted: #716982;
+  --border: #ded5f2;
+  --success: #19745f;
+  --danger: #b3261e;
+  --warning: #8a5b00;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: linear-gradient(180deg, #f3efff 0%, #ffffff 100%);
+  color: var(--text);
+}
+.wrap {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 28px 18px 52px;
+}
+.wrap.narrow { max-width: 560px; text-align: center; }
+.card {
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  box-shadow: 0 18px 42px rgba(72, 41, 150, 0.12);
+}
+.stack { display: grid; gap: 16px; }
+.eyebrow {
+  color: var(--primary);
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+h1 { margin: 0 0 10px; font-size: 32px; line-height: 1.15; }
+h2 { margin: 0; font-size: 20px; line-height: 1.25; }
+p { margin: 0; line-height: 1.58; color: var(--muted); }
+label { display: block; margin: 14px 0 8px; font-weight: 700; }
+input {
+  width: 100%;
+  padding: 13px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text);
+  font-size: 16px;
+}
+button {
+  min-height: 44px;
+  border: 0;
+  border-radius: 8px;
+  padding: 12px 18px;
+  font-weight: 700;
+  cursor: pointer;
+}
+button.primary { background: var(--primary); color: #fff; }
+button.secondary { background: #fff; color: var(--primary); border: 1px solid var(--primary); }
+button.danger { background: var(--danger); color: #fff; }
+button:disabled { background: #d8d2e8; color: #766f8f; cursor: not-allowed; }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 18px; }
+.summary {
+  display: grid;
+  gap: 10px;
+  margin: 18px 0;
+  padding: 16px;
+  border-radius: 8px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+}
+.row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.label { color: var(--muted); }
+.value { font-weight: 700; text-align: right; }
+.badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-weight: 700;
+  background: #efe8ff;
+  color: var(--primary-dark);
+}
+.badge.good { background: #e8f7f2; color: var(--success); }
+.badge.warn { background: #fff6df; color: var(--warning); }
+.badge.danger { background: #ffe8e5; color: var(--danger); }
+.notice {
+  padding: 14px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-soft);
+  color: var(--text);
+}
+.notice.good { background: #edf9f5; border-color: #c7e9de; color: var(--success); }
+.notice.danger { background: #ffe8e5; border-color: #f1b8b2; color: var(--danger); }
+.hint { color: var(--muted); font-size: 14px; }
+.ok { color: var(--success); }
+.err { color: var(--danger); }
+.login-qr, .qr {
+  width: min(280px, 100%);
+  aspect-ratio: 1;
+  border-radius: 8px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+}
+.login-qr { display: none; margin: 16px 0 8px; }
+.qr { display: block; margin: 20px auto; }
+form { margin: 0; }
+@media (max-width: 640px) {
+  .wrap { padding: 18px 12px 36px; }
+  .card { padding: 18px; }
+  h1 { font-size: 28px; }
+  .row { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .value { text-align: left; }
+  .actions button { width: 100%; }
+}
+"""
+
+
+def _portal_document(*, title: str, body: str, narrow: bool = False) -> str:
+    wrap_class = "wrap narrow" if narrow else "wrap"
+    safe_title = _html_escape(title)
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{safe_title}</title>
+  <style>{_PORTAL_CSS}</style>
+</head>
+<body>
+  <main class="{wrap_class}">
+    {body}
+  </main>
+</body>
+</html>"""
+
+
+def _customer_status_label(
+    status: str,
+    *,
+    configured: bool = False,
+    connected: bool = False,
+) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"error", "failed", "send_failed", "timeout", "expired"}:
+        return "需要处理"
+    if connected or normalized in {"ready", "connected", "polling", "polling_idle", "validated", "configured", "confirmed"}:
+        return "已连接" if configured else "可用"
+    if configured:
+        return "连接中"
+    return "待配置"
+
+
+def _badge_class(label: str) -> str:
+    if label in {"已连接", "已绑定", "已配置", "可用"}:
+        return "good"
+    if label == "需要处理":
+        return "danger"
+    return "warn"
+
+
+def _customer_connection_mode_label(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == "webhook":
+        return "回调接收"
+    return "自动接收"
+
+
 def _classify_weixin_transport_blocker(
     *,
     configured: bool,
@@ -180,9 +355,9 @@ def _qr_to_svg(text: str, border: int = 4) -> str:
         safe_text = _html_escape(text)
         return (
             '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180">'
-            '<rect width="100%" height="100%" fill="#f8f3ec"/>'
-            '<text x="20" y="48" font-size="18" fill="#1b1814">QR dependency missing</text>'
-            f'<text x="20" y="88" font-size="12" fill="#5b534a">{safe_text}</text>'
+            '<rect width="100%" height="100%" fill="#f4efff"/>'
+            '<text x="20" y="48" font-size="18" fill="#40108f">二维码暂不可用</text>'
+            f'<text x="20" y="88" font-size="12" fill="#716982">{safe_text}</text>'
             "</svg>"
         )
 
@@ -198,8 +373,8 @@ def _qr_to_svg(text: str, border: int = 4) -> str:
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {dimension} {dimension}" '
         'shape-rendering="crispEdges">'
-        '<rect width="100%" height="100%" fill="#f8f3ec"/>'
-        f'<path d="{path}" fill="#1b1814"/>'
+        '<rect width="100%" height="100%" fill="#f4efff"/>'
+        f'<path d="{path}" fill="#40108f"/>'
         "</svg>"
     )
 
@@ -445,7 +620,7 @@ class SetupPortalService:
         login = self.store.load_weixin_login_state()
         qrcode_target = str(login.get("qrcode_img_content") or login.get("qrcode") or "").strip()
         if not qrcode_target:
-            return _qr_to_svg("HarborGate Weixin login has not started")
+            return _qr_to_svg("微信二维码尚未生成")
         return _qr_to_svg(qrcode_target)
 
     def start_weixin_login(self, *, bot_type: str = "3") -> tuple[int, dict[str, Any]]:
@@ -1304,145 +1479,77 @@ class SetupPortalService:
     def build_setup_page(self, *, request_host: str = "") -> str:
         status = self.build_status_payload(request_host=request_host)
         feishu = status["feishu"]
-        weixin = status["weixin"]
-        gateway_status = status["gateway_status"] if isinstance(status.get("gateway_status"), dict) else {}
-        gateway_channels = gateway_status.get("channels") if isinstance(gateway_status, dict) else []
-        setup_url = _html_escape(str(feishu.get("setup_url") or status["setup_url"]))
-        qr_path = _html_escape("/setup/feishu/qr.svg")
-        session_code = _html_escape(str(status["session_code"]))
-        app_name = _html_escape(str(feishu["app_name"]))
-        app_id_masked = _html_escape(str(feishu["app_id_masked"]))
-        state_text = _html_escape(str(feishu["status"]))
-        connection_mode = _html_escape(str(feishu["connection_mode"]))
-        credential_status = _html_escape(str(feishu["credential_status"]))
-        last_error = _html_escape(str(feishu["last_error"]))
-        mode_hint = (
-            '<p class="hint ok">当前默认使用飞书长连接模式，不需要公网回调地址。</p>'
-            if feishu["connection_mode"] == "websocket"
-            else '<p class="hint">当前处于 webhook 模式，需要公网可达的回调地址。</p>'
+        configured = bool(feishu.get("configured"))
+        connected = bool(feishu.get("connected"))
+        state_label = _customer_status_label(
+            str(feishu.get("status") or ""),
+            configured=configured,
+            connected=connected,
         )
-        transport_meta = ""
-        if last_error:
-            transport_meta += f'<div><strong>最近错误：</strong><code>{last_error}</code></div>'
+        credential_label = "已配置" if configured else "待配置"
+        app_name = _html_escape(str(feishu.get("app_name") or "未设置"))
+        app_id_masked = _html_escape(str(feishu.get("app_id_masked") or "未设置"))
+        connection_mode = _html_escape(_customer_connection_mode_label(str(feishu.get("connection_mode") or "")))
+        last_error = str(feishu.get("last_error") or "").strip()
+        problem_notice = (
+            '<div class="notice danger">飞书连接暂时不可用，请检查应用配置后重试。</div>'
+            if last_error
+            else ""
+        )
         warning = ""
         if not status["mobile_reachable"]:
             warning = (
-                '<p class="hint err">当前二维码链接看起来仍然是本机回环地址。'
-                '如果手机扫不开，请用 IM_AGENT_HOST=0.0.0.0 启动，或设置 IM_AGENT_PUBLIC_ORIGIN。</p>'
+                '<div class="notice danger">当前链接无法从手机直接打开，请在 HarborDesk 中打开配置页。</div>'
             )
-        gateway_rows = ""
-        if isinstance(gateway_channels, list):
-            for channel in gateway_channels:
-                if not isinstance(channel, dict):
-                    continue
-                platform = _html_escape(str(channel.get("platform") or ""))
-                display_name = _html_escape(str(channel.get("display_name") or ""))
-                connected = "yes" if bool(channel.get("connected")) else "no"
-                transport = channel.get("transport") if isinstance(channel.get("transport"), dict) else {}
-                transport_status = _html_escape(str(transport.get("status") or ""))
-                surface_family = _html_escape(str(channel.get("surface_family") or ""))
-                gateway_rows += (
-                    f'<div><strong>{platform or "unknown"}</strong>'
-                    f' <span class="hint">({display_name or "未命名"} / {surface_family or "unknown"})</span>'
-                    f'<br /><span class="hint">connected={connected}, transport={transport_status or "unknown"}</span></div>'
-                )
-        gateway_version = _html_escape(str(gateway_status.get("gateway_version") or __version__))
-        release_v2 = status.get("release_v2") if isinstance(status.get("release_v2"), dict) else {}
-        release_decision = _html_escape(str(release_v2.get("decision") or ""))
-        release_reason = _html_escape(str(release_v2.get("decision_reason") or ""))
-        source_bound_health = release_v2.get("source_bound_delivery_health") if isinstance(release_v2.get("source_bound_delivery_health"), dict) else {}
-        proactive_health = release_v2.get("proactive_delivery_health") if isinstance(release_v2.get("proactive_delivery_health"), dict) else {}
-        source_bound_health_state = _html_escape(str(source_bound_health.get("health_state") or "unknown"))
-        proactive_health_state = _html_escape(str(proactive_health.get("health_state") or "unknown"))
-        return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HarborGate Feishu 配置</title>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
-    .wrap {{ max-width: 620px; margin: 0 auto; padding: 24px 18px 48px; }}
-    .card {{ background: rgba(255,255,255,0.92); border-radius: 20px; padding: 20px; box-shadow: 0 18px 48px rgba(51,36,18,0.12); }}
-    h1 {{ margin: 0 0 8px; font-size: 28px; }}
-    p {{ line-height: 1.55; }}
-    label {{ display: block; margin: 14px 0 8px; font-weight: 600; }}
-    input {{ width: 100%; box-sizing: border-box; padding: 14px 12px; border-radius: 12px; border: 1px solid #d9c6ae; font-size: 16px; }}
-    input[readonly] {{ background: #f6f2ec; color: #6a5d50; }}
-    button {{ width: 100%; margin-top: 18px; padding: 14px 16px; border: 0; border-radius: 999px; background: #1f7a6f; color: white; font-size: 16px; font-weight: 700; }}
-    .meta {{ color: #6b5a49; font-size: 14px; margin-bottom: 18px; }}
-    .status {{ margin: 16px 0; padding: 12px 14px; border-radius: 14px; background: #f6f2ec; }}
-    .hint {{ font-size: 13px; color: #766757; }}
-    .ok {{ color: #1f7a6f; }}
-    .err {{ color: #b94739; }}
-    .qr {{ margin: 18px auto 6px; width: 220px; height: 220px; display: block; border-radius: 16px; background: #f8f3ec; }}
-    code {{ word-break: break-all; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <div class="meta">HarborGate · Feishu 手机配置页</div>
-      <h1>扫码后直接填飞书凭证</h1>
-      <p>这个页面会把 <code>app_id</code> 和 <code>app_secret</code> 保存在当前 HarborGate 本机，并立即更新正在运行的 Feishu adapter，不需要用户手动登录到服务器。</p>
-      <img class="qr" src="{qr_path}" alt="setup qr" />
-      <p class="hint">当前配置链接：<code>{setup_url}</code></p>
+        body = f"""
+    <section class="card stack">
+      <div>
+        <div class="eyebrow">IM 连接</div>
+        <h1>飞书连接</h1>
+        <p>连接飞书应用后，可通过飞书接收和回复消息。</p>
+      </div>
       {warning}
-      {mode_hint}
-      <div class="status">
-        <div><strong>连接状态：</strong>{state_text}</div>
-        <div><strong>凭证状态：</strong>{credential_status}</div>
-        <div><strong>接收模式：</strong>{connection_mode}</div>
-        <div><strong>当前会话：</strong>{session_code}</div>
-        <div><strong>Bot 显示名：</strong>{app_name or "未配置"}</div>
-        <div><strong>App ID：</strong>{app_id_masked or "未配置"}</div>
-        {transport_meta}
+      {problem_notice}
+      <div class="summary">
+        <div class="row">
+          <span class="label">连接状态</span>
+          <span class="badge {_badge_class(state_label)}">{_html_escape(state_label)}</span>
+        </div>
+        <div class="row">
+          <span class="label">配置状态</span>
+          <span class="badge {_badge_class(credential_label)}">{_html_escape(credential_label)}</span>
+        </div>
+        <div class="row">
+          <span class="label">接收方式</span>
+          <span class="value">{connection_mode}</span>
+        </div>
+        <div class="row">
+          <span class="label">应用名称</span>
+          <span class="value">{app_name}</span>
+        </div>
+        <div class="row">
+          <span class="label">App ID</span>
+          <span class="value">{app_id_masked}</span>
+        </div>
       </div>
-      <label for="app-id">App ID</label>
-      <input id="app-id" type="text" placeholder="cli_xxx" />
-      <label for="app-secret">App Secret</label>
-      <input id="app-secret" type="password" placeholder="输入飞书应用密钥" />
-      <label for="verification-token">Verification Token（可选，仅 webhook 模式才需要）</label>
-      <input id="verification-token" type="text" placeholder="长连接模式通常不需要填写" />
-      <button id="submit-btn">验证并应用 Feishu 配置</button>
-      <p class="hint">当前 starter 会先验证凭证，再把配置写入本地状态文件，并默认启用 live send + 飞书长连接收消息。</p>
-      <p id="result" class="hint"></p>
-    </div>
-    <div class="card" style="margin-top: 18px;">
-      <div class="meta">HarborGate · Weixin 状态</div>
-      <h2 style="margin: 0 0 8px; font-size: 20px;">Weixin parity / getupdates</h2>
-      <p>Weixin 仍然通过 QR 登录和 getupdates 长轮询运行。这个卡片只展示已脱敏状态，方便 HarborDesk 在同一页里看 setup、gateway 和 ingress 健康度。</p>
-      <div class="status">
-        <div><strong>连接状态：</strong>{_html_escape(str(weixin["status"]))}</div>
-        <div><strong>账号状态：</strong>{_html_escape(str(weixin["account_id_masked"] or "未配置"))}</div>
-        <div><strong>Transport blocker：</strong>{_html_escape(str(weixin["blocker_category"] or "ready"))}</div>
-        <div><strong>Parity bucket：</strong>{_html_escape(str(weixin["ingress_blocker_category"] or "ready"))}</div>
-        <div><strong>最近 getupdates：</strong>{_html_escape(str(weixin["poll"]["last_getupdates_at"] or "暂无"))}</div>
-        <div><strong>私聊消息：</strong>{_html_escape(str(weixin["poll"]["last_private_text_message_count"]))}</div>
-        <div><strong>context_token：</strong>{_html_escape(str(weixin["context_token_count"]))}</div>
-        <div><strong>ingress_observability：</strong>{_html_escape(str(weixin["ingress_observability"]["last_getupdates_count"]))} / {_html_escape(str(weixin["ingress_observability"]["last_inbound_message_id"] or "暂无"))}</div>
-        <div><strong>outbound_observability：</strong>{_html_escape(str(weixin["delivery_observability"]["last_send_status"] or "idle"))} / {_html_escape(str(weixin["delivery_observability"]["last_send_error"] or "无错误"))}</div>
+      <div>
+        <label for="app-id">App ID</label>
+        <input id="app-id" type="text" placeholder="cli_xxx" autocomplete="off" />
+        <label for="app-secret">App Secret</label>
+        <input id="app-secret" type="password" placeholder="输入飞书应用密钥" autocomplete="off" />
+        <label for="verification-token">Verification Token（可选）</label>
+        <input id="verification-token" type="text" placeholder="如未启用回调可留空" autocomplete="off" />
+        <div class="actions">
+          <button id="submit-btn" class="primary" type="button">保存飞书连接</button>
+        </div>
+        <p id="result" class="hint" style="margin-top: 12px;"></p>
       </div>
-      <p class="hint">登录入口：<code>harborgate-weixin-login</code>。收消息 runtime 由 <code>harborgate.service</code> 进程内 supervisor 启动；排查 ingress 时用 <code>harborgate-weixin-ingress-probe</code>。长轮询空闲会表现为 <code>idle_timeout</code>，这不再视为故障。</p>
-    </div>
-    <div class="card" style="margin-top: 18px;">
-      <div class="meta">HarborGate · Gateway 状态</div>
-      <h2 style="margin: 0 0 8px; font-size: 20px;">Redacted channel snapshot</h2>
-      <div class="status">
-        <div><strong>gateway_version：</strong>{gateway_version}</div>
-        <div><strong>channels：</strong>{len(gateway_channels) if isinstance(gateway_channels, list) else 0}</div>
-        <div><strong>release_v2：</strong>{release_decision or "unknown"}<span class="hint"> / {release_reason or "n/a"}</span></div>
-        <div><strong>source_bound_health：</strong>{source_bound_health_state}</div>
-        <div><strong>proactive_health：</strong>{proactive_health_state}</div>
-        {gateway_rows or '<div class="hint">当前还没有注册到网关的通道。</div>'}
-      </div>
-    </div>
-  </div>
+    </section>
   <script>
     document.getElementById('submit-btn').addEventListener('click', async () => {{
       const result = document.getElementById('result');
       result.className = 'hint';
-      result.textContent = '正在验证 Feishu 凭证...';
+      result.textContent = '正在保存飞书连接...';
       const payload = {{
         session_code: {json.dumps(status["session_code"], ensure_ascii=False)},
         app_id: document.getElementById('app-id').value.trim(),
@@ -1460,115 +1567,96 @@ class SetupPortalService:
           throw new Error(data.message || data.error || '配置失败');
         }}
         result.className = 'hint ok';
-        const appName = data.bot_info?.app_name || 'Feishu Bot';
-        result.textContent = `已应用配置：${{appName}}。下一步去飞书后台把事件订阅方式切到“使用长连接接收事件”，并订阅 im.message.receive_v1。`;
+        result.textContent = '飞书连接已保存，可以返回 HarborDesk 查看状态。';
       }} catch (error) {{
         result.className = 'hint err';
-        result.textContent = error.message;
+        result.textContent = '保存失败，请检查 App ID 和 App Secret 后重试。';
       }}
     }});
   </script>
-</body>
-</html>"""
+"""
+        return _portal_document(title="飞书连接", body=body)
 
     def build_weixin_setup_page(self, *, request_host: str = "", unbound: bool = False) -> str:
         status = self.build_status_payload(request_host=request_host)
         weixin = status["weixin"]
-        qr_status = _html_escape(str(weixin.get("qr_status") or "unknown"))
-        state_text = _html_escape(str(weixin.get("status") or "unknown"))
-        account_id = _html_escape(str(weixin.get("account_id_masked") or "未配置"))
-        user_id = _html_escape(str(weixin.get("user_id_masked") or "未配置"))
-        blocker = _html_escape(str(weixin.get("ingress_blocker_category") or weixin.get("blocker_category") or "ready"))
-        last_poll = _html_escape(str((weixin.get("poll") or {}).get("last_getupdates_at") or "暂无"))
-        private_count = _html_escape(str((weixin.get("poll") or {}).get("last_private_text_message_count") or 0))
-        context_count = _html_escape(str(weixin.get("context_token_count") or 0))
-        last_error = _html_escape(str(weixin.get("last_error") or (weixin.get("poll") or {}).get("error") or ""))
-        error_row = f"<div><strong>最近错误：</strong><code>{last_error}</code></div>" if last_error else ""
+        weixin_configured = bool(weixin.get("configured"))
+        weixin_connected = bool(weixin.get("connected"))
+        state_label = _customer_status_label(
+            str(weixin.get("status") or ""),
+            configured=weixin_configured,
+            connected=weixin_connected,
+        )
+        binding_label = "已绑定" if weixin_configured else "待绑定"
+        account_id = _html_escape(str(weixin.get("account_id_masked") or "未绑定"))
+        last_error = str(weixin.get("last_error") or (weixin.get("poll") or {}).get("error") or "").strip()
+        problem_notice = (
+            '<div class="notice danger">微信连接暂时不可用，请稍后重试或重新绑定。</div>'
+            if last_error
+            else ""
+        )
         login_state_json = json.dumps(
             self._project_weixin_login_state(self.store.load_weixin_login_state()),
             ensure_ascii=False,
         )
-        unbind_disabled = "" if bool(weixin.get("configured")) else " disabled"
+        unbind_disabled = "" if weixin_configured else " disabled"
         unbound_notice = (
-            '<div class="notice ok"><strong>已解绑。</strong>本机保存的 Weixin 账号和轮询状态已清除，'
-            "请在本页重新生成二维码并完成扫码登录。</div>"
+            '<div class="notice good">已解绑。请重新扫码绑定微信。</div>'
             if unbound
             else ""
         )
-        weixin_configured = bool(weixin.get("configured"))
         login_hint = (
-            "当前已绑定 Weixin 账号，收消息由 harborgate.service 内部 runtime 轮询。"
-            "如需换绑，再生成新的微信扫码登录二维码。"
+            "需要更换账号时，重新扫码即可。"
             if weixin_configured
-            else "如果状态是 login_required，请点击按钮生成二维码。"
+            else "点击后使用微信扫码完成绑定。"
         )
-        login_button_text = "重新生成微信扫码登录二维码" if weixin_configured else "生成微信扫码登录二维码"
+        login_button_text = "重新绑定微信" if weixin_configured else "绑定微信"
         configured_notice = (
-            '<div class="notice ok"><strong>已绑定。</strong>HarborGate 已保存本机 Weixin 账号状态；'
-            "返回 HarborDesk 后应显示 polling/connected。需要更换账号时再使用下面的重新扫码入口。</div>"
+            '<div class="notice good">已绑定。可返回 HarborDesk 使用微信连接。</div>'
             if weixin_configured
             else ""
         )
-        return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HarborGate Weixin 配置</title>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
-    .wrap {{ max-width: 620px; margin: 0 auto; padding: 24px 18px 48px; }}
-    .card {{ background: rgba(255,255,255,0.92); border-radius: 20px; padding: 20px; box-shadow: 0 18px 48px rgba(51,36,18,0.12); }}
-    h1 {{ margin: 0 0 8px; font-size: 28px; }}
-    p {{ line-height: 1.55; }}
-    .meta {{ color: #6b5a49; font-size: 14px; margin-bottom: 18px; }}
-    .status {{ margin: 16px 0; padding: 12px 14px; border-radius: 14px; background: #f6f2ec; }}
-    .hint {{ font-size: 13px; color: #766757; }}
-    .ok {{ color: #1f7a6f; }}
-    .err {{ color: #b94739; }}
-    .notice {{ margin: 14px 0; padding: 12px 14px; border-radius: 14px; background: #edf7f3; }}
-    .login-panel {{ margin-top: 18px; padding: 14px; border-radius: 16px; background: #fbf8f2; border: 1px solid #e8ded1; }}
-    .login-qr {{ width: 260px; height: 260px; display: none; margin: 14px 0 6px; background: #f8f3ec; border-radius: 14px; }}
-    code {{ word-break: break-all; }}
-    form {{ margin: 18px 0 0; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }}
-    button {{ border: 0; border-radius: 999px; padding: 10px 16px; font-weight: 700; cursor: pointer; }}
-    button.primary {{ background: #1f7a6f; color: #fff; }}
-    button.danger {{ background: #b3261e; color: #fff; }}
-    button:disabled {{ background: #d7d2ca; color: #817a72; cursor: not-allowed; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <div class="meta">HarborGate · Weixin 管理页</div>
-      <h1>微信配置与登录状态</h1>
-      <p>微信凭据和扫码登录由 HarborGate 的 Weixin adapter 管理。这个页面只展示脱敏状态，不接收或保存微信 token。</p>
+        body = f"""
+    <section class="card stack">
+      <div>
+        <div class="eyebrow">IM 连接</div>
+        <h1>微信连接</h1>
+        <p>绑定微信后，可通过微信接收和回复消息。</p>
+      </div>
       {unbound_notice}
       {configured_notice}
-      <div class="status">
-        <div><strong>连接状态：</strong>{state_text}</div>
-        <div><strong>扫码状态：</strong>{qr_status}</div>
-        <div><strong>账号：</strong>{account_id}</div>
-        <div><strong>用户：</strong>{user_id}</div>
-        <div><strong>阻塞项：</strong>{blocker}</div>
-        <div><strong>最近 getupdates：</strong>{last_poll}</div>
-        <div><strong>私聊消息：</strong>{private_count}</div>
-        <div><strong>context_token：</strong>{context_count}</div>
-        {error_row}
+      {problem_notice}
+      <div class="summary">
+        <div class="row">
+          <span class="label">绑定状态</span>
+          <span class="badge {_badge_class(binding_label)}">{_html_escape(binding_label)}</span>
+        </div>
+        <div class="row">
+          <span class="label">连接状态</span>
+          <span class="badge {_badge_class(state_label)}">{_html_escape(state_label)}</span>
+        </div>
+        <div class="row">
+          <span class="label">账号</span>
+          <span class="value">{account_id}</span>
+        </div>
       </div>
-      <div class="login-panel">
-        <button id="weixin-login-start" class="primary" type="button">{login_button_text}</button>
-        <div id="weixin-login-status" class="hint" style="margin-top: 10px;">{login_hint}</div>
-        <img id="weixin-login-qr" class="login-qr" src="" alt="Weixin login QR" />
+      <div class="summary">
+        <h2>扫码绑定</h2>
+        <p>{_html_escape(login_hint)}</p>
+        <div class="actions">
+          <button id="weixin-login-start" class="primary" type="button">{_html_escape(login_button_text)}</button>
+        </div>
+        <div id="weixin-login-status" class="hint" style="margin-top: 10px;"></div>
+        <img id="weixin-login-qr" class="login-qr" src="" alt="微信登录二维码" />
         <div id="weixin-login-link" class="hint"></div>
       </div>
-      <form method="post" action="/api/setup/weixin/unbind" onsubmit="return confirm('确认解绑当前本机 Weixin 状态？这会清除 HarborGate 本地保存的账号、context_token、polling 进度和运行状态。');">
-        <button class="danger" type="submit"{unbind_disabled}>解绑当前微信状态</button>
-        <span class="hint">解绑清除 HarborGate 本地 Weixin 状态；如果 systemd 环境变量仍固定账号，需要同步更新服务配置并重启 harborgate。</span>
+      <form method="post" action="/api/setup/weixin/unbind" onsubmit="return confirm('确认解绑微信？解绑后需要重新扫码。');">
+        <div class="actions">
+          <button class="danger" type="submit"{unbind_disabled}>解绑微信</button>
+        </div>
+        <p class="hint" style="margin-top: 10px;">解绑后需要重新扫码才能继续使用微信连接。</p>
       </form>
-      <p class="hint">扫码成功后，HarborGate 会把账号凭据保存到本机 Weixin state dir；收消息由 <code>harborgate.service</code> 内部 runtime 长轮询。HarborDesk 会从 <code>/api/gateway/status</code> 读取这里的脱敏状态。</p>
-    </div>
-  </div>
+    </section>
   <script>
     const initialLogin = {login_state_json};
     const startButton = document.getElementById('weixin-login-start');
@@ -1576,6 +1664,19 @@ class SetupPortalService:
     const qrEl = document.getElementById('weixin-login-qr');
     const linkEl = document.getElementById('weixin-login-link');
     let pollTimer = null;
+
+    function statusText(status) {{
+      const labels = {{
+        not_started: '准备中',
+        wait: '等待扫码',
+        scaned: '已扫码，等待确认',
+        scaned_but_redirect: '已扫码，正在确认',
+        confirmed: '已绑定',
+        expired: '二维码已过期',
+        error: '二维码暂时不可用'
+      }};
+      return labels[status] || '准备中';
+    }}
 
     function renderLogin(data) {{
       const login = data.weixin_login || data || {{}};
@@ -1585,11 +1686,14 @@ class SetupPortalService:
         ? `，剩余约 ${{expires}} 秒`
         : '';
       statusEl.className = status === 'error' || status === 'expired' ? 'hint err' : 'hint';
-      statusEl.textContent = `扫码状态：${{status}}${{suffix}}${{login.last_error ? ' / ' + login.last_error : ''}}`;
+      statusEl.textContent = `扫码状态：${{statusText(status)}}${{suffix}}`;
+      if (status === 'error') {{
+        statusEl.textContent = '二维码暂时不可用，请稍后重试。';
+      }}
       if (login.qrcode_available) {{
         qrEl.style.display = 'block';
         qrEl.src = `/setup/weixin/qr.svg?ts=${{Date.now()}}`;
-        linkEl.textContent = login.qrcode_url || '';
+        linkEl.textContent = '';
       }} else {{
         qrEl.style.display = 'none';
         qrEl.removeAttribute('src');
@@ -1597,7 +1701,7 @@ class SetupPortalService:
       }}
       if (status === 'confirmed') {{
         statusEl.className = 'hint ok';
-        statusEl.textContent = `扫码登录完成：${{login.account_id_masked || 'Weixin'}}。页面即将刷新。`;
+        statusEl.textContent = '微信绑定完成，页面即将刷新。';
         window.setTimeout(() => window.location.reload(), 1200);
       }}
     }}
@@ -1616,7 +1720,7 @@ class SetupPortalService:
     startButton.addEventListener('click', async () => {{
       startButton.disabled = true;
       statusEl.className = 'hint';
-      statusEl.textContent = '正在向 Weixin 申请扫码二维码...';
+      statusEl.textContent = '正在生成二维码...';
       try {{
         const response = await fetch('/api/setup/weixin/login/start', {{ method: 'POST' }});
         const data = await response.json();
@@ -1627,7 +1731,7 @@ class SetupPortalService:
         pollTimer = window.setTimeout(pollLogin, 1500);
       }} catch (error) {{
         statusEl.className = 'hint err';
-        statusEl.textContent = error.message;
+        statusEl.textContent = '二维码暂时不可用，请稍后重试。';
       }} finally {{
         startButton.disabled = false;
       }}
@@ -1638,37 +1742,21 @@ class SetupPortalService:
       pollTimer = window.setTimeout(pollLogin, 1500);
     }}
   </script>
-</body>
-</html>"""
+"""
+        return _portal_document(title="微信连接", body=body)
 
     def build_qr_page(self, *, request_host: str = "") -> str:
-        status = self.build_status_payload(request_host=request_host)
-        setup_url = _html_escape(str(status["feishu"].get("setup_url") or status["setup_url"]))
-        return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HarborGate Setup QR</title>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
-    .wrap {{ max-width: 520px; margin: 0 auto; padding: 28px 18px 48px; text-align: center; }}
-    .card {{ background: rgba(255,255,255,0.92); border-radius: 20px; padding: 20px; box-shadow: 0 18px 48px rgba(51,36,18,0.12); }}
-    img {{ width: 280px; height: 280px; background: #f8f3ec; border-radius: 18px; }}
-    code {{ word-break: break-all; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h1>手机扫码配置 Feishu</h1>
-      <p>扫下面这个二维码，打开本机 HarborGate 的 Feishu 配置页。</p>
-      <img src="/setup/feishu/qr.svg" alt="setup qr" />
-      <p><code>{setup_url}</code></p>
-    </div>
-  </div>
-</body>
-</html>"""
+        body = """
+    <section class="card stack">
+      <div>
+        <div class="eyebrow">IM 连接</div>
+        <h1>飞书连接</h1>
+        <p>使用手机扫码打开飞书连接页面。</p>
+      </div>
+      <img class="qr" src="/setup/feishu/qr.svg" alt="飞书连接二维码" />
+    </section>
+"""
+        return _portal_document(title="飞书连接", body=body, narrow=True)
 
     def build_qr_svg(self, *, request_host: str = "") -> str:
         status = self.build_status_payload(request_host=request_host)
