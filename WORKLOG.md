@@ -1,5 +1,20 @@
 # HarborGate Work Log
 
+## 2026-05-01
+
+### Rust-Only Runtime Cutover
+
+- Promoted Rust `harborgate` to the only current HarborGate runtime.
+- Archived the final Python-capable checkpoint with
+  `archive/harborgate-python-runtime-final-20260501`.
+- Retired Python runtime packaging from main; rollback now means installing an
+  older verified release artifact.
+- Verified live `.82` behavior before retirement: Feishu and Weixin private
+  messages both reached HarborBeacon and received replies.
+- Current release checks are Rust-first: `cargo fmt --check`, `cargo test`,
+  `cargo build --release --bin harborgate`, and builder-side
+  `cargo zigbuild --release --bin harborgate --target x86_64-unknown-linux-musl`.
+
 ## 2026-04-26
 
 ### v2.0 Control Pack Start

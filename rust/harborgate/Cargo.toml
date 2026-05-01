@@ -1,17 +1,13 @@
 [package]
-name = "harborgate-rust"
+name = "harborgate"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Rust parity lane for HarborGate IM transport gateway"
+description = "Rust HarborGate IM transport gateway for HarborBeacon"
 
 [lib]
 name = "harborgate"
 path = "src/lib.rs"
-
-[[bin]]
-name = "harborgate-rust"
-path = "src/main.rs"
 
 [[bin]]
 name = "harborgate"

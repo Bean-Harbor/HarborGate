@@ -1,99 +1,48 @@
-# HarborGate v2.0 Roadmap
+# HarborGate Rust Roadmap
 
 ## Guiding Baseline
 
-The active implementation guide is
-[`HarborBeacon-HarborGate-Agent-Contract-v2.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v2.0.md).
+HarborGate is the Rust IM gateway for HarborBeacon. The active cross-repo
+contract is `HarborBeacon-HarborGate-Agent-Contract-v2.0.md`.
 
-v1.5 is historical reference only. Current work must follow the v2.0 upgrade
-runbook and cutover checklist.
-
-## Project Goal
-
-Build the HarborGate transport side of the v2.0 conversation-turn seam:
-
-- HarborGate owns platform adapters, ingress, outbound delivery, route registry,
-  and platform credentials.
-- HarborBeacon owns conversation handles, active frames, business execution,
-  approvals, artifacts, and audit.
-
-## Phases
-
-### Phase 0: v2.0 Control Pack
-
-Status: in progress
-
-- Publish the v2.0 contract.
-- Update management docs.
-- Add drift guards that expose v1.5 active paths.
+## Current Milestone: Rust-Only Release Readiness
 
 Exit criteria:
 
-- README, PLAN, ROADMAP, WORKLOG, runbook, and checklist point to v2.0.
-- Guard tests exist for contract version, `/api/tasks`, `args.resume_token`, and
-  active-frame semantic routing.
+- Rust `harborgate` is the only packaged runtime.
+- HarborBeacon release bundles include `harborgate/bin/harborgate` and no Python
+  runtime fallback.
+- `.82` live acceptance passes for Feishu and Weixin private messages.
+- HarborDesk shows connected/manage for configured IM connectors.
+- HarborBot retrieval remains same-origin through `/api/harbordesk/*`.
 
-### Phase 1: Inbound Turn Path
+## Next Milestones
 
-Status: planned
+1. Release hardening
+   - keep musl builder lane green
+   - keep setup/admin pages customer-facing
+   - improve adapter error classification and observability
 
-- Make HarborGate send canonical `POST /api/web/turns` requests.
-- Ensure stable inbound idempotency with `turn_id`, `trace_id`,
-  `transport.message_id`, and `transport.route_key`.
-- Map HarborBeacon v2 turn responses back into user-visible IM replies without
-  changing business meaning.
+2. Feishu polish
+   - expand interactive card delivery modes
+   - keep native image delivery as the default image path
+   - preserve webhook compatibility for controlled callback deployments
 
-Exit criteria:
+3. Weixin polish
+   - stabilize private-DM long-poll observability
+   - keep text/image/video/file native delivery paths covered
+   - keep group chat outside ready scope until explicitly planned
 
-- Real IM inbound round-trip passes through
-  `HarborGate -> /api/web/turns -> v2 turn response -> user reply`.
-- Same-message retry with the same `turn_id` is proven idempotent.
-- Conflicting replay of the same `turn_id` is rejected.
+4. Product-led prelaunch testing
+   - use HarborDesk as the admin validation entry
+   - use HarborBot as the retrieval user validation entry
+   - run end-to-end Beacon/Gate/WebUI release gates before tagging RC
 
-### Phase 2: Continuation Flow
+## Permanent Boundary Rules
 
-Status: planned
-
-- Store and replay Beacon-owned `conversation.handle`.
-- Store and replay opaque `continuation`.
-- Keep workflow truth in HarborBeacon.
-
-Exit criteria:
-
-- Real active-frame continuation passes end to end.
-- Gate does not parse business active-frame semantics.
-
-### Phase 3: Outbound Delivery
-
-Status: planned
-
-- Keep `POST /api/notifications/deliveries` hosted by HarborGate.
-- Use v2 `delivery_hints`.
-- Keep native video/file fallback inside platform adapters.
-
-Exit criteria:
-
-- Real `HarborBeacon -> HarborGate -> platform delivery` notification succeeds.
-- Conflicting replay of the same `delivery.idempotency_key` is rejected.
-
-### Phase 4: Weixin Evidence
-
-Status: planned
-
-- Stabilize Weixin private-DM text flow on the v2 seam.
-- Validate conversation, clarification, cancel, record, and playback cases.
-- Keep group chat out of scope.
-
-Exit criteria:
-
-- Weixin private-DM matrix in the v2 checklist passes or records an external
-  blocker.
-
-## Working Principles
-
-- Contract-first before adapter-first.
-- Platform logic stays in adapters.
-- Business logic stays in HarborBeacon.
-- No shared runtime state across repos.
-- No v1.5/v2.0 in-process compatibility.
-- Release only after the v2.0 release gate is satisfied.
+- HarborGate and HarborBeacon communicate only through HTTP/JSON.
+- HarborGate keeps IM credentials and platform transport state.
+- HarborBeacon keeps business state, approvals, artifacts, audit, and model
+  policy.
+- HarborGate treats `conversation.handle`, `continuation`, and `active_frame` as
+  opaque Beacon-owned values.

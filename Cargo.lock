@@ -428,7 +428,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "harborgate-rust"
+name = "harborgate"
 version = "0.1.0"
 dependencies = [
  "aes",
