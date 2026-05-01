@@ -546,6 +546,37 @@ class FakeNativeWeixinAdapter(PlatformAdapter):
         return outbound.to_dict() | {"sent": True, "message_id": "wx-native-image-1"}
 
 
+class FakeNativeFeishuAdapter(PlatformAdapter):
+    name = "feishu"
+
+    def get_profile(self) -> dict[str, object]:
+        return {
+            "adapter_name": self.name,
+            "surface_family": "feishu",
+            "transport_mode": "websocket",
+            "supports_mentions": True,
+            "supports_attachments": True,
+            "supports_replies": True,
+            "supports_updates": False,
+            "supports_live_receive": True,
+        }
+
+    def normalize_inbound(self, payload):  # type: ignore[no-untyped-def]
+        return InboundMessage(
+            platform="feishu",
+            chat_id=str(payload.get("chat_id") or "").strip(),
+            user_id=str(payload.get("user_id") or "").strip(),
+            text=str(payload.get("text") or "").strip(),
+            message_id=str(payload.get("message_id") or "").strip(),
+            chat_type=str(payload.get("chat_type") or "p2p").strip().lower() or "p2p",
+            route_key=str(payload.get("route_key") or "").strip(),
+            raw_payload=payload,
+        )
+
+    def send_outbound(self, outbound: OutboundMessage):  # type: ignore[no-untyped-def]
+        return outbound.to_dict() | {"sent": True, "message_id": "feishu-native-image-1"}
+
+
 class FakeNotificationTargetClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -1484,6 +1515,41 @@ class GatewayServiceTests(unittest.TestCase):
                         "user_id": "wx-user-1",
                         "text": "帮我抓拍一下当前摄像头画面",
                         "message_id": "wx-msg-native-image-1",
+                    },
+                )
+
+                self.assertEqual(response["text"], "已抓拍 Tapo 231 当前画面。")
+                self.assertEqual(response["metadata"]["retrieval_render"]["content_kind"], "plain_reply")
+                self.assertEqual(response["metadata"]["native_attachment_count"], 1)
+                self.assertEqual(len(response["attachments"]), 1)
+                self.assertEqual(response["attachments"][0]["kind"], "image")
+                self.assertEqual(response["attachments"][0]["mime_type"], "image/jpeg")
+                self.assertEqual(response["attachments"][0]["path"], image_path.name)
+                self.assertNotIn("附件", response["text"])
+            finally:
+                image_path.close()
+
+    def test_source_bound_feishu_image_reply_uses_attachment_field_without_synthetic_artifact_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = tempfile.NamedTemporaryFile(dir=tmp, suffix=".jpg", delete=False)
+            try:
+                image_path.write(b"fake-jpeg")
+                image_path.close()
+                gateway = GatewayService(
+                    store=FileSessionStore(tmp, max_turns=10),
+                    brain=RuleBasedBrain(),
+                    task_client=FakeImageReplyTaskClient(image_path.name),
+                )
+                gateway.register_adapter(FakeNativeFeishuAdapter())
+
+                response = gateway.handle_inbound(
+                    "feishu",
+                    {
+                        "chat_id": "oc-chat-1",
+                        "user_id": "ou-user-1",
+                        "text": "找到和春天相关的照片",
+                        "message_id": "feishu-msg-native-image-1",
+                        "chat_type": "p2p",
                     },
                 )
 

@@ -1,8 +1,10 @@
 import json
+import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from im_agent.models import OutboundMessage
 from im_agent.platforms.feishu import (
@@ -16,10 +18,14 @@ from im_agent.platforms.feishu import (
 class FakeFeishuHandler(BaseHTTPRequestHandler):
     auth_calls = 0
     bot_info_calls = 0
+    image_upload_calls = 0
     send_calls = 0
     last_path = ""
     last_auth_body = {}
     last_send_body = {}
+    send_bodies = []
+    last_image_upload_content_type = ""
+    last_image_upload_body = b""
 
     def do_GET(self) -> None:  # noqa: N802
         type(self).last_path = self.path
@@ -47,8 +53,9 @@ class FakeFeishuHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         content_length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(content_length).decode("utf-8")
-        payload = json.loads(body) if body else {}
+        raw_body = self.rfile.read(content_length)
+        body = raw_body.decode("utf-8", errors="replace")
+        payload = json.loads(body) if body and not self.path.endswith("/open-apis/im/v1/images") else {}
         type(self).last_path = self.path
         if self.path.endswith("/open-apis/auth/v3/tenant_access_token/internal"):
             type(self).auth_calls += 1
@@ -59,9 +66,19 @@ class FakeFeishuHandler(BaseHTTPRequestHandler):
                 "tenant_access_token": "tenant_token_123",
                 "expire": 7200,
             }
+        elif self.path.endswith("/open-apis/im/v1/images"):
+            type(self).image_upload_calls += 1
+            type(self).last_image_upload_content_type = self.headers.get("Content-Type", "")
+            type(self).last_image_upload_body = raw_body
+            response = {
+                "code": 0,
+                "msg": "success",
+                "data": {"image_key": "img_uploaded_123"},
+            }
         elif self.path.startswith("/open-apis/im/v1/messages"):
             type(self).send_calls += 1
             type(self).last_send_body = payload
+            type(self).send_bodies.append(payload)
             response = {
                 "code": 0,
                 "msg": "success",
@@ -127,6 +144,16 @@ class FeishuAdapterTests(unittest.TestCase):
         FakeWebsocketRuntime.started = 0
         FakeWebsocketRuntime.stopped = 0
         FakeWebsocketRuntime.payload = None
+        FakeFeishuHandler.auth_calls = 0
+        FakeFeishuHandler.bot_info_calls = 0
+        FakeFeishuHandler.image_upload_calls = 0
+        FakeFeishuHandler.send_calls = 0
+        FakeFeishuHandler.last_path = ""
+        FakeFeishuHandler.last_auth_body = {}
+        FakeFeishuHandler.last_send_body = {}
+        FakeFeishuHandler.send_bodies = []
+        FakeFeishuHandler.last_image_upload_content_type = ""
+        FakeFeishuHandler.last_image_upload_body = b""
 
     def test_normalize_direct_message_from_raw_event(self) -> None:
         adapter = FeishuAdapter(
@@ -311,6 +338,63 @@ class FeishuAdapterTests(unittest.TestCase):
             self.assertEqual(FakeFeishuHandler.send_calls, 1)
             self.assertEqual(FakeFeishuHandler.last_auth_body["app_id"], "cli_xxx")
             self.assertEqual(FakeFeishuHandler.last_send_body["receive_id"], "oc_chat_1")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_live_send_uploads_native_image_and_sends_image_message(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeFeishuHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                image_path = Path(tmp) / "scene-001.jpg"
+                image_path.write_bytes(b"fake-jpeg")
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                adapter = FeishuAdapter(
+                    FeishuSettings(
+                        app_id="cli_xxx",
+                        app_secret="secret_xxx",
+                        connection_mode="webhook",
+                        base_url=base_url,
+                        auth_base_url=base_url,
+                        enable_live_send=True,
+                    )
+                )
+
+                payload = adapter.send_outbound(
+                    OutboundMessage(
+                        platform="feishu",
+                        chat_id="oc_chat_1",
+                        text="已找到与“春天”相关的 1 张图片。",
+                        attachments=[
+                            {
+                                "kind": "image",
+                                "label": "scene-001.jpg",
+                                "mime_type": "image/jpeg",
+                                "path": str(image_path),
+                            }
+                        ],
+                        metadata={"source": "harborbeacon"},
+                    )
+                )
+
+            self.assertTrue(payload["sent"])
+            self.assertEqual(payload["message_id"], "om_sent_123")
+            self.assertEqual(payload["metadata"]["native_attachment_kind"], "image")
+            self.assertTrue(payload["metadata"]["native_image_reply"])
+            self.assertEqual(payload["metadata"]["native_attachment_count"], 1)
+            self.assertEqual(FakeFeishuHandler.auth_calls, 1)
+            self.assertEqual(FakeFeishuHandler.image_upload_calls, 1)
+            self.assertEqual(FakeFeishuHandler.send_calls, 2)
+            self.assertIn("multipart/form-data", FakeFeishuHandler.last_image_upload_content_type)
+            self.assertIn(b'name="image_type"', FakeFeishuHandler.last_image_upload_body)
+            self.assertIn(b"message", FakeFeishuHandler.last_image_upload_body)
+            self.assertEqual(FakeFeishuHandler.send_bodies[0]["msg_type"], "text")
+            self.assertEqual(FakeFeishuHandler.send_bodies[1]["msg_type"], "image")
+            image_content = json.loads(FakeFeishuHandler.send_bodies[1]["content"])
+            self.assertEqual(image_content["image_key"], "img_uploaded_123")
         finally:
             server.shutdown()
             server.server_close()

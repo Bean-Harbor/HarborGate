@@ -211,7 +211,7 @@ def _native_source_bound_attachments(
     adapter_name: str,
     response_payload: dict[str, object],
 ) -> list[dict[str, object]]:
-    if adapter_name != "weixin":
+    if adapter_name not in {"weixin", "feishu"}:
         return []
 
     normalized = [
@@ -225,7 +225,7 @@ def _native_source_bound_attachments(
     if not normalized:
         return []
 
-    if _clip_delivery_instruction(response_payload) is not None:
+    if adapter_name == "weixin" and _clip_delivery_instruction(response_payload) is not None:
         if len(normalized) != 1:
             return []
         attachment = normalized[0]

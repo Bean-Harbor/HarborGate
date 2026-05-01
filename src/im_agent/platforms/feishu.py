@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 from urllib import error, parse, request
 
@@ -18,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn"
 FEISHU_BOT_INFO_ENDPOINT = "/open-apis/bot/v3/info"
+FEISHU_IMAGE_UPLOAD_ENDPOINT = "/open-apis/im/v1/images"
 FEISHU_MESSAGE_EVENT_TYPE = "im.message.receive_v1"
+FEISHU_UPLOAD_IMAGE_TYPE = "message"
 
 InboundHandler = Callable[[dict[str, Any]], None]
 
@@ -114,6 +118,113 @@ def build_feishu_text_payload(chat_id: str, text: str) -> dict[str, Any]:
         "msg_type": "text",
         "content": json.dumps({"text": text}, ensure_ascii=False),
     }
+
+
+def build_feishu_image_payload(chat_id: str, image_key: str) -> dict[str, Any]:
+    return {
+        "receive_id": chat_id,
+        "msg_type": "image",
+        "content": json.dumps({"image_key": image_key}, ensure_ascii=False),
+    }
+
+
+def build_feishu_reply_image_payload(image_key: str) -> dict[str, Any]:
+    return {
+        "msg_type": "image",
+        "content": json.dumps({"image_key": image_key}, ensure_ascii=False),
+    }
+
+
+@dataclass(slots=True)
+class NativeFeishuImageAttachment:
+    path: Path
+    mime_type: str
+    file_name: str
+
+
+def _resolve_local_attachment_path(raw_path: str) -> Path | None:
+    normalized = str(raw_path or "").strip()
+    if not normalized:
+        return None
+
+    candidate = Path(normalized)
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _guess_image_mime_type(path: Path, raw_mime_type: str) -> str:
+    mime_type = str(raw_mime_type or "").strip().lower()
+    if mime_type.startswith("image/"):
+        return mime_type
+    guessed, _ = mimetypes.guess_type(path.name)
+    guessed = str(guessed or "").strip().lower()
+    return guessed if guessed.startswith("image/") else "image/jpeg"
+
+
+def _native_image_attachment_from_record(attachment: dict[str, Any]) -> NativeFeishuImageAttachment:
+    kind = str(attachment.get("kind") or attachment.get("type") or "").strip().lower()
+    mime_type = str(attachment.get("mime_type") or "").strip().lower()
+    if kind != "image" and not mime_type.startswith("image/"):
+        raise RuntimeError("Feishu native image reply only supports image attachments")
+
+    path = _resolve_local_attachment_path(str(attachment.get("path") or ""))
+    if path is None:
+        raise RuntimeError("Feishu native image reply requires a readable same-host attachment path")
+
+    metadata = dict(attachment.get("metadata") or {}) if isinstance(attachment.get("metadata"), dict) else {}
+    file_name = (
+        str(metadata.get("file_name") or "").strip()
+        or str(attachment.get("label") or "").strip()
+        or path.name
+    )
+    return NativeFeishuImageAttachment(
+        path=path,
+        mime_type=_guess_image_mime_type(path, mime_type),
+        file_name=file_name,
+    )
+
+
+def _resolve_native_image_attachments(outbound: OutboundMessage) -> list[NativeFeishuImageAttachment]:
+    attachments = [item for item in outbound.attachments if isinstance(item, dict)]
+    if not attachments:
+        return []
+    return [_native_image_attachment_from_record(attachment) for attachment in attachments[:3]]
+
+
+def _should_send_native_image_reply(outbound: OutboundMessage) -> bool:
+    return str(outbound.metadata.get("source") or "").strip() == "harborbeacon" and bool(outbound.attachments)
+
+
+def _safe_multipart_filename(file_name: str) -> str:
+    cleaned = str(file_name or "").replace("\\", "_").replace("/", "_").replace('"', "").strip()
+    ascii_name = cleaned.encode("ascii", errors="ignore").decode("ascii").strip()
+    return ascii_name or "image"
+
+
+def _encode_feishu_image_upload_multipart(attachment: NativeFeishuImageAttachment) -> tuple[bytes, str]:
+    boundary = f"----harborgate-feishu-{os.urandom(12).hex()}"
+    file_bytes = attachment.path.read_bytes()
+    if not file_bytes:
+        raise RuntimeError(f"Feishu image artifact is empty: {attachment.path}")
+
+    safe_filename = _safe_multipart_filename(attachment.file_name or attachment.path.name)
+    encoded_filename = parse.quote(attachment.file_name or attachment.path.name)
+    parts: list[bytes] = [
+        f"--{boundary}\r\n".encode("utf-8"),
+        b'Content-Disposition: form-data; name="image_type"\r\n\r\n',
+        f"{FEISHU_UPLOAD_IMAGE_TYPE}\r\n".encode("utf-8"),
+        f"--{boundary}\r\n".encode("utf-8"),
+        (
+            'Content-Disposition: form-data; name="image"; '
+            f'filename="{safe_filename}"; filename*=UTF-8\'\'{encoded_filename}\r\n'
+        ).encode("utf-8"),
+        f"Content-Type: {attachment.mime_type}\r\n\r\n".encode("utf-8"),
+        file_bytes,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode("utf-8"),
+    ]
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
 class FeishuWebsocketRuntime:
@@ -484,6 +595,9 @@ class FeishuAdapter(PlatformAdapter):
         if not (self.configured and self.settings.enable_live_send):
             return self.build_delivery_payload(outbound)
 
+        if _should_send_native_image_reply(outbound):
+            return self._send_native_image_reply(outbound)
+
         response = self._send_message_request(outbound)
         message_id = str(((response.get("data") or {}).get("message_id") or "")).strip()
         return {
@@ -500,6 +614,118 @@ class FeishuAdapter(PlatformAdapter):
             },
             "request": self._build_request_body(outbound),
             "response": response,
+        }
+
+    def _send_native_image_reply(self, outbound: OutboundMessage) -> dict[str, Any]:
+        native_attachments = _resolve_native_image_attachments(outbound)
+        if not native_attachments:
+            response = self._send_message_request(outbound)
+            message_id = str(((response.get("data") or {}).get("message_id") or "")).strip()
+            return {
+                "platform": "feishu",
+                "chat_id": outbound.chat_id,
+                "text": outbound.text,
+                "timestamp": outbound.timestamp,
+                "delivery": "feishu",
+                "sent": True,
+                "message_id": message_id,
+                "metadata": {
+                    **outbound.metadata,
+                    "connection_mode": self.settings.connection_mode,
+                },
+                "request": self._build_request_body(outbound),
+                "response": response,
+            }
+
+        native_caption = outbound.text.strip()
+        token = self._get_tenant_access_token()
+        sent_responses: list[dict[str, Any]] = []
+        image_keys: list[str] = []
+        observed_at = _now_utc()
+        self._set_transport_state(
+            status="sending",
+            last_error="",
+            last_send_at=observed_at,
+            last_send_attachment_count=len(native_attachments),
+            last_send_content_kind="text+image" if native_caption else "image",
+        )
+
+        try:
+            if native_caption:
+                sent_responses.append(self._send_message_request(outbound, token=token))
+            for attachment in native_attachments:
+                image_key = self._upload_image_attachment(attachment, token=token)
+                image_keys.append(image_key)
+                sent_responses.append(self._send_image_message_request(outbound, image_key, token=token))
+        except Exception as exc:
+            error_text = _redact_sensitive_text(
+                str(exc),
+                self.settings.app_id,
+                self.settings.app_secret,
+                self._tenant_access_token,
+            )
+            with self._transport_lock:
+                connected = bool(self._transport_state.get("connected"))
+            self._set_transport_state(
+                status="connected" if connected else "error",
+                connected=connected,
+                last_error=error_text,
+                last_send_status="failed",
+                last_send_error=error_text,
+                last_send_attachment_count=len(native_attachments),
+                last_send_content_kind="text+image" if native_caption else "image",
+            )
+            raise
+
+        message_ids = [
+            str(((response.get("data") or {}).get("message_id") or "")).strip()
+            for response in sent_responses
+        ]
+        message_ids = [message_id for message_id in message_ids if message_id]
+        message_id = message_ids[-1] if message_ids else ""
+        with self._transport_lock:
+            connected = bool(self._transport_state.get("connected"))
+        self._set_transport_state(
+            status="connected" if connected else f"{self.settings.connection_mode}_idle",
+            last_error="",
+            last_send_status="sent",
+            last_send_provider_message_id=message_id,
+            last_send_attachment_count=len(native_attachments),
+            last_send_content_kind="text+image" if native_caption else "image",
+        )
+        response_attachments = [dict(item) for item in outbound.attachments if isinstance(item, dict)]
+        response_attachments = response_attachments[: len(native_attachments)]
+        return {
+            "platform": "feishu",
+            "chat_id": outbound.chat_id,
+            "text": outbound.text,
+            "timestamp": outbound.timestamp,
+            "delivery": "feishu",
+            "sent": True,
+            "message_id": message_id,
+            "provider_message_id": message_id,
+            "message_ids": message_ids,
+            "attachments": response_attachments,
+            "metadata": {
+                **outbound.metadata,
+                "connection_mode": self.settings.connection_mode,
+                "attachment_count": len(native_attachments),
+                "native_image_reply": True,
+                "native_attachment_count": len(native_attachments),
+                "native_attachment_kind": "image",
+                "native_attachment_fallback": False,
+                "feishu_image_keys": image_keys,
+            },
+            "request": {
+                "text": self._build_request_body(outbound) if native_caption else None,
+                "image_upload": FEISHU_IMAGE_UPLOAD_ENDPOINT,
+                "images": [
+                    self._build_image_request_body(outbound, image_key)
+                    for image_key in image_keys
+                ],
+            },
+            "responses": sent_responses,
+            "response": sent_responses[-1] if sent_responses else {},
         }
 
     def fetch_bot_info(self) -> dict[str, Any]:
@@ -559,8 +785,33 @@ class FeishuAdapter(PlatformAdapter):
             }
         return build_feishu_text_payload(outbound.chat_id, outbound.text)
 
-    def _send_message_request(self, outbound: OutboundMessage) -> dict[str, Any]:
+    def _build_image_request_body(self, outbound: OutboundMessage, image_key: str) -> dict[str, Any]:
+        reply_to_message_id = str(outbound.metadata.get("reply_to_message_id") or "").strip()
+        if reply_to_message_id:
+            return build_feishu_reply_image_payload(image_key)
+        return build_feishu_image_payload(outbound.chat_id, image_key)
+
+    def _send_message_request(self, outbound: OutboundMessage, *, token: str | None = None) -> dict[str, Any]:
         body = self._build_request_body(outbound)
+        return self._send_message_body(outbound, body, token=token)
+
+    def _send_image_message_request(
+        self,
+        outbound: OutboundMessage,
+        image_key: str,
+        *,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        body = self._build_image_request_body(outbound, image_key)
+        return self._send_message_body(outbound, body, token=token)
+
+    def _send_message_body(
+        self,
+        outbound: OutboundMessage,
+        body: dict[str, Any],
+        *,
+        token: str | None = None,
+    ) -> dict[str, Any]:
         reply_to_message_id = str(outbound.metadata.get("reply_to_message_id") or "").strip()
         update_message_id = str(outbound.metadata.get("update_message_id") or "").strip()
         if update_message_id:
@@ -575,8 +826,24 @@ class FeishuAdapter(PlatformAdapter):
             self.settings.base_url,
             endpoint,
             body,
-            token=self._get_tenant_access_token(),
+            token=token or self._get_tenant_access_token(),
         )
+
+    def _upload_image_attachment(self, attachment: NativeFeishuImageAttachment, *, token: str) -> str:
+        body, content_type = _encode_feishu_image_upload_multipart(attachment)
+        response = self._post_multipart(
+            self.settings.base_url,
+            FEISHU_IMAGE_UPLOAD_ENDPOINT,
+            body,
+            content_type=content_type,
+            token=token,
+        )
+        data = response.get("data")
+        data = data if isinstance(data, dict) else {}
+        image_key = str(data.get("image_key") or "").strip()
+        if not image_key:
+            raise RuntimeError("Feishu image upload response did not include image_key")
+        return image_key
 
     def _get_tenant_access_token(self) -> str:
         if self._tenant_access_token and time.time() < self._tenant_access_token_expires_at:
@@ -603,6 +870,37 @@ class FeishuAdapter(PlatformAdapter):
     def _post_json(self, base_url: str, endpoint: str, payload: dict[str, Any], *, token: str) -> dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return self._request_json("POST", base_url, endpoint, payload_bytes=body, token=token)
+
+    def _post_multipart(
+        self,
+        base_url: str,
+        endpoint: str,
+        payload_bytes: bytes,
+        *,
+        content_type: str,
+        token: str,
+    ) -> dict[str, Any]:
+        headers = {
+            "Content-Type": content_type,
+            "Content-Length": str(len(payload_bytes)),
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = request.Request(
+            parse.urljoin(f"{base_url.rstrip('/')}/", endpoint.lstrip("/")),
+            data=payload_bytes,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=self.settings.timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Feishu API returned HTTP {exc.code}: {detail}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"Could not reach Feishu API: {exc.reason}") from exc
+        return self._decode_openapi_response(raw)
 
     def _get_json(self, base_url: str, endpoint: str, *, token: str) -> dict[str, Any]:
         return self._request_json("GET", base_url, endpoint, payload_bytes=None, token=token)
@@ -631,6 +929,10 @@ class FeishuAdapter(PlatformAdapter):
         except error.URLError as exc:
             raise RuntimeError(f"Could not reach Feishu API: {exc.reason}") from exc
 
+        return self._decode_openapi_response(raw)
+
+    @staticmethod
+    def _decode_openapi_response(raw: str) -> dict[str, Any]:
         data = json.loads(raw) if raw else {}
         if not isinstance(data, dict):
             raise RuntimeError("Feishu API returned a non-object JSON payload")
