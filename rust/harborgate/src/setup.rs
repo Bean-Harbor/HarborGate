@@ -205,11 +205,13 @@ impl SetupPortalService {
         let body = format!(
             r#"
     <section class="card stack">
-      <div>
-        <div class="eyebrow">IM 连接</div>
-        <h1>飞书连接</h1>
-        <p>连接飞书应用后，可通过飞书接收和回复消息。</p>
-      </div>
+      <header class="native-header">
+        <div>
+          <h1>飞书</h1>
+          <p>消息连接</p>
+        </div>
+        <span class="badge {state_badge}">{state_label}</span>
+      </header>
       {problem}
       <div class="summary">
         <div class="row"><span class="label">连接状态</span><span class="badge {state_badge}">{state_label}</span></div>
@@ -218,7 +220,7 @@ impl SetupPortalService {
         <div class="row"><span class="label">应用名称</span><span class="value">{name}</span></div>
         <div class="row"><span class="label">App ID</span><span class="value">{app_id}</span></div>
       </div>
-      <div>
+      <div class="form-panel">
         <label for="app-id">App ID</label>
         <input id="app-id" type="text" placeholder="cli_xxx" autocomplete="off" />
         <label for="app-secret">App Secret</label>
@@ -249,7 +251,7 @@ impl SetupPortalService {
         const data = await response.json();
         if (!response.ok || !data.success) throw new Error(data.message || '配置失败');
         result.className = 'hint ok';
-        result.textContent = '飞书连接已保存，可以返回 HarborDesk 查看状态。';
+        result.textContent = '飞书连接已保存。';
       }} catch (error) {{
         result.className = 'hint err';
         result.textContent = '保存失败，请检查 App ID 和 App Secret 后重试。';
@@ -286,7 +288,7 @@ impl SetupPortalService {
         let notice = if unbound {
             r#"<div class="notice good">已解绑。请重新扫码绑定微信。</div>"#.to_string()
         } else if configured {
-            r#"<div class="notice good">已绑定。可返回 HarborDesk 使用微信连接。</div>"#.to_string()
+            r#"<div class="notice good">已绑定。</div>"#.to_string()
         } else {
             String::new()
         };
@@ -306,18 +308,20 @@ impl SetupPortalService {
         let body = format!(
             r#"
     <section class="card stack">
-      <div>
-        <div class="eyebrow">IM 连接</div>
-        <h1>微信连接</h1>
-        <p>绑定微信后，可通过微信接收和回复消息。</p>
-      </div>
+      <header class="native-header">
+        <div>
+          <h1>微信</h1>
+          <p>消息连接</p>
+        </div>
+        <span class="badge {state_badge}">{state_label}</span>
+      </header>
       {notice}
       <div class="summary">
         <div class="row"><span class="label">绑定状态</span><span class="badge {binding_badge}">{binding_label}</span></div>
         <div class="row"><span class="label">连接状态</span><span class="badge {state_badge}">{state_label}</span></div>
         <div class="row"><span class="label">账号</span><span class="value">{account}</span></div>
       </div>
-      <div class="summary">
+      <div class="form-panel">
         <h2>扫码绑定</h2>
         <p>{login_hint}</p>
         <div class="actions"><button id="weixin-login-start" class="primary" type="button">{login_button}</button></div>
@@ -410,11 +414,12 @@ impl SetupPortalService {
             "飞书连接",
             r#"
     <section class="card stack">
-      <div>
-        <div class="eyebrow">IM 连接</div>
-        <h1>飞书连接</h1>
-        <p>使用手机扫码打开飞书连接页面。</p>
-      </div>
+      <header class="native-header">
+        <div>
+          <h1>飞书</h1>
+          <p>扫码打开连接页面</p>
+        </div>
+      </header>
       <img class="qr" src="/setup/feishu/qr.svg" alt="飞书连接二维码" />
     </section>
 "#,
@@ -941,7 +946,7 @@ fn portal_document(title: &str, body: &str, narrow: bool) -> String {
 </head>
 <body>
   <main class="{wrap}">
-    <nav class="topbar" aria-label="页面导航"><a class="back-link" href="/ui/harbordesk">返回 HarborDesk</a></nav>
+    <nav class="topbar" aria-label="页面导航"><a class="back-link" href="/ui/harbor-assistant?tab=messages&amp;ngsw-bypass=1">返回</a></nav>
     {body}
   </main>
 </body>
@@ -1115,14 +1120,14 @@ impl IfEmptyThen for String {
 
 const PORTAL_CSS: &str = r#"
 :root {
-  --bg: #f7f4ff;
+  --bg: #f6f7f9;
   --surface: #ffffff;
-  --surface-soft: #f4efff;
+  --surface-soft: #f7f8fa;
   --primary: #6715ff;
   --primary-dark: #40108f;
-  --text: #201638;
-  --muted: #716982;
-  --border: #ded5f2;
+  --text: #20252b;
+  --muted: #68707d;
+  --border: #d9dde3;
   --success: #19745f;
   --danger: #b3261e;
   --warning: #8a5b00;
@@ -1131,10 +1136,10 @@ const PORTAL_CSS: &str = r#"
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: linear-gradient(180deg, #f3efff 0%, #ffffff 100%);
+  background: var(--bg);
   color: var(--text);
 }
-.wrap { max-width: 760px; margin: 0 auto; padding: 28px 18px 52px; }
+.wrap { max-width: 920px; margin: 0 auto; padding: 24px 18px 48px; }
 .wrap.narrow { max-width: 560px; text-align: center; }
 .topbar { display: flex; justify-content: flex-end; margin-bottom: 14px; }
 .back-link {
@@ -1151,17 +1156,26 @@ body {
 }
 .back-link:hover { background: var(--surface-soft); }
 .card {
-  background: rgba(255, 255, 255, 0.96);
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 24px;
-  box-shadow: 0 18px 42px rgba(72, 41, 150, 0.12);
+  padding: 0;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
 }
-.stack { display: grid; gap: 16px; }
+.stack { display: grid; gap: 0; }
 .eyebrow { color: var(--primary); font-size: 13px; font-weight: 700; margin-bottom: 8px; }
-h1 { margin: 0 0 10px; font-size: 32px; line-height: 1.15; }
+h1 { margin: 0; font-size: 24px; line-height: 1.2; }
 h2 { margin: 0; font-size: 20px; line-height: 1.25; }
 p { margin: 0; line-height: 1.58; color: var(--muted); }
+.native-header {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+  min-height: 72px;
+  padding: 16px 20px;
+}
 label { display: block; margin: 14px 0 8px; font-weight: 700; }
 input {
   width: 100%;
@@ -1187,12 +1201,11 @@ button:disabled { background: #d8d2e8; color: #766f8f; cursor: not-allowed; }
 .summary {
   display: grid;
   gap: 10px;
-  margin: 18px 0;
-  padding: 16px;
-  border-radius: 8px;
-  background: var(--surface-soft);
-  border: 1px solid var(--border);
+  margin: 0;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
 }
+.form-panel { padding: 18px 20px; }
 .row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .label { color: var(--muted); }
 .value { font-weight: 700; text-align: right; }
@@ -1209,7 +1222,7 @@ button:disabled { background: #d8d2e8; color: #766f8f; cursor: not-allowed; }
 .badge.good { background: #e8f7f2; color: var(--success); }
 .badge.warn { background: #fff6df; color: var(--warning); }
 .badge.danger { background: #ffe8e5; color: var(--danger); }
-.notice { padding: 14px 16px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-soft); color: var(--text); }
+.notice { border-bottom: 1px solid var(--border); padding: 14px 20px; color: var(--text); }
 .notice.good { background: #edf9f5; border-color: #c7e9de; color: var(--success); }
 .notice.danger { background: #ffe8e5; border-color: #f1b8b2; color: var(--danger); }
 .hint { color: var(--muted); font-size: 14px; }
@@ -1227,8 +1240,8 @@ button:disabled { background: #d8d2e8; color: #766f8f; cursor: not-allowed; }
 form { margin: 0; }
 @media (max-width: 640px) {
   .wrap { padding: 18px 12px 36px; }
-  .card { padding: 18px; }
-  h1 { font-size: 28px; }
+  h1 { font-size: 22px; }
+  .native-header { align-items: flex-start; flex-direction: column; }
   .row { align-items: flex-start; flex-direction: column; gap: 4px; }
   .value { text-align: left; }
   .actions button { width: 100%; }
@@ -1252,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_pages_include_harbordesk_back_link() {
+    fn setup_pages_include_harbor_assistant_back_link() {
         let dir = tempdir().unwrap();
         let mut config = AppConfig::from_env();
         config.state_dir = dir.path().to_path_buf();
@@ -1262,9 +1275,12 @@ mod tests {
         let service = SetupPortalService::new(config, gateway);
         assert!(service
             .build_weixin_setup_page("127.0.0.1:8787", false)
-            .contains("返回 HarborDesk"));
+            .contains(">返回</a>"));
         assert!(service
             .build_feishu_setup_page("127.0.0.1:8787")
-            .contains("返回 HarborDesk"));
+            .contains(">返回</a>"));
+        assert!(service
+            .build_weixin_setup_page("127.0.0.1:8787", false)
+            .contains("/ui/harbor-assistant?tab=messages&amp;ngsw-bypass=1"));
     }
 }
