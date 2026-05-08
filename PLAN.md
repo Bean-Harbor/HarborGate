@@ -31,8 +31,8 @@ Keep HarborGate as the IM transport boundary for HarborBeacon:
    - rollback by installing an older verified release artifact
 
 3. Product acceptance
-   - verify HarborDesk IM Connectors against `/api/setup/status`
-   - verify HarborBot retrieval stays under `/api/harbordesk/*`
+   - verify Harbor Assistant Messages tab against `/api/setup/status`
+   - verify Harbor Assistant Search requests stay under `/api/harbor-assistant/*`
    - run Feishu and Weixin private-DM live acceptance before release
 
 ## Drift Guards

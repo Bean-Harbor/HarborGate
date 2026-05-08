@@ -13,8 +13,8 @@ Exit criteria:
 - HarborBeacon release bundles include `harborgate/bin/harborgate` and no Python
   runtime fallback.
 - `.82` live acceptance passes for Feishu and Weixin private messages.
-- HarborDesk shows connected/manage for configured IM connectors.
-- HarborBot retrieval remains same-origin through `/api/harbordesk/*`.
+- Harbor Assistant Messages shows connected/manage for configured IM connectors.
+- Harbor Assistant Search remains same-origin through `/api/harbor-assistant/*`.
 
 ## Next Milestones
 
@@ -34,8 +34,8 @@ Exit criteria:
    - keep group chat outside ready scope until explicitly planned
 
 4. Product-led prelaunch testing
-   - use HarborDesk as the admin validation entry
-   - use HarborBot as the retrieval user validation entry
+   - use Harbor Assistant as the only WebUI validation entry
+   - validate Search, Camera, Messages, and Settings as internal tabs
    - run end-to-end Beacon/Gate/WebUI release gates before tagging RC
 
 ## Permanent Boundary Rules
