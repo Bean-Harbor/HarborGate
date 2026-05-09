@@ -2,10 +2,13 @@
 
 HarborGate is the Rust-based IM transport gateway for HarborBeacon.
 
-The active cross-repo contract is
+The active IM service-to-service contract is
 [`HarborBeacon-HarborGate-Agent-Contract-v2.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v2.0.md).
-HarborGate owns IM adapters, platform credentials, setup/admin pages, inbound
-normalization, route registry, outbound delivery, and redacted gateway status.
+The northbound channel-edge upgrade is
+[`HarborBeacon-HarborGate-Agent-Contract-v3.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v3.0.md).
+HarborGate owns IM adapters, channel-edge entrypoints, platform credentials,
+setup/admin pages, inbound normalization, route registry, outbound delivery,
+and redacted gateway status.
 HarborBeacon owns business conversation state, active frames, approvals,
 artifacts, audit, and local model policy.
 
@@ -69,6 +72,18 @@ POST /api/web/turns
 X-Contract-Version: 2.0
 ```
 
+Android/Web clients enter through HarborGate:
+
+```text
+POST /api/gateway/turns
+```
+
+Beacon-owned admin/config APIs are proxied through HarborGate:
+
+```text
+/api/beacon/* -> HarborBeacon /api/*
+```
+
 Rules that must not drift:
 
 - do not post active turns to `/api/tasks`
@@ -88,6 +103,8 @@ POST /api/notifications/deliveries
 - `GET /health`
 - `GET /api/setup/status`
 - `GET /api/gateway/status`
+- `POST /api/gateway/turns`
+- `/api/beacon/*`
 - `POST /messages/webhook`
 - `POST /messages/feishu`
 - `POST /messages/weixin`

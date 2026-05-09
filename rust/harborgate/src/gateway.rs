@@ -4,7 +4,10 @@ use crate::adapters::weixin::WeixinAdapter;
 use crate::adapters::PlatformAdapter;
 use crate::config::AppConfig;
 use crate::error::GatewayError;
-use crate::harborbeacon::{derive_route_key, derive_session_id, stable_id, HarborBeaconTaskClient};
+use crate::harborbeacon::{
+    build_channel_turn_request, derive_route_key, derive_session_id, stable_id,
+    HarborBeaconTaskClient,
+};
 use crate::models::{ConversationTurn, InboundMessage, OutboundMessage};
 use crate::store::FileSessionStore;
 use axum::http::StatusCode;
@@ -206,6 +209,113 @@ impl GatewayService {
             metadata: outbound_metadata,
         };
         adapter.send_outbound(outbound).await
+    }
+
+    pub async fn handle_gateway_turn(&self, payload: Value) -> Result<Value, GatewayError> {
+        let Some(task_client) = &self.task_client else {
+            return Err(GatewayError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "HARBORBEACON_DISABLED",
+                "HarborBeacon turn forwarding is not configured",
+            ));
+        };
+        let inbound = gateway_turn_to_inbound(&payload)?;
+        let mut session_metadata = self
+            .store
+            .load_metadata(&inbound.platform, &inbound.chat_id)
+            .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
+        if let Some(handle) = payload
+            .pointer("/conversation/handle")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            session_metadata.insert("conversation_handle".into(), json!(handle.trim()));
+        }
+        if let Some(continuation) = payload
+            .get("continuation")
+            .filter(|value| value.is_object())
+        {
+            session_metadata.insert("continuation".into(), continuation.clone());
+        }
+
+        let conversation_handle = session_metadata
+            .get("conversation_handle")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let continuation = session_metadata
+            .get("continuation")
+            .filter(|value| value.is_object())
+            .cloned();
+        let request_payload = build_channel_turn_request(
+            &inbound,
+            &payload,
+            conversation_handle.as_deref(),
+            continuation,
+        );
+        let task_result = task_client.submit_turn_payload(request_payload).await?;
+
+        let resolved_route_key = task_result
+            .route_key
+            .trim()
+            .to_string()
+            .if_empty_then(|| derive_route_key(&inbound));
+        let resolved_session_id = derive_session_id(&inbound);
+        let mut next_metadata = session_metadata;
+        next_metadata.insert("route_key".into(), json!(resolved_route_key));
+        next_metadata.insert("session_id".into(), json!(resolved_session_id));
+        next_metadata.insert("last_turn_id".into(), json!(task_result.task_id));
+        next_metadata.insert("last_trace_id".into(), json!(task_result.trace_id));
+        if let Some(handle) = &task_result.conversation_handle {
+            next_metadata.insert("conversation_handle".into(), json!(handle));
+        }
+        if let Some(continuation) = &task_result.continuation {
+            next_metadata.insert("continuation".into(), continuation.clone());
+        } else {
+            next_metadata.remove("continuation");
+        }
+        if !inbound.message_id.trim().is_empty() {
+            next_metadata.insert("last_message_id".into(), json!(inbound.message_id));
+        }
+        self.store
+            .set_metadata(&inbound.platform, &inbound.chat_id, next_metadata)
+            .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
+        self.store
+            .register_route(
+                &resolved_route_key,
+                json!({
+                    "route_key": resolved_route_key,
+                    "platform": inbound.platform,
+                    "chat_id": inbound.chat_id,
+                    "user_id": inbound.user_id,
+                    "adapter_name": inbound.platform,
+                    "session_id": resolved_session_id,
+                    "status": "active",
+                    "route_mode": "channel_edge",
+                    "route_source": "gateway_turn",
+                }),
+            )
+            .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
+        self.store
+            .append_turns(
+                &inbound.platform,
+                &inbound.chat_id,
+                vec![
+                    ConversationTurn {
+                        role: "user".into(),
+                        content: inbound.text.clone(),
+                        timestamp: crate::models::utc_now_iso(),
+                    },
+                    ConversationTurn {
+                        role: "assistant".into(),
+                        content: task_result.text.clone(),
+                        timestamp: crate::models::utc_now_iso(),
+                    },
+                ],
+            )
+            .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
+
+        Ok(task_result.response_payload)
     }
 
     pub async fn handle_notification_delivery(
@@ -430,6 +540,9 @@ impl GatewayService {
             "status": "ok",
             "runtime": "rust",
             "contract_version": "2.0",
+            "gateway_turn_contract_version": "3.0",
+            "gateway_turn_endpoint": "/api/gateway/turns",
+            "beacon_proxy_prefix": "/api/beacon",
             "turn_endpoint": "/api/web/turns",
             "adapters": adapters,
             "delivery_health": self.store.delivery_health().unwrap_or_else(|_| json!({"record_count": 0})),
@@ -513,6 +626,85 @@ impl GatewayService {
             "route_source": if destination.get("id").is_some() { "platform_id" } else { "recipient" },
         }))
     }
+}
+
+fn gateway_turn_to_inbound(payload: &Value) -> Result<InboundMessage, GatewayError> {
+    let channel = first_string(
+        payload,
+        &[
+            "/conversation/channel",
+            "/channel",
+            "/surface",
+            "/transport/channel",
+        ],
+    )
+    .unwrap_or_else(|| "webui".to_string());
+    let thread_id = first_string(
+        payload,
+        &[
+            "/conversation/thread_id",
+            "/thread_id",
+            "/session_id",
+            "/transport/session_id",
+            "/actor/user_id",
+        ],
+    )
+    .unwrap_or_else(|| stable_id("thread_", &crate::harborbeacon::canonical_json(payload), 16));
+    let user_id = first_string(payload, &["/actor/user_id", "/user_id", "/open_id"])
+        .unwrap_or_else(|| "anonymous".to_string());
+    let text = first_string(payload, &["/input/text", "/text", "/message/text"])
+        .ok_or_else(|| GatewayError::validation("input.text is required"))?;
+    let mut metadata = payload
+        .pointer("/transport/metadata")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    metadata.insert("source".into(), json!("gateway_turn"));
+    if let Some(surface) = payload
+        .pointer("/conversation/surface")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        metadata.insert("surface".into(), json!(surface.trim()));
+    }
+    Ok(InboundMessage {
+        platform: channel,
+        chat_id: thread_id,
+        user_id,
+        text,
+        message_id: first_string(
+            payload,
+            &["/transport/message_id", "/message_id", "/turn/turn_id"],
+        )
+        .unwrap_or_default(),
+        chat_type: first_string(payload, &["/conversation/chat_type", "/chat_type"])
+            .unwrap_or_else(|| "p2p".to_string()),
+        route_key: first_string(payload, &["/transport/route_key", "/route_key"])
+            .unwrap_or_default(),
+        session_id: first_string(payload, &["/transport/session_id", "/session_id"])
+            .unwrap_or_default(),
+        mentions: vec![],
+        attachments: payload
+            .pointer("/input/parts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        metadata,
+        timestamp: first_string(payload, &["/turn/occurred_at"])
+            .unwrap_or_else(crate::models::utc_now_iso),
+        raw_payload: payload.clone(),
+    })
+}
+
+fn first_string(payload: &Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        payload
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
 }
 
 fn fallback_reply(history: &[ConversationTurn], inbound: &InboundMessage) -> String {
@@ -1020,5 +1212,39 @@ mod tests {
             .unwrap();
         let second = gateway.handle_notification_delivery(payload).await.unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn gateway_turn_normalizes_android_payload_without_forwarding_push_secret() {
+        let payload = json!({
+            "turn": {"turn_id": "turn-android-1", "trace_id": "trace-android-1"},
+            "actor": {"user_id": "user-1", "workspace_id": "home-1"},
+            "conversation": {"channel": "android", "surface": "android", "thread_id": "device-1"},
+            "transport": {
+                "message_id": "msg-1",
+                "metadata": {
+                    "client_version": "1.0",
+                    "push_token": "secret-token"
+                }
+            },
+            "input": {"text": "hello", "parts": []}
+        });
+
+        let inbound = gateway_turn_to_inbound(&payload).unwrap();
+
+        assert_eq!(inbound.platform, "android");
+        assert_eq!(inbound.chat_id, "device-1");
+        assert_eq!(inbound.user_id, "user-1");
+        assert_eq!(inbound.text, "hello");
+        assert_eq!(inbound.message_id, "msg-1");
+        assert_eq!(
+            inbound.raw_payload["transport"]["metadata"]["push_token"],
+            "secret-token"
+        );
+        let turn_payload =
+            build_channel_turn_request(&inbound, &payload, Some("conv-android-1"), None);
+        assert_eq!(turn_payload["conversation"]["channel"], "android");
+        assert_eq!(turn_payload["conversation"]["handle"], "conv-android-1");
+        assert!(turn_payload["transport"]["metadata"]["push_token"].is_null());
     }
 }

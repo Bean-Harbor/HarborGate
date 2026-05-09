@@ -4,16 +4,19 @@
 
 HarborGate main is Rust-only. The active implementation guide is
 [`HarborBeacon-HarborGate-Agent-Contract-v2.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v2.0.md).
+The northbound channel-edge upgrade guide is
+[`HarborBeacon-HarborGate-Agent-Contract-v3.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v3.0.md).
 
 The retired Python runtime is preserved only in Git history and the archive tag
 `archive/harborgate-python-runtime-final-20260501`.
 
 ## Mission
 
-Keep HarborGate as the IM transport boundary for HarborBeacon:
+Keep HarborGate as the IM transport boundary and northbound channel edge for HarborBeacon:
 
 - own Feishu, Weixin, webhook, setup/admin, route registry, delivery, and
   redacted gateway status
+- own Android/Web channel-edge turn entry and Beacon admin/config proxying
 - call HarborBeacon only through HTTP/JSON
 - keep business state, active-frame semantics, approvals, artifacts, and audit in
   HarborBeacon
@@ -32,7 +35,8 @@ Keep HarborGate as the IM transport boundary for HarborBeacon:
 
 3. Product acceptance
    - verify Harbor Assistant Messages tab against `/api/setup/status`
-   - verify Harbor Assistant Search requests stay under `/api/harbor-assistant/*`
+   - verify Harbor Assistant Search requests stay under `/api/beacon/*`
+   - verify Android/Web turns enter through `POST /api/gateway/turns`
    - run Feishu and Weixin private-DM live acceptance before release
 
 ## Drift Guards
@@ -43,6 +47,7 @@ The project is not release-ready if active code:
 - emits `args.resume_token`
 - routes business behavior from `active_frame.kind`
 - imports HarborBeacon runtime code
+- persists Beacon-owned device credentials, model secrets, or camera config in Gate
 - reintroduces Python runtime packaging or `im_agent` entrypoints
 
 ## Verification

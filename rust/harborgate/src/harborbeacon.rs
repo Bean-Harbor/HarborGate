@@ -66,6 +66,14 @@ impl HarborBeaconTaskClient {
         Ok(map_turn_response(&request_payload, response_payload))
     }
 
+    pub async fn submit_turn_payload(
+        &self,
+        request_payload: Value,
+    ) -> Result<TaskTurnResult, GatewayError> {
+        let response_payload = self.post_json(&request_payload).await?;
+        Ok(map_turn_response(&request_payload, response_payload))
+    }
+
     async fn post_json(&self, payload: &Value) -> Result<Value, GatewayError> {
         let url = format!(
             "{}/{}",
@@ -217,6 +225,79 @@ pub fn build_turn_request(
             "level": "supervised",
         },
     })
+}
+
+pub fn build_channel_turn_request(
+    incoming: &InboundMessage,
+    source_payload: &Value,
+    conversation_handle: Option<&str>,
+    continuation: Option<Value>,
+) -> Value {
+    let mut payload = build_turn_request(incoming, conversation_handle, continuation);
+    apply_channel_turn_overrides(&mut payload, source_payload);
+    payload
+}
+
+fn apply_channel_turn_overrides(payload: &mut Value, source_payload: &Value) {
+    if let Some(turn) = payload.get_mut("turn").and_then(Value::as_object_mut) {
+        if let Some(turn_id) = source_payload
+            .pointer("/turn/turn_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            turn.insert("turn_id".into(), json!(turn_id.trim()));
+        }
+        if let Some(trace_id) = source_payload
+            .pointer("/turn/trace_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            turn.insert("trace_id".into(), json!(trace_id.trim()));
+        }
+        if let Some(occurred_at) = source_payload
+            .pointer("/turn/occurred_at")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            turn.insert("occurred_at".into(), json!(occurred_at.trim()));
+        }
+        if let Some(retry_of) = source_payload.pointer("/turn/retry_of") {
+            turn.insert("retry_of".into(), retry_of.clone());
+        }
+    }
+    if let Some(actor) = payload.get_mut("actor").and_then(Value::as_object_mut) {
+        if let Some(workspace_id) = source_payload
+            .pointer("/actor/workspace_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            actor.insert("workspace_id".into(), json!(workspace_id.trim()));
+        }
+        if let Some(account_id) = source_payload.pointer("/actor/account_id") {
+            actor.insert("account_id".into(), account_id.clone());
+        }
+    }
+    if let Some(conversation) = payload
+        .get_mut("conversation")
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(surface) = source_payload
+            .pointer("/conversation/surface")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            conversation.insert("surface".into(), json!(surface.trim()));
+        }
+    }
+    if let Some(autonomy) = payload.get_mut("autonomy").and_then(Value::as_object_mut) {
+        if let Some(level) = source_payload
+            .pointer("/autonomy/level")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            autonomy.insert("level".into(), json!(level.trim()));
+        }
+    }
 }
 
 fn map_turn_response(request_payload: &Value, response_payload: Value) -> TaskTurnResult {
@@ -432,6 +513,47 @@ mod tests {
             payload["transport"]["route_key"],
             derive_route_key(&incoming)
         );
+        assert!(payload.get("args").is_none());
+        assert!(payload.get("source").is_none());
+    }
+
+    #[test]
+    fn build_channel_turn_request_preserves_client_turn_identity() {
+        let incoming = InboundMessage {
+            platform: "android".into(),
+            chat_id: "device-1".into(),
+            user_id: "user-1".into(),
+            text: "show camera".into(),
+            message_id: "client-msg-1".into(),
+            chat_type: "p2p".into(),
+            route_key: "".into(),
+            session_id: "".into(),
+            mentions: vec![],
+            attachments: vec![],
+            metadata: serde_json::Map::new(),
+            timestamp: utc_now_iso(),
+            raw_payload: json!({"turn": {"turn_id": "turn-client-1"}}),
+        };
+        let source = json!({
+            "turn": {
+                "turn_id": "turn-client-1",
+                "trace_id": "trace-client-1",
+                "occurred_at": "2026-05-09T10:00:00Z",
+                "retry_of": null
+            },
+            "actor": {"workspace_id": "home-android", "account_id": "acct-1"},
+            "conversation": {"surface": "android"},
+            "autonomy": {"level": "supervised"}
+        });
+
+        let payload = build_channel_turn_request(&incoming, &source, Some("conv-1"), None);
+
+        assert_eq!(payload["turn"]["turn_id"], "turn-client-1");
+        assert_eq!(payload["turn"]["trace_id"], "trace-client-1");
+        assert_eq!(payload["actor"]["workspace_id"], "home-android");
+        assert_eq!(payload["conversation"]["channel"], "android");
+        assert_eq!(payload["conversation"]["surface"], "android");
+        assert_eq!(payload["conversation"]["handle"], "conv-1");
         assert!(payload.get("args").is_none());
         assert!(payload.get("source").is_none());
     }

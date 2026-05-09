@@ -3,11 +3,13 @@ use crate::error::GatewayError;
 use crate::gateway::GatewayService;
 use crate::runtime::{maybe_start_feishu_websocket_runtime, maybe_start_weixin_poll_runtime};
 use crate::setup::SetupPortalService;
-use axum::extract::{Path, Query, State};
-use axum::http::{header::CONTENT_TYPE, HeaderMap, StatusCode};
+use axum::body::Bytes;
+use axum::extract::{OriginalUri, Path, Query, State};
+use axum::http::{header::CONTENT_TYPE, HeaderMap, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -55,6 +57,9 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(root))
         .route("/api/setup/status", get(setup_status))
         .route("/api/gateway/status", get(gateway_status))
+        .route("/api/gateway/turns", post(gateway_turn))
+        .route("/api/beacon", any(beacon_proxy_root))
+        .route("/api/beacon/{*path}", any(beacon_proxy))
         .route("/api/notifications/deliveries", post(notification_delivery))
         .route("/setup", get(feishu_setup_page))
         .route("/setup/feishu", get(feishu_setup_page))
@@ -122,6 +127,99 @@ async fn notification_delivery(
     Ok(Json(
         state.gateway.handle_notification_delivery(payload).await?,
     ))
+}
+
+async fn gateway_turn(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, GatewayError> {
+    Ok(Json(state.gateway.handle_gateway_turn(payload).await?))
+}
+
+async fn beacon_proxy_root(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<axum::response::Response, GatewayError> {
+    proxy_beacon_request(state, method, headers, "/api/state".to_string(), body).await
+}
+
+async fn beacon_proxy(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<axum::response::Response, GatewayError> {
+    proxy_beacon_request(
+        state,
+        method,
+        headers,
+        beacon_proxy_target_path(&path, uri.query()),
+        body,
+    )
+    .await
+}
+
+async fn proxy_beacon_request(
+    state: AppState,
+    method: Method,
+    headers: HeaderMap,
+    target_path: String,
+    body: Bytes,
+) -> Result<axum::response::Response, GatewayError> {
+    let base_url = state
+        .config
+        .harborbeacon_base_url
+        .trim()
+        .trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err(GatewayError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HARBORBEACON_DISABLED",
+            "HarborBeacon admin proxy is not configured",
+        ));
+    }
+    let url = format!("{base_url}{target_path}");
+    let reqwest_method =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).map_err(|err| {
+            GatewayError::validation(format!("unsupported proxy method {}: {err}", method))
+        })?;
+    let mut request = Client::new()
+        .request(reqwest_method, url)
+        .body(body.to_vec());
+    request = forward_beacon_headers(request, &headers, state.config.harborbeacon_token.as_str());
+    let response = request.send().await.map_err(|err| {
+        GatewayError::infrastructure(format!("Could not reach HarborBeacon admin API: {err}"))
+    })?;
+    let status = StatusCode::from_u16(response.status().as_u16()).map_err(|err| {
+        GatewayError::infrastructure(format!("HarborBeacon returned invalid HTTP status: {err}"))
+    })?;
+    let upstream_headers = response.headers().clone();
+    let body = response.bytes().await.map_err(|err| {
+        GatewayError::infrastructure(format!(
+            "Could not read HarborBeacon admin API response: {err}"
+        ))
+    })?;
+    let mut result = (status, body).into_response();
+    copy_response_header(&upstream_headers, result.headers_mut(), "content-type");
+    copy_response_header(&upstream_headers, result.headers_mut(), "cache-control");
+    copy_response_header(
+        &upstream_headers,
+        result.headers_mut(),
+        "x-contract-version",
+    );
+    for (name, value) in [
+        ("X-Harbor-Gateway-Proxy", "beacon"),
+        ("X-Harbor-Beacon-Proxy-Prefix", "/api/beacon"),
+    ] {
+        if let Ok(header_value) = value.parse() {
+            result.headers_mut().insert(name, header_value);
+        }
+    }
+    Ok(result)
 }
 
 async fn message(
@@ -275,6 +373,53 @@ fn require_service_auth(config: &AppConfig, headers: &HeaderMap) -> Result<(), G
     Ok(())
 }
 
+fn beacon_proxy_target_path(path: &str, query: Option<&str>) -> String {
+    let tail = path.trim_start_matches('/');
+    let base = if tail.is_empty() {
+        "/api/state".to_string()
+    } else {
+        format!("/api/{tail}")
+    };
+    match query.filter(|value| !value.trim().is_empty()) {
+        Some(query) => format!("{base}?{query}"),
+        None => base,
+    }
+}
+
+fn forward_beacon_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+    harborbeacon_token: &str,
+) -> reqwest::RequestBuilder {
+    for name in [
+        "content-type",
+        "x-request-id",
+        "x-trace-id",
+        "x-harbor-user-id",
+        "x-harbor-open-id",
+        "x-harboros-user",
+        "x-harbor-os-user",
+    ] {
+        if let Some(value) = headers.get(name) {
+            request = request.header(name, value);
+        }
+    }
+    if harborbeacon_token.trim().is_empty() {
+        if let Some(value) = headers.get("authorization") {
+            request = request.header("authorization", value);
+        }
+    } else {
+        request = request.bearer_auth(harborbeacon_token.trim().to_string());
+    }
+    request
+}
+
+fn copy_response_header(source: &HeaderMap, target: &mut HeaderMap, name: &'static str) {
+    if let Some(value) = source.get(name) {
+        target.insert(name, value.clone());
+    }
+}
+
 fn host_header(headers: &HeaderMap) -> &str {
     headers
         .get("Host")
@@ -307,4 +452,22 @@ fn maybe_start_configured_feishu_runtime(
         return;
     }
     maybe_start_feishu_websocket_runtime(gateway, config, true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::beacon_proxy_target_path;
+
+    #[test]
+    fn beacon_proxy_prefix_maps_to_beacon_internal_admin_api() {
+        assert_eq!(beacon_proxy_target_path("", None), "/api/state");
+        assert_eq!(
+            beacon_proxy_target_path("knowledge/search", None),
+            "/api/knowledge/search"
+        );
+        assert_eq!(
+            beacon_proxy_target_path("devices/camera-1/evidence", Some("user_id=u1")),
+            "/api/devices/camera-1/evidence?user_id=u1"
+        );
+    }
 }
