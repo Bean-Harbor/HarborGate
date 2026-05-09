@@ -470,4 +470,24 @@ mod tests {
             "/api/devices/camera-1/evidence?user_id=u1"
         );
     }
+
+    #[test]
+    fn beacon_proxy_maps_home_assistant_paths_without_gate_semantics() {
+        assert_eq!(
+            beacon_proxy_target_path("home-assistant/status", None),
+            "/api/home-assistant/status"
+        );
+        assert_eq!(
+            beacon_proxy_target_path("home-assistant/config", None),
+            "/api/home-assistant/config"
+        );
+        assert_eq!(
+            beacon_proxy_target_path("home-assistant/entities", Some("domain=light")),
+            "/api/home-assistant/entities?domain=light"
+        );
+        assert_eq!(
+            beacon_proxy_target_path("harboros/apps/home-assistant/install", None),
+            "/api/harboros/apps/home-assistant/install"
+        );
+    }
 }
