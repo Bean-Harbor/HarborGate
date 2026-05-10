@@ -9,7 +9,7 @@ on:
         default: "1.0.0"
 
 jobs:
-  rust-ci:
+  build-deb:
     runs-on: ubuntu-latest
     permissions:
       contents: write
