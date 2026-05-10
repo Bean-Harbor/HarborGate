@@ -1,0 +1,7 @@
+#!/bin/bash
+set -e
+
+systemctl stop harboros-im-gate.service || true
+systemctl disable harboros-im-gate.service || true
+
+exit 0

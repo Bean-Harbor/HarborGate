@@ -1,0 +1,13 @@
+[Unit]
+Description=HarborOS IM Gateway Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/harboros-im-gate
+Restart=always
+RestartSec=5s
+StateDirectory=harboros-im-gate
+
+[Install]
+WantedBy=multi-user.target

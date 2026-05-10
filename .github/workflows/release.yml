@@ -1,0 +1,77 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release"
+        required: true
+        default: "1.0.0"
+
+jobs:
+  rust-ci:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout HarborGate
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup target add x86_64-unknown-linux-gnu
+
+      - name: Cache cargo builds
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --bin harboros-im-gate --target x86_64-unknown-linux-gnu
+
+      - name: Create deb package
+        run: |
+          VERSION="${{ inputs.tag }}"
+          PKG_NAME="harboros-im-gate_${VERSION}_linux_amd64"
+          PKG_DIR="./deb-package/${PKG_NAME}"
+
+          mkdir -p ${PKG_DIR}/DEBIAN
+          mkdir -p ${PKG_DIR}/usr/bin
+          mkdir -p ${PKG_DIR}/etc/systemd/system
+
+          cp ./target/x86_64-unknown-linux-gnu/release/harboros-im-gate ${PKG_DIR}/usr/bin/harboros-im-gate
+          chmod +x ${PKG_DIR}/usr/bin/harboros-im-gate
+
+          cp ./debian/harboros-im-gate.service ${PKG_DIR}/etc/systemd/system/
+
+          cp ./debian/control ${PKG_DIR}/DEBIAN/control
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" ${PKG_DIR}/DEBIAN/control
+
+          cp ./debian/postinst ${PKG_DIR}/DEBIAN/postinst
+          chmod +x ${PKG_DIR}/DEBIAN/postinst
+
+          cp ./debian/prerm ${PKG_DIR}/DEBIAN/prerm
+          chmod +x ${PKG_DIR}/DEBIAN/prerm
+
+          dpkg-deb --build ${PKG_DIR}
+          mkdir -p ./artifacts/
+          mv ./deb-package/${PKG_NAME}.deb ./artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.tag }}
+          name: v${{ inputs.tag }}
+          generate_release_notes: true
+          files: |
+            ./artifacts/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

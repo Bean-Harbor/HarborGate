@@ -27,8 +27,8 @@ switching a Python fallback inside the current release.
 ## Quick Start
 
 ```powershell
-cargo test
-cargo run --bin harborgate
+just test
+just start
 ```
 
 The service listens on `127.0.0.1:8787` by default.
@@ -43,13 +43,13 @@ curl http://127.0.0.1:8787/api/setup/status
 Release build:
 
 ```powershell
-cargo build --release --bin harborgate
+just build
 ```
 
 Portable Linux release builds are produced on the builder with:
 
 ```bash
-cargo zigbuild --release --bin harborgate --target x86_64-unknown-linux-musl
+just build-linux
 ```
 
 ## Current Adapters
@@ -171,15 +171,15 @@ rust/harborgate/
 Local gate:
 
 ```powershell
-cargo fmt --check
-cargo test
-cargo build --release --bin harborgate
+just fmt
+just test
+just build
 ```
 
 Release gate on the Linux builder:
 
 ```bash
-cargo zigbuild --release --bin harborgate --target x86_64-unknown-linux-musl
+just build-linux
 ```
 
 Live acceptance:

@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+systemctl daemon-reload
+systemctl enable harboros-im-gate.service
+systemctl restart harboros-im-gate.service
+
+exit 0
