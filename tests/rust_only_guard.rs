@@ -3,13 +3,17 @@ use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
         .canonicalize()
         .expect("repo root should resolve")
 }
 
 fn rust_source_files(root: &Path) -> Vec<PathBuf> {
-    let mut pending = vec![root.join("rust/harborgate/src")];
+    let source_root = if root.join("src").is_dir() {
+        root.join("src")
+    } else {
+        root.join("rust/harborgate/src")
+    };
+    let mut pending = vec![source_root];
     let mut files = Vec::new();
     while let Some(path) = pending.pop() {
         for entry in fs::read_dir(path).expect("source directory should be readable") {
@@ -56,8 +60,12 @@ fn main_branch_has_no_python_runtime_packaging() {
     assert!(!root.join("tools/run_platform_live_gate.py").exists());
     assert!(!root.join("tools/run_weixin_ingress_probe.py").exists());
 
-    let manifest = fs::read_to_string(root.join("rust/harborgate/Cargo.toml"))
-        .expect("crate manifest should be readable");
+    let manifest_path = if root.join("Cargo.toml").is_file() {
+        root.join("Cargo.toml")
+    } else {
+        root.join("rust/harborgate/Cargo.toml")
+    };
+    let manifest = fs::read_to_string(manifest_path).expect("crate manifest should be readable");
     assert!(manifest.contains("name = \"harborgate\""));
     assert!(!manifest.contains("harborgate-rust"));
 }
