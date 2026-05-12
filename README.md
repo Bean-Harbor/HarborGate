@@ -184,7 +184,7 @@ just build-linux
 
 Live acceptance:
 
-- `harborgate.service` reports runtime `rust`
+- `harboros-im-gate.service` reports runtime `rust`
 - Feishu private DM receives a reply
 - Weixin private DM receives a reply
 - `/api/setup/status` reports Feishu connected and Weixin polling/connected
