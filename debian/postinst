@@ -1,6 +1,24 @@
 #!/bin/bash
 set -e
 
+ensure_shared_token_env() {
+  local env_file="/etc/default/harboros-beacon-gate"
+  if [ -f "$env_file" ]; then
+    return
+  fi
+
+  local token
+  token="$(openssl rand -hex 32 2>/dev/null || tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48)"
+  install -d -m 0755 /etc/default
+  umask 077
+  cat > "$env_file" <<EOF
+HARBOR_TASK_API_BEARER_TOKEN=$token
+HARBORBEACON_WEB_API_TOKEN=$token
+IM_AGENT_SERVICE_TOKEN=$token
+EOF
+}
+
+ensure_shared_token_env
 systemctl daemon-reload
 systemctl enable harboros-im-gate.service
 systemctl restart harboros-im-gate.service

@@ -4,6 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
+Environment=HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
+EnvironmentFile=-/etc/default/harboros-beacon-gate
+EnvironmentFile=-/etc/default/harboros-im-gate
 ExecStart=/usr/bin/harboros-im-gate
 Restart=always
 RestartSec=5s
