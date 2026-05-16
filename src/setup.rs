@@ -130,6 +130,10 @@ impl SetupPortalService {
     }
 
     pub fn status_payload(&self, request_host: &str) -> Value {
+        self.status_payload_with_prefix(request_host, "")
+    }
+
+    pub fn status_payload_with_prefix(&self, request_host: &str, route_prefix: &str) -> Value {
         let state = self.store.load_state().unwrap_or_else(|_| json!({}));
         let session = state
             .get("session_code")
@@ -137,22 +141,28 @@ impl SetupPortalService {
             .unwrap_or("")
             .to_string();
         let origin = self.resolve_public_origin(request_host);
-        let setup_url = format!("{origin}/setup?session={}", urlencoding::encode(&session));
-        let feishu_setup_url = format!(
-            "{origin}/setup/feishu?session={}",
+        let prefix = normalized_route_prefix(route_prefix);
+        let setup_url = format!(
+            "{origin}{}?session={}",
+            prefixed_path(&prefix, "/setup"),
             urlencoding::encode(&session)
         );
-        let weixin_setup_url = format!("{origin}/setup/weixin");
+        let feishu_setup_url = format!(
+            "{origin}{}?session={}",
+            prefixed_path(&prefix, "/setup/feishu"),
+            urlencoding::encode(&session)
+        );
+        let weixin_setup_url = format!("{origin}{}", prefixed_path(&prefix, "/setup/weixin"));
         let gateway_status = self.gateway.status();
-        let feishu = self.feishu_status(&state, &origin, &feishu_setup_url);
-        let weixin = self.weixin_status(&state, &origin, &weixin_setup_url);
+        let feishu = self.feishu_status(&state, &origin, &feishu_setup_url, &prefix);
+        let weixin = self.weixin_status(&state, &origin, &weixin_setup_url, &prefix);
         json!({
             "runtime": "rust",
             "session_code": session,
             "setup_url": setup_url,
-            "static_setup_url": format!("{origin}/setup"),
-            "qr_page_url": format!("{origin}/setup/qr"),
-            "qr_svg_url": format!("{origin}/setup/qr.svg"),
+            "static_setup_url": format!("{origin}{}", prefixed_path(&prefix, "/setup")),
+            "qr_page_url": format!("{origin}{}", prefixed_path(&prefix, "/setup/qr")),
+            "qr_svg_url": format!("{origin}{}", prefixed_path(&prefix, "/setup/qr.svg")),
             "mobile_reachable": !looks_like_loopback(&origin),
             "feishu": feishu,
             "weixin": weixin,
@@ -169,12 +179,21 @@ impl SetupPortalService {
     }
 
     pub fn gateway_status_payload(&self, request_host: &str) -> Value {
+        self.gateway_status_payload_with_prefix(request_host, "")
+    }
+
+    pub fn gateway_status_payload_with_prefix(
+        &self,
+        request_host: &str,
+        route_prefix: &str,
+    ) -> Value {
         let mut payload = self.gateway.status();
-        let setup = self.status_payload(request_host);
+        let setup = self.status_payload_with_prefix(request_host, route_prefix);
         payload["setup"] = setup.clone();
         payload["feishu"] = setup["feishu"].clone();
         payload["weixin"] = setup["weixin"].clone();
         payload["channels"] = setup["channels"].clone();
+        payload["setup_url"] = setup["setup_url"].clone();
         payload["static_setup_url"] = setup["static_setup_url"].clone();
         payload["qr_page_url"] = setup["qr_page_url"].clone();
         payload["qr_svg_url"] = setup["qr_svg_url"].clone();
@@ -182,7 +201,16 @@ impl SetupPortalService {
     }
 
     pub fn build_feishu_setup_page(&self, request_host: &str) -> String {
-        let status = self.status_payload(request_host);
+        self.build_feishu_setup_page_with_prefix(request_host, "")
+    }
+
+    pub fn build_feishu_setup_page_with_prefix(
+        &self,
+        request_host: &str,
+        route_prefix: &str,
+    ) -> String {
+        let prefix = normalized_route_prefix(route_prefix);
+        let status = self.status_payload_with_prefix(request_host, &prefix);
         let feishu = &status["feishu"];
         let configured = feishu["configured"].as_bool().unwrap_or(false);
         let connected = feishu["connected"].as_bool().unwrap_or(false);
@@ -202,6 +230,7 @@ impl SetupPortalService {
         } else {
             r#"<div class="notice danger">飞书连接暂时不可用，请检查应用配置后重试。</div>"#.into()
         };
+        let configure_url = prefixed_path(&prefix, "/api/setup/feishu/configure");
         let body = format!(
             r#"
     <section class="card stack">
@@ -243,7 +272,7 @@ impl SetupPortalService {
         verification_token: document.getElementById('verification-token').value.trim()
       }};
       try {{
-        const response = await fetch('/api/setup/feishu/configure', {{
+        const response = await fetch('{configure_url}', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify(payload)
@@ -269,13 +298,24 @@ impl SetupPortalService {
             name = html_escape(feishu["display_name"].as_str().unwrap_or("未设置")),
             app_id = html_escape(feishu["app_id_masked"].as_str().unwrap_or("未设置")),
             session_json = serde_json::to_string(status["session_code"].as_str().unwrap_or(""))
-                .unwrap_or_else(|_| "\"\"".into())
+                .unwrap_or_else(|_| "\"\"".into()),
+            configure_url = configure_url
         );
         portal_document("飞书连接", &body, false)
     }
 
     pub fn build_weixin_setup_page(&self, request_host: &str, unbound: bool) -> String {
-        let status = self.status_payload(request_host);
+        self.build_weixin_setup_page_with_prefix(request_host, unbound, "")
+    }
+
+    pub fn build_weixin_setup_page_with_prefix(
+        &self,
+        request_host: &str,
+        unbound: bool,
+        route_prefix: &str,
+    ) -> String {
+        let prefix = normalized_route_prefix(route_prefix);
+        let status = self.status_payload_with_prefix(request_host, &prefix);
         let weixin = &status["weixin"];
         let configured = weixin["configured"].as_bool().unwrap_or(false);
         let connected = weixin["connected"].as_bool().unwrap_or(false);
@@ -305,6 +345,10 @@ impl SetupPortalService {
         } else {
             "绑定微信"
         };
+        let unbind_url = prefixed_path(&prefix, "/api/setup/weixin/unbind");
+        let qr_svg_url = prefixed_path(&prefix, "/setup/weixin/qr.svg");
+        let login_status_url = prefixed_path(&prefix, "/api/setup/weixin/login/status");
+        let login_start_url = prefixed_path(&prefix, "/api/setup/weixin/login/start");
         let body = format!(
             r#"
     <section class="card stack">
@@ -328,7 +372,7 @@ impl SetupPortalService {
         <div id="weixin-login-status" class="hint" style="margin-top:10px;"></div>
         <img id="weixin-login-qr" class="login-qr" src="" alt="微信登录二维码" />
       </div>
-      <form method="post" action="/api/setup/weixin/unbind" onsubmit="return confirm('确认解绑微信？解绑后需要重新扫码。');">
+      <form method="post" action="{unbind_url}" onsubmit="return confirm('确认解绑微信？解绑后需要重新扫码。');">
         <div class="actions"><button class="danger" type="submit"{unbind_disabled}>解绑微信</button></div>
       </form>
     </section>
@@ -351,7 +395,7 @@ impl SetupPortalService {
       statusEl.textContent = `扫码状态：${{statusText(status)}}${{suffix}}`;
       if (login.qrcode_available) {{
         qrEl.style.display = 'block';
-        qrEl.src = `/setup/weixin/qr.svg?ts=${{Date.now()}}`;
+        qrEl.src = `{qr_svg_url}?ts=${{Date.now()}}`;
       }} else {{
         qrEl.style.display = 'none';
         qrEl.removeAttribute('src');
@@ -364,7 +408,7 @@ impl SetupPortalService {
     }}
     async function pollLogin() {{
       window.clearTimeout(pollTimer);
-      const response = await fetch('/api/setup/weixin/login/status');
+      const response = await fetch('{login_status_url}');
       const data = await response.json();
       renderLogin(data);
       const status = (data.weixin_login || {{}}).status || '';
@@ -377,7 +421,7 @@ impl SetupPortalService {
       statusEl.className = 'hint';
       statusEl.textContent = '正在生成二维码...';
       try {{
-        const response = await fetch('/api/setup/weixin/login/start', {{ method: 'POST' }});
+        const response = await fetch('{login_start_url}', {{ method: 'POST' }});
         const data = await response.json();
         renderLogin(data);
         if (!response.ok || !data.ok) throw new Error(data.message || '生成二维码失败');
@@ -404,15 +448,26 @@ impl SetupPortalService {
             login_hint = html_escape(login_hint),
             login_button = html_escape(login_button),
             unbind_disabled = unbind_disabled,
-            login_state_json = login_state_json
+            login_state_json = login_state_json,
+            unbind_url = unbind_url,
+            qr_svg_url = qr_svg_url,
+            login_status_url = login_status_url,
+            login_start_url = login_start_url
         );
         portal_document("微信连接", &body, false)
     }
 
     pub fn build_qr_page(&self) -> String {
+        self.build_qr_page_with_prefix("")
+    }
+
+    pub fn build_qr_page_with_prefix(&self, route_prefix: &str) -> String {
+        let prefix = normalized_route_prefix(route_prefix);
+        let qr_svg_url = prefixed_path(&prefix, "/setup/feishu/qr.svg");
         portal_document(
             "飞书连接",
-            r#"
+            &format!(
+                r#"
     <section class="card stack">
       <header class="native-header">
         <div>
@@ -420,15 +475,25 @@ impl SetupPortalService {
           <p>扫码打开连接页面</p>
         </div>
       </header>
-      <img class="qr" src="/setup/feishu/qr.svg" alt="飞书连接二维码" />
+      <img class="qr" src="{qr_svg_url}" alt="飞书连接二维码" />
     </section>
 "#,
+                qr_svg_url = qr_svg_url
+            ),
             true,
         )
     }
 
     pub fn build_feishu_qr_svg(&self, request_host: &str) -> String {
-        let status = self.status_payload(request_host);
+        self.build_feishu_qr_svg_with_prefix(request_host, "")
+    }
+
+    pub fn build_feishu_qr_svg_with_prefix(
+        &self,
+        request_host: &str,
+        route_prefix: &str,
+    ) -> String {
+        let status = self.status_payload_with_prefix(request_host, route_prefix);
         let target = status
             .pointer("/feishu/setup_url")
             .and_then(Value::as_str)
@@ -526,6 +591,14 @@ impl SetupPortalService {
     }
 
     pub async fn start_weixin_login(&self) -> Result<(StatusCode, Value), GatewayError> {
+        self.start_weixin_login_with_prefix("").await
+    }
+
+    pub async fn start_weixin_login_with_prefix(
+        &self,
+        route_prefix: &str,
+    ) -> Result<(StatusCode, Value), GatewayError> {
+        let prefix = normalized_route_prefix(route_prefix);
         let bot_type = "3";
         match self
             .gateway
@@ -547,7 +620,7 @@ impl SetupPortalService {
                 }))?;
                 Ok((
                     StatusCode::OK,
-                    json!({"ok": true, "message": "微信二维码已生成。", "weixin_login": self.project_weixin_login_state(&state)}),
+                    json!({"ok": true, "message": "微信二维码已生成。", "weixin_login": self.project_weixin_login_state(&state, &prefix)}),
                 ))
             }
             Err(error) => {
@@ -560,13 +633,21 @@ impl SetupPortalService {
                 }))?;
                 Ok((
                     StatusCode::BAD_GATEWAY,
-                    json!({"ok": false, "message": "微信二维码暂时不可用。", "weixin_login": self.project_weixin_login_state(&state)}),
+                    json!({"ok": false, "message": "微信二维码暂时不可用。", "weixin_login": self.project_weixin_login_state(&state, &prefix)}),
                 ))
             }
         }
     }
 
     pub async fn poll_weixin_login(&self) -> Result<(StatusCode, Value), GatewayError> {
+        self.poll_weixin_login_with_prefix("").await
+    }
+
+    pub async fn poll_weixin_login_with_prefix(
+        &self,
+        route_prefix: &str,
+    ) -> Result<(StatusCode, Value), GatewayError> {
+        let prefix = normalized_route_prefix(route_prefix);
         let mut login = self.store.load_weixin_login_state()?;
         let qrcode = login
             .get("qrcode")
@@ -577,7 +658,7 @@ impl SetupPortalService {
         if qrcode.is_empty() {
             return Ok((
                 StatusCode::NOT_FOUND,
-                json!({"ok": false, "message": "请先生成微信二维码。", "weixin_login": self.project_weixin_login_state(&login)}),
+                json!({"ok": false, "message": "请先生成微信二维码。", "weixin_login": self.project_weixin_login_state(&login, &prefix)}),
             ));
         }
         if login
@@ -590,7 +671,7 @@ impl SetupPortalService {
             let saved = self.store.save_weixin_login_state(login)?;
             return Ok((
                 StatusCode::OK,
-                json!({"ok": false, "message": "微信二维码已过期。", "weixin_login": self.project_weixin_login_state(&saved)}),
+                json!({"ok": false, "message": "微信二维码已过期。", "weixin_login": self.project_weixin_login_state(&saved, &prefix)}),
             ));
         }
         let base_url = login
@@ -612,7 +693,7 @@ impl SetupPortalService {
                 let saved = self.store.save_weixin_login_state(login)?;
                 return Ok((
                     StatusCode::OK,
-                    json!({"ok": false, "message": "微信扫码状态暂时不可用。", "weixin_login": self.project_weixin_login_state(&saved)}),
+                    json!({"ok": false, "message": "微信扫码状态暂时不可用。", "weixin_login": self.project_weixin_login_state(&saved, &prefix)}),
                 ));
             }
         };
@@ -659,7 +740,7 @@ impl SetupPortalService {
             json!({
                 "ok": saved.get("status").and_then(Value::as_str) == Some("confirmed"),
                 "message": "微信扫码状态已更新。",
-                "weixin_login": self.project_weixin_login_state(&saved),
+                "weixin_login": self.project_weixin_login_state(&saved, &prefix),
             }),
         ))
     }
@@ -670,7 +751,13 @@ impl SetupPortalService {
         response
     }
 
-    fn feishu_status(&self, state: &Value, origin: &str, setup_url: &str) -> Value {
+    fn feishu_status(
+        &self,
+        state: &Value,
+        origin: &str,
+        setup_url: &str,
+        route_prefix: &str,
+    ) -> Value {
         let adapter = self.gateway.feishu_adapter();
         let settings = adapter.settings();
         let portal = state.get("feishu").and_then(Value::as_object);
@@ -721,13 +808,19 @@ impl SetupPortalService {
             "app_id_masked": mask_secret(&app_id),
             "last_error": transport.get("last_error").cloned().unwrap_or_else(|| json!("")),
             "setup_url": setup_url,
-            "manage_url": format!("{origin}/admin/im/feishu"),
+            "manage_url": format!("{origin}{}", prefixed_path(route_prefix, "/admin/im/feishu")),
             "readiness": readiness(configured, connected, status),
             "transport": transport,
         })
     }
 
-    fn weixin_status(&self, state: &Value, origin: &str, setup_url: &str) -> Value {
+    fn weixin_status(
+        &self,
+        state: &Value,
+        origin: &str,
+        setup_url: &str,
+        route_prefix: &str,
+    ) -> Value {
         let adapter = self.gateway.weixin_adapter();
         let account = adapter.account();
         let transport = adapter.status();
@@ -770,8 +863,8 @@ impl SetupPortalService {
             "qr_status": if configured { "configured" } else { "not_configured" },
             "manage_status": "available",
             "setup_url": setup_url,
-            "manage_url": format!("{origin}/admin/im/weixin"),
-            "login": self.project_weixin_login_state(&login),
+            "manage_url": format!("{origin}{}", prefixed_path(route_prefix, "/admin/im/weixin")),
+            "login": self.project_weixin_login_state(&login, route_prefix),
             "readiness": readiness(configured, connected && blocker.is_empty(), status),
             "poll": transport.clone(),
             "ingress_observability": transport.clone(),
@@ -798,7 +891,7 @@ impl SetupPortalService {
         })
     }
 
-    fn project_weixin_login_state(&self, payload: &Value) -> Value {
+    fn project_weixin_login_state(&self, payload: &Value, route_prefix: &str) -> Value {
         let status = payload
             .get("status")
             .and_then(Value::as_str)
@@ -820,7 +913,7 @@ impl SetupPortalService {
             "expires_in_seconds": expires_in,
             "qrcode_url": qrcode_value,
             "qrcode_available": !qrcode_value.trim().is_empty(),
-            "qr_svg_url": if qrcode_value.trim().is_empty() { "" } else { "/setup/weixin/qr.svg" },
+            "qr_svg_url": if qrcode_value.trim().is_empty() { String::new() } else { prefixed_path(route_prefix, "/setup/weixin/qr.svg") },
             "account_id_masked": mask_secret(payload.get("account_id").and_then(Value::as_str).unwrap_or("")),
             "user_id_masked": mask_secret(payload.get("user_id").and_then(Value::as_str).unwrap_or("")),
             "last_error": redact_sensitive(payload.get("last_error").and_then(Value::as_str).unwrap_or("")),
@@ -1023,6 +1116,31 @@ fn html_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn normalized_route_prefix(route_prefix: &str) -> String {
+    let trimmed = route_prefix.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn prefixed_path(route_prefix: &str, path: &str) -> String {
+    let prefix = normalized_route_prefix(route_prefix);
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if prefix.is_empty() {
+        path
+    } else {
+        format!("{prefix}{path}")
+    }
 }
 
 fn mask_secret(value: &str) -> String {
@@ -1282,5 +1400,53 @@ mod tests {
         assert!(service
             .build_weixin_setup_page("127.0.0.1:8787", false)
             .contains("/ui/harbor-assistant?tab=messages&amp;ngsw-bypass=1"));
+    }
+
+    #[test]
+    fn setup_pages_support_harbor_gate_prefix() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.state_dir = dir.path().to_path_buf();
+        config.data_dir = dir.path().join("sessions");
+        config.harborbeacon_base_url.clear();
+        let gateway = Arc::new(GatewayService::from_config(&config).unwrap());
+        let service = SetupPortalService::new(config, gateway);
+
+        let status =
+            service.gateway_status_payload_with_prefix("127.0.0.1:8787", "/api/harbor-gate");
+        assert!(status["setup_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:8787/api/harbor-gate/setup?session="));
+        assert_eq!(
+            status["static_setup_url"].as_str().unwrap(),
+            "http://127.0.0.1:8787/api/harbor-gate/setup"
+        );
+        assert_eq!(
+            status["qr_page_url"].as_str().unwrap(),
+            "http://127.0.0.1:8787/api/harbor-gate/setup/qr"
+        );
+        assert_eq!(
+            status["weixin"]["setup_url"].as_str().unwrap(),
+            "http://127.0.0.1:8787/api/harbor-gate/setup/weixin"
+        );
+        assert_eq!(
+            status["weixin"]["manage_url"].as_str().unwrap(),
+            "http://127.0.0.1:8787/api/harbor-gate/admin/im/weixin"
+        );
+
+        let weixin_page = service.build_weixin_setup_page_with_prefix(
+            "127.0.0.1:8787",
+            false,
+            "/api/harbor-gate",
+        );
+        assert!(weixin_page.contains(r#"action="/api/harbor-gate/api/setup/weixin/unbind""#));
+        assert!(weixin_page.contains("fetch('/api/harbor-gate/api/setup/weixin/login/status')"));
+        assert!(weixin_page
+            .contains(r#"qrEl.src = `/api/harbor-gate/setup/weixin/qr.svg?ts=${Date.now()}`;"#));
+
+        let feishu_page =
+            service.build_feishu_setup_page_with_prefix("127.0.0.1:8787", "/api/harbor-gate");
+        assert!(feishu_page.contains("fetch('/api/harbor-gate/api/setup/feishu/configure'"));
     }
 }

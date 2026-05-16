@@ -18,6 +18,8 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 
+const HARBOR_GATE_PUBLIC_PREFIX: &str = "/api/harbor-gate";
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
@@ -58,11 +60,72 @@ pub fn router(state: AppState) -> Router {
         .route("/api/setup/status", get(setup_status))
         .route("/api/gateway/status", get(gateway_status))
         .route("/api/gateway/turns", post(gateway_turn))
+        .route("/api/harbor-gate", get(root))
+        .route("/api/harbor-gate/", get(root))
+        .route(
+            "/api/harbor-gate/api/setup/status",
+            get(prefixed_setup_status),
+        )
+        .route("/api/harbor-gate/api/gateway/status", get(gateway_status))
+        .route("/api/harbor-gate/api/gateway/turns", post(gateway_turn))
         .route("/api/harbor-assistant", any(harbor_assistant_proxy_root))
         .route("/api/harbor-assistant/{*path}", any(harbor_assistant_proxy))
         .route("/api/beacon", any(beacon_proxy_root))
         .route("/api/beacon/{*path}", any(beacon_proxy))
+        .route(
+            "/api/harbor-gate/api/notifications/deliveries",
+            post(notification_delivery),
+        )
         .route("/api/notifications/deliveries", post(notification_delivery))
+        .route("/api/harbor-gate/setup", get(prefixed_feishu_setup_page))
+        .route(
+            "/api/harbor-gate/setup/feishu",
+            get(prefixed_feishu_setup_page),
+        )
+        .route("/api/harbor-gate/setup/qr", get(prefixed_feishu_qr_page))
+        .route(
+            "/api/harbor-gate/setup/feishu/qr",
+            get(prefixed_feishu_qr_page),
+        )
+        .route("/api/harbor-gate/setup/qr.svg", get(prefixed_feishu_qr_svg))
+        .route(
+            "/api/harbor-gate/setup/feishu/qr.svg",
+            get(prefixed_feishu_qr_svg),
+        )
+        .route(
+            "/api/harbor-gate/setup/weixin",
+            get(prefixed_weixin_setup_page),
+        )
+        .route(
+            "/api/harbor-gate/setup/weixin/qr",
+            get(prefixed_weixin_setup_page),
+        )
+        .route("/api/harbor-gate/setup/weixin/qr.svg", get(weixin_qr_svg))
+        .route("/api/harbor-gate/admin/im", get(prefixed_admin_im))
+        .route(
+            "/api/harbor-gate/admin/im/feishu",
+            get(prefixed_feishu_setup_page),
+        )
+        .route(
+            "/api/harbor-gate/admin/im/weixin",
+            get(prefixed_weixin_setup_page),
+        )
+        .route(
+            "/api/harbor-gate/api/setup/feishu/configure",
+            post(configure_feishu),
+        )
+        .route(
+            "/api/harbor-gate/api/setup/weixin/login/start",
+            post(prefixed_weixin_login_start),
+        )
+        .route(
+            "/api/harbor-gate/api/setup/weixin/login/status",
+            get(prefixed_weixin_login_status),
+        )
+        .route(
+            "/api/harbor-gate/api/setup/weixin/unbind",
+            post(prefixed_weixin_unbind),
+        )
         .route("/setup", get(feishu_setup_page))
         .route("/setup/feishu", get(feishu_setup_page))
         .route("/setup/qr", get(feishu_qr_page))
@@ -79,6 +142,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/setup/weixin/login/start", post(weixin_login_start))
         .route("/api/setup/weixin/login/status", get(weixin_login_status))
         .route("/api/setup/weixin/unbind", post(weixin_unbind))
+        .route("/api/harbor-gate/messages/{platform}", post(message))
         .route("/messages/{platform}", post(message))
         .route(&feishu_path, post(feishu_webhook))
         .with_state(state)
@@ -106,6 +170,17 @@ async fn root() -> impl IntoResponse {
 
 async fn setup_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     Json(state.setup.status_payload(host_header(&headers)))
+}
+
+async fn prefixed_setup_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    Json(
+        state
+            .setup
+            .status_payload_with_prefix(host_header(&headers), HARBOR_GATE_PUBLIC_PREFIX),
+    )
 }
 
 async fn gateway_status(
@@ -292,14 +367,45 @@ async fn feishu_setup_page(State(state): State<AppState>, headers: HeaderMap) ->
     Html(state.setup.build_feishu_setup_page(host_header(&headers)))
 }
 
+async fn prefixed_feishu_setup_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    Html(
+        state
+            .setup
+            .build_feishu_setup_page_with_prefix(host_header(&headers), HARBOR_GATE_PUBLIC_PREFIX),
+    )
+}
+
 async fn feishu_qr_page(State(state): State<AppState>) -> impl IntoResponse {
     Html(state.setup.build_qr_page())
+}
+
+async fn prefixed_feishu_qr_page(State(state): State<AppState>) -> impl IntoResponse {
+    Html(
+        state
+            .setup
+            .build_qr_page_with_prefix(HARBOR_GATE_PUBLIC_PREFIX),
+    )
 }
 
 async fn feishu_qr_svg(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
         state.setup.build_feishu_qr_svg(host_header(&headers)),
+    )
+}
+
+async fn prefixed_feishu_qr_svg(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        state
+            .setup
+            .build_feishu_qr_svg_with_prefix(host_header(&headers), HARBOR_GATE_PUBLIC_PREFIX),
     )
 }
 
@@ -313,6 +419,18 @@ async fn weixin_setup_page(
             .setup
             .build_weixin_setup_page(host_header(&headers), query_flag(&query, "unbound")),
     )
+}
+
+async fn prefixed_weixin_setup_page(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    Html(state.setup.build_weixin_setup_page_with_prefix(
+        host_header(&headers),
+        query_flag(&query, "unbound"),
+        HARBOR_GATE_PUBLIC_PREFIX,
+    ))
 }
 
 async fn weixin_qr_svg(State(state): State<AppState>) -> impl IntoResponse {
@@ -339,6 +457,29 @@ async fn admin_im(
         );
     }
     Html(state.setup.build_feishu_setup_page(host_header(&headers)))
+}
+
+async fn prefixed_admin_im(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let platform = query
+        .get("platform")
+        .map(|value| value.trim().to_lowercase())
+        .unwrap_or_else(|| "feishu".into());
+    if platform == "weixin" {
+        return Html(state.setup.build_weixin_setup_page_with_prefix(
+            host_header(&headers),
+            query_flag(&query, "unbound"),
+            HARBOR_GATE_PUBLIC_PREFIX,
+        ));
+    }
+    Html(
+        state
+            .setup
+            .build_feishu_setup_page_with_prefix(host_header(&headers), HARBOR_GATE_PUBLIC_PREFIX),
+    )
 }
 
 async fn configure_feishu(
@@ -371,14 +512,49 @@ async fn weixin_login_status(
     Ok((status, Json(payload)))
 }
 
+async fn prefixed_weixin_login_start(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, GatewayError> {
+    let (status, payload) = state
+        .setup
+        .start_weixin_login_with_prefix(HARBOR_GATE_PUBLIC_PREFIX)
+        .await?;
+    Ok((status, Json(payload)))
+}
+
+async fn prefixed_weixin_login_status(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, GatewayError> {
+    let (status, payload) = state
+        .setup
+        .poll_weixin_login_with_prefix(HARBOR_GATE_PUBLIC_PREFIX)
+        .await?;
+    Ok((status, Json(payload)))
+}
+
 async fn weixin_unbind(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    weixin_unbind_response(state, headers, "/setup/weixin?unbound=1")
+}
+
+async fn prefixed_weixin_unbind(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    weixin_unbind_response(state, headers, "/api/harbor-gate/setup/weixin?unbound=1")
+}
+
+fn weixin_unbind_response(
+    state: AppState,
+    headers: HeaderMap,
+    redirect_path: &'static str,
+) -> axum::response::Response {
     let payload = state.setup.unbind_weixin();
     let accept = headers
         .get("Accept")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if accept.contains("text/html") {
-        return Redirect::to("/setup/weixin?unbound=1").into_response();
+        return Redirect::to(redirect_path).into_response();
     }
     Json(payload).into_response()
 }
