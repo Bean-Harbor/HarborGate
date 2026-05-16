@@ -58,6 +58,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/setup/status", get(setup_status))
         .route("/api/gateway/status", get(gateway_status))
         .route("/api/gateway/turns", post(gateway_turn))
+        .route("/api/harbor-assistant", any(harbor_assistant_proxy_root))
+        .route("/api/harbor-assistant/{*path}", any(harbor_assistant_proxy))
         .route("/api/beacon", any(beacon_proxy_root))
         .route("/api/beacon/{*path}", any(beacon_proxy))
         .route("/api/notifications/deliveries", post(notification_delivery))
@@ -138,11 +140,20 @@ async fn gateway_turn(
 
 async fn beacon_proxy_root(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, GatewayError> {
-    proxy_beacon_request(state, method, headers, "/api/state".to_string(), body).await
+    proxy_beacon_request(
+        state,
+        method,
+        headers,
+        beacon_proxy_target_path("", uri.query()),
+        "/api/beacon",
+        body,
+    )
+    .await
 }
 
 async fn beacon_proxy(
@@ -158,6 +169,44 @@ async fn beacon_proxy(
         method,
         headers,
         beacon_proxy_target_path(&path, uri.query()),
+        "/api/beacon",
+        body,
+    )
+    .await
+}
+
+async fn harbor_assistant_proxy_root(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<axum::response::Response, GatewayError> {
+    proxy_beacon_request(
+        state,
+        method,
+        headers,
+        harbor_assistant_proxy_target_path("", uri.query()),
+        "/api/harbor-assistant",
+        body,
+    )
+    .await
+}
+
+async fn harbor_assistant_proxy(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<axum::response::Response, GatewayError> {
+    proxy_beacon_request(
+        state,
+        method,
+        headers,
+        harbor_assistant_proxy_target_path(&path, uri.query()),
+        "/api/harbor-assistant",
         body,
     )
     .await
@@ -168,6 +217,7 @@ async fn proxy_beacon_request(
     method: Method,
     headers: HeaderMap,
     target_path: String,
+    proxy_prefix: &'static str,
     body: Bytes,
 ) -> Result<axum::response::Response, GatewayError> {
     let base_url = state
@@ -211,13 +261,19 @@ async fn proxy_beacon_request(
         result.headers_mut(),
         "x-contract-version",
     );
-    for (name, value) in [
-        ("X-Harbor-Gateway-Proxy", "beacon"),
-        ("X-Harbor-Beacon-Proxy-Prefix", "/api/beacon"),
-    ] {
-        if let Ok(header_value) = value.parse() {
-            result.headers_mut().insert(name, header_value);
-        }
+    if let Ok(header_value) = "beacon".parse() {
+        result
+            .headers_mut()
+            .insert("X-Harbor-Gateway-Proxy", header_value);
+    }
+    let proxy_prefix_header = match proxy_prefix {
+        "/api/harbor-assistant" => "X-Harbor-Assistant-Proxy-Prefix",
+        _ => "X-Harbor-Beacon-Proxy-Prefix",
+    };
+    if let Ok(header_value) = proxy_prefix.parse() {
+        result
+            .headers_mut()
+            .insert(proxy_prefix_header, header_value);
     }
     Ok(result)
 }
@@ -386,6 +442,10 @@ fn beacon_proxy_target_path(path: &str, query: Option<&str>) -> String {
     }
 }
 
+fn harbor_assistant_proxy_target_path(path: &str, query: Option<&str>) -> String {
+    beacon_proxy_target_path(path, query)
+}
+
 fn forward_beacon_headers(
     mut request: reqwest::RequestBuilder,
     headers: &HeaderMap,
@@ -456,7 +516,7 @@ fn maybe_start_configured_feishu_runtime(
 
 #[cfg(test)]
 mod tests {
-    use super::beacon_proxy_target_path;
+    use super::{beacon_proxy_target_path, harbor_assistant_proxy_target_path};
 
     #[test]
     fn beacon_proxy_prefix_maps_to_beacon_internal_admin_api() {
@@ -468,6 +528,10 @@ mod tests {
         assert_eq!(
             beacon_proxy_target_path("devices/camera-1/evidence", Some("user_id=u1")),
             "/api/devices/camera-1/evidence?user_id=u1"
+        );
+        assert_eq!(
+            beacon_proxy_target_path("", Some("refresh=1")),
+            "/api/state?refresh=1"
         );
     }
 
@@ -488,6 +552,35 @@ mod tests {
         assert_eq!(
             beacon_proxy_target_path("harboros/apps/home-assistant/install", None),
             "/api/harboros/apps/home-assistant/install"
+        );
+        assert_eq!(
+            beacon_proxy_target_path("automation/reviews", None),
+            "/api/automation/reviews"
+        );
+        assert_eq!(
+            beacon_proxy_target_path("automation/reviews/review-1/enable", None),
+            "/api/automation/reviews/review-1/enable"
+        );
+    }
+
+    #[test]
+    fn harbor_assistant_facade_maps_to_beacon_internal_admin_api() {
+        assert_eq!(harbor_assistant_proxy_target_path("", None), "/api/state");
+        assert_eq!(
+            harbor_assistant_proxy_target_path("", Some("refresh=1")),
+            "/api/state?refresh=1"
+        );
+        assert_eq!(
+            harbor_assistant_proxy_target_path("state", None),
+            "/api/state"
+        );
+        assert_eq!(
+            harbor_assistant_proxy_target_path("home-assistant/status", None),
+            "/api/home-assistant/status"
+        );
+        assert_eq!(
+            harbor_assistant_proxy_target_path("knowledge/search", Some("limit=10")),
+            "/api/knowledge/search?limit=10"
         );
     }
 }

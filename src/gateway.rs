@@ -543,6 +543,7 @@ impl GatewayService {
             "gateway_turn_contract_version": "3.0",
             "gateway_turn_endpoint": "/api/gateway/turns",
             "beacon_proxy_prefix": "/api/beacon",
+            "harbor_assistant_proxy_prefix": "/api/harbor-assistant",
             "turn_endpoint": "/api/web/turns",
             "adapters": adapters,
             "delivery_health": self.store.delivery_health().unwrap_or_else(|_| json!({"record_count": 0})),
