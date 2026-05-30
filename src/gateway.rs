@@ -1215,6 +1215,118 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    #[tokio::test]
+    async fn notification_delivery_accepts_safe_local_vision_event_payload() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url.clear();
+        let gateway = GatewayService::from_config(&config).unwrap();
+        gateway
+            .store
+            .register_route(
+                "gw_route_harbornavi_dev",
+                json!({
+                    "platform": "webhook",
+                    "adapter_name": "webhook",
+                    "chat_id": "chat1",
+                    "status": "active"
+                }),
+            )
+            .unwrap();
+        let payload = json!({
+            "notification_id": "notif_lve_1",
+            "trace_id": "trace_lve_1",
+            "source": {
+                "service": "harborbeacon",
+                "module": "local_vision_event",
+                "event_type": "harbornavi.local_vision_event"
+            },
+            "destination": {"route_key": "gw_route_harbornavi_dev"},
+            "content": {
+                "title": "HarborNavi 人员事件",
+                "body": "检测到人员活动：K3 本地视觉检测到人员活动。",
+                "payload_format": "plain_text",
+                "structured_payload": {
+                    "event": {
+                        "event_id": "lve_1",
+                        "camera_id": "cam-real-231",
+                        "event_type": "person_detected",
+                        "confidence": 0.82,
+                        "vlm_status": "not_sampled"
+                    },
+                    "privacy": {
+                        "text_only": true,
+                        "raw_image_included": false,
+                        "local_paths_included": false
+                    }
+                },
+                "attachments": []
+            },
+            "delivery": {"mode": "send", "idempotency_key": "idem_lve_1", "reply_to_message_id": "", "update_message_id": ""}
+        });
+
+        let response = gateway
+            .handle_notification_delivery(payload.clone())
+            .await
+            .unwrap();
+        let replay = gateway.handle_notification_delivery(payload).await.unwrap();
+
+        assert_eq!(response, replay);
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["platform"], json!("webhook"));
+        assert_eq!(response["notification_id"], json!("notif_lve_1"));
+    }
+
+    #[tokio::test]
+    async fn notification_delivery_classifies_missing_and_expired_routes() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url.clear();
+        let gateway = GatewayService::from_config(&config).unwrap();
+        let missing = gateway
+            .handle_notification_delivery(notification_payload_for_route(
+                "gw_route_missing",
+                "idem_missing",
+            ))
+            .await
+            .expect_err("missing route must fail before delivery");
+        assert_eq!(missing.code, "ROUTE_NOT_FOUND");
+        assert_eq!(missing.status, axum::http::StatusCode::NOT_FOUND);
+
+        gateway
+            .store
+            .register_route(
+                "gw_route_expired",
+                json!({
+                    "platform": "webhook",
+                    "adapter_name": "webhook",
+                    "chat_id": "chat1",
+                    "status": "expired"
+                }),
+            )
+            .unwrap();
+        let expired = gateway
+            .handle_notification_delivery(notification_payload_for_route(
+                "gw_route_expired",
+                "idem_expired",
+            ))
+            .await
+            .expect_err("expired route must fail before delivery");
+        assert_eq!(expired.code, "ROUTE_EXPIRED");
+        assert_eq!(expired.status, axum::http::StatusCode::GONE);
+    }
+
+    fn notification_payload_for_route(route_key: &str, idempotency_key: &str) -> Value {
+        json!({
+            "notification": {"notification_id": "notif_route_test", "trace_id": "trace_route_test"},
+            "destination": {"route_key": route_key},
+            "reply": {"kind": "tool_result", "text": "HarborNavi 本地事件通知。"},
+            "delivery": {"mode": "send", "idempotency_key": idempotency_key, "reply_to_message_id": null, "update_message_id": null}
+        })
+    }
+
     #[test]
     fn gateway_turn_normalizes_android_payload_without_forwarding_push_secret() {
         let payload = json!({
