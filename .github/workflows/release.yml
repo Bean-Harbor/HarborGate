@@ -4,9 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release"
+        description: "Debian package version / release tag"
         required: true
-        default: "1.0.0"
+        default: "20260529+harborassistant.live.solidify"
+
+env:
+  HARBOR_ASSISTANT_ARTIFACT_ID: harborassistant-live-solidify-20260529
 
 jobs:
   build-deb:
@@ -38,7 +41,7 @@ jobs:
       - name: Create deb package
         run: |
           VERSION="${{ inputs.tag }}"
-          PKG_NAME="harboros-im-gate_${VERSION}_linux_amd64"
+          PKG_NAME="harboros-im-gate_${VERSION}_${HARBOR_ASSISTANT_ARTIFACT_ID}_linux_amd64"
           PKG_DIR="./deb-package/${PKG_NAME}"
 
           mkdir -p ${PKG_DIR}/DEBIAN
@@ -62,6 +65,12 @@ jobs:
           dpkg-deb --build ${PKG_DIR}
           mkdir -p ./artifacts/
           mv ./deb-package/${PKG_NAME}.deb ./artifacts/
+
+      - name: Verify deb package metadata
+        run: |
+          VERSION="${{ inputs.tag }}"
+          PKG_NAME="harboros-im-gate_${VERSION}_${HARBOR_ASSISTANT_ARTIFACT_ID}_linux_amd64"
+          bash ./scripts/verify_harboros_im_gate_deb.sh "./artifacts/${PKG_NAME}.deb"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
