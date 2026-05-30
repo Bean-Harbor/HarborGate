@@ -3,14 +3,20 @@
 HarborGate is the Rust-based IM transport gateway for HarborBeacon.
 
 The active IM service-to-service contract is
-[`HarborBeacon-HarborGate-Agent-Contract-v2.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v2.0.md).
+[`HarborBeacon-HarborGate-Agent-Contract-v2.0.md`](./docs/HarborBeacon-HarborGate-Agent-Contract-v2.0.md).
 The northbound channel-edge upgrade is
-[`HarborBeacon-HarborGate-Agent-Contract-v3.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v3.0.md).
+[`HarborBeacon-HarborGate-Agent-Contract-v3.0.md`](./docs/HarborBeacon-HarborGate-Agent-Contract-v3.0.md).
 HarborGate owns IM adapters, channel-edge entrypoints, platform credentials,
 setup/admin pages, inbound normalization, route registry, outbound delivery,
 and redacted gateway status.
 HarborBeacon owns business conversation state, active frames, approvals,
 artifacts, audit, and local model policy.
+
+HarborCloud owns account, entitlement, Hub identity, WebRTC signaling, and cloud
+metadata. HarborLink owns Hub-side outbound MQTT and Home Assistant/camera
+bridge execution. harbor-dock owns Android/Paper UI intent. HarborNAS-webui
+owns HarborOS UI presentation. HarborGate must not absorb those product
+boundaries.
 
 ## Runtime
 
@@ -72,7 +78,7 @@ POST /api/web/turns
 X-Contract-Version: 2.0
 ```
 
-Android/Web clients enter through HarborGate:
+Android/Web assistant chat clients may enter through HarborGate:
 
 ```text
 POST /api/gateway/turns
@@ -84,6 +90,10 @@ Beacon-owned admin/config APIs are proxied through HarborGate:
 /api/beacon/* -> HarborBeacon /api/*
 ```
 
+This proxy is not a cloud, Hub, or UI state owner. HarborDock remote home/camera
+control remains a HarborCloud + HarborLink + harbor-dock concern unless an
+approved assistant turn explicitly enters the Beacon/Gate seam.
+
 Rules that must not drift:
 
 - do not post active turns to `/api/tasks`
@@ -91,6 +101,8 @@ Rules that must not drift:
 - do not interpret `active_frame.kind` for business routing
 - do not import HarborBeacon runtime code
 - do not store IM platform credentials in HarborBeacon
+- do not route HarborCloud entitlement, HarborLink MQTT, HarborDock remote
+  control, or WebUI display state through HarborGate business semantics
 
 HarborGate exposes outbound delivery for HarborBeacon:
 

@@ -2,7 +2,8 @@
 
 ## Guiding Baseline
 
-HarborGate is the Rust IM gateway and northbound channel edge for HarborBeacon.
+HarborGate is the Rust IM gateway and northbound assistant/channel edge for
+HarborBeacon.
 The active IM service-to-service contract is
 `HarborBeacon-HarborGate-Agent-Contract-v2.0.md`; the Android/Web/Gate edge
 upgrade contract is `HarborBeacon-HarborGate-Agent-Contract-v3.0.md`.
@@ -17,7 +18,7 @@ Exit criteria:
 - `.82` live acceptance passes for Feishu and Weixin private messages.
 - Harbor Assistant Messages shows connected/manage for configured IM connectors.
 - Harbor Assistant Search remains same-origin through `/api/beacon/*`.
-- Android/Web chat turns enter through `POST /api/gateway/turns`.
+- Android/Web assistant chat turns enter through `POST /api/gateway/turns`.
 
 ## Next Milestones
 
@@ -51,3 +52,5 @@ Exit criteria:
   policy.
 - HarborGate treats `conversation.handle`, `continuation`, and `active_frame` as
   opaque Beacon-owned values.
+- HarborCloud entitlement, HarborLink MQTT command/ack, HarborDock remote
+  home/camera control, and WebUI display state stay outside HarborGate.
