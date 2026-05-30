@@ -692,7 +692,12 @@ fn maybe_start_configured_feishu_runtime(
 
 #[cfg(test)]
 mod tests {
-    use super::{beacon_proxy_target_path, harbor_assistant_proxy_target_path};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+    use super::{
+        beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_contract,
+    };
+    use crate::config::AppConfig;
 
     #[test]
     fn beacon_proxy_prefix_maps_to_beacon_internal_admin_api() {
@@ -758,5 +763,19 @@ mod tests {
             harbor_assistant_proxy_target_path("knowledge/search", Some("limit=10")),
             "/api/knowledge/search?limit=10"
         );
+    }
+
+    #[test]
+    fn notification_delivery_requires_v20_contract_header() {
+        let mut config = AppConfig::from_env();
+        config.contract_version = "2.0".to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Contract-Version", HeaderValue::from_static("1.5"));
+
+        let error = require_service_contract(&config, &headers)
+            .expect_err("wrong contract version must be rejected");
+
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code, "CONTRACT_VERSION_MISMATCH");
     }
 }
