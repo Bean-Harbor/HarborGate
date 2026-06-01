@@ -15,14 +15,18 @@ export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_RISCV64GC
 cargo build --release --target "${TARGET}" --bin "${BIN_NAME}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-pkg_root="${repo_root}/${OUT_DIR}/package/${PKG_NAME}_${VERSION}_${DEB_ARCH}"
-deb_path="${repo_root}/${OUT_DIR}/${PKG_NAME}_${VERSION}_${DEB_ARCH}.deb"
+case "${OUT_DIR}" in
+  /*) out_dir="${OUT_DIR}" ;;
+  *) out_dir="${repo_root}/${OUT_DIR}" ;;
+esac
+pkg_root="${out_dir}/package/${PKG_NAME}_${VERSION}_${DEB_ARCH}"
+deb_path="${out_dir}/${PKG_NAME}_${VERSION}_${DEB_ARCH}.deb"
 
 rm -rf "${pkg_root}"
 mkdir -p "${pkg_root}/DEBIAN" \
   "${pkg_root}/usr/bin" \
   "${pkg_root}/etc/systemd/system"
-find "${repo_root}/${OUT_DIR}/package" -type d -exec chmod a-s,u=rwx,go=rx {} +
+find "${out_dir}/package" -type d -exec chmod a-s,u=rwx,go=rx {} +
 
 install -m 0755 "${repo_root}/target/${TARGET}/release/${BIN_NAME}" \
   "${pkg_root}/usr/bin/${BIN_NAME}"
@@ -38,7 +42,7 @@ sed \
 install -m 0755 "${repo_root}/debian/postinst" "${pkg_root}/DEBIAN/postinst"
 install -m 0755 "${repo_root}/debian/prerm" "${pkg_root}/DEBIAN/prerm"
 
-mkdir -p "${repo_root}/${OUT_DIR}"
+mkdir -p "${out_dir}"
 find "${pkg_root}" -type d -exec chmod a-s,u=rwx,go=rx {} +
 dpkg-deb --build --root-owner-group "${pkg_root}" "${deb_path}"
 sha256sum "${deb_path}" | tee "${deb_path}.sha256"
