@@ -22,7 +22,7 @@ rm -rf "${pkg_root}"
 mkdir -p "${pkg_root}/DEBIAN" \
   "${pkg_root}/usr/bin" \
   "${pkg_root}/etc/systemd/system"
-find "${repo_root}/${OUT_DIR}/package" -type d -exec chmod 0755 {} +
+find "${repo_root}/${OUT_DIR}/package" -type d -exec chmod a-s,u=rwx,go=rx {} +
 
 install -m 0755 "${repo_root}/target/${TARGET}/release/${BIN_NAME}" \
   "${pkg_root}/usr/bin/${BIN_NAME}"
@@ -39,6 +39,7 @@ install -m 0755 "${repo_root}/debian/postinst" "${pkg_root}/DEBIAN/postinst"
 install -m 0755 "${repo_root}/debian/prerm" "${pkg_root}/DEBIAN/prerm"
 
 mkdir -p "${repo_root}/${OUT_DIR}"
+find "${pkg_root}" -type d -exec chmod a-s,u=rwx,go=rx {} +
 dpkg-deb --build --root-owner-group "${pkg_root}" "${deb_path}"
 sha256sum "${deb_path}" | tee "${deb_path}.sha256"
 dpkg-deb --info "${deb_path}"
