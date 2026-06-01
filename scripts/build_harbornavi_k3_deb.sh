@@ -8,6 +8,10 @@ OUT_DIR="${OUT_DIR:-artifacts/k3}"
 BIN_NAME="harboros-im-gate"
 PKG_NAME="harboros-im-gate"
 
+command -v dpkg-deb >/dev/null
+command -v riscv64-linux-gnu-gcc >/dev/null
+export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER:-riscv64-linux-gnu-gcc}"
+
 cargo build --release --target "${TARGET}" --bin "${BIN_NAME}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
