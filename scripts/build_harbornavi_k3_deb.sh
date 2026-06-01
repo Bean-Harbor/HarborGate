@@ -22,6 +22,7 @@ rm -rf "${pkg_root}"
 mkdir -p "${pkg_root}/DEBIAN" \
   "${pkg_root}/usr/bin" \
   "${pkg_root}/etc/systemd/system"
+find "${repo_root}/${OUT_DIR}/package" -type d -exec chmod 0755 {} +
 
 install -m 0755 "${repo_root}/target/${TARGET}/release/${BIN_NAME}" \
   "${pkg_root}/usr/bin/${BIN_NAME}"
