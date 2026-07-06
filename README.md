@@ -156,9 +156,12 @@ FEISHU_MAIL_TOKEN_STATE_PATH=/var/lib/harborgate/feishu-mail-token.json
 `FEISHU_MAIL_USER_ACCESS_TOKEN` is useful for one-off smoke delivery. For a
 longer-lived HarborOps route, configure the refresh token and token state path;
 Gate will refresh the user token through Feishu's OAuth v2 token endpoint using
-the app credentials and persist the rotated token state. Keep the state file
-private to the Gate host. Beacon and HarborOps must only reference the Gate
-delivery route and must not store Feishu credentials or token material.
+the app credentials and persist the rotated token state. Treat
+`FEISHU_MAIL_USER_REFRESH_TOKEN` as a bootstrap seed; after the first successful
+refresh, the token state file is the source of truth for rotated refresh tokens.
+Keep the state file private to the Gate host. Beacon and HarborOps must only
+reference the Gate delivery route and must not store Feishu credentials or token
+material.
 
 Weixin:
 

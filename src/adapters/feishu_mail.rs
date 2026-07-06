@@ -127,14 +127,11 @@ impl FeishuMailAdapter {
             }
         }
 
-        let refresh_token = if !settings.user_refresh_token.trim().is_empty() {
-            settings.user_refresh_token.trim().to_string()
-        } else {
-            state
-                .as_ref()
-                .map(|state| state.user_refresh_token.trim().to_string())
-                .unwrap_or_default()
-        };
+        let refresh_token = state
+            .as_ref()
+            .map(|state| state.user_refresh_token.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| settings.user_refresh_token.trim().to_string());
         if refresh_token.is_empty() {
             return Err(self.mail_error(
                 "Feishu Mail authorization failed: user refresh token is not configured",
@@ -392,6 +389,11 @@ impl FeishuMailAdapter {
         fs::write(&tmp, encoded).map_err(|err| {
             self.mail_error(format!(
                 "Feishu Mail authorization failed: could not write token state: {err}"
+            ))
+        })?;
+        set_private_file_permissions(&tmp).map_err(|err| {
+            self.mail_error(format!(
+                "Feishu Mail authorization failed: could not protect token state: {err}"
             ))
         })?;
         fs::rename(&tmp, &path).map_err(|err| {
@@ -724,6 +726,20 @@ fn now_epoch_seconds() -> u64 {
         .as_secs()
 }
 
+#[cfg(unix)]
+fn set_private_file_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn redact_sensitive(message: &str, settings: &FeishuMailConfig) -> String {
     let mut redacted = message.to_string();
     for secret in [
@@ -834,6 +850,13 @@ mod tests {
         assert_eq!(token, "fresh-user-token");
         assert_eq!(state.user_access_token, "fresh-user-token");
         assert_eq!(state.user_refresh_token, "fresh-refresh-token");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&state_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("POST /open-apis/authen/v2/oauth/token"));
         assert!(requests[0].contains(r#""client_id":"cli_test""#));
@@ -864,6 +887,42 @@ mod tests {
 
         assert_eq!(mode, "user_refresh_token");
         assert_eq!(token, "cached-user-token");
+    }
+
+    #[tokio::test]
+    async fn feishu_mail_prefers_rotated_state_refresh_token_over_env_seed() {
+        let (base_url, request_handle) = spawn_http_responses(vec![
+            r#"{"code":0,"access_token":"next-user-token","refresh_token":"next-refresh-token","expires_in":7200,"refresh_token_expires_in":2592000}"#,
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("feishu-mail-token.json");
+        std::fs::write(
+            &state_path,
+            serde_json::to_string(&UserTokenState {
+                user_access_token: "expired-user-token".into(),
+                user_refresh_token: "rotated-refresh-token".into(),
+                access_expires_at_epoch_seconds: now_epoch_seconds().saturating_sub(60),
+                refresh_expires_at_epoch_seconds: now_epoch_seconds() + 86400,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = test_config(&base_url);
+        config.user_refresh_token = "initial-env-seed-refresh-token".into();
+        config.user_token_state_path = state_path.to_string_lossy().to_string();
+        let adapter = FeishuMailAdapter::new(config);
+
+        let (token, mode) = adapter.access_token().await.unwrap();
+        let requests = request_handle.await.unwrap();
+        let state: UserTokenState =
+            serde_json::from_str(&std::fs::read_to_string(state_path).unwrap()).unwrap();
+
+        assert_eq!(mode, "user_refresh_token");
+        assert_eq!(token, "next-user-token");
+        assert_eq!(state.user_refresh_token, "next-refresh-token");
+        assert!(requests[0].contains(r#""refresh_token":"rotated-refresh-token""#));
+        assert!(!requests[0].contains("initial-env-seed-refresh-token"));
     }
 
     #[tokio::test]
