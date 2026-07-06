@@ -1,4 +1,5 @@
 use crate::adapters::feishu::FeishuAdapter;
+use crate::adapters::feishu_mail::FeishuMailAdapter;
 use crate::adapters::webhook::WebhookAdapter;
 use crate::adapters::weixin::WeixinAdapter;
 use crate::adapters::PlatformAdapter;
@@ -21,6 +22,7 @@ pub struct GatewayService {
     task_client: Option<HarborBeaconTaskClient>,
     adapters: BTreeMap<String, Arc<dyn PlatformAdapter>>,
     feishu_adapter: Arc<FeishuAdapter>,
+    feishu_mail_adapter: Arc<FeishuMailAdapter>,
     weixin_adapter: Arc<WeixinAdapter>,
 }
 
@@ -32,6 +34,8 @@ impl GatewayService {
         adapters.insert(webhook.name().to_string(), webhook);
         let feishu = Arc::new(FeishuAdapter::new(config.feishu.clone()));
         adapters.insert(feishu.name().to_string(), feishu.clone());
+        let feishu_mail = Arc::new(FeishuMailAdapter::new(config.feishu_mail.clone()));
+        adapters.insert(feishu_mail.name().to_string(), feishu_mail.clone());
         let weixin = Arc::new(WeixinAdapter::new(config.weixin.clone()));
         adapters.insert(weixin.name().to_string(), weixin.clone());
         Ok(Self {
@@ -39,6 +43,7 @@ impl GatewayService {
             task_client: HarborBeaconTaskClient::from_config(config),
             adapters,
             feishu_adapter: feishu,
+            feishu_mail_adapter: feishu_mail,
             weixin_adapter: weixin,
         })
     }
@@ -49,6 +54,10 @@ impl GatewayService {
 
     pub fn feishu_adapter(&self) -> Arc<FeishuAdapter> {
         self.feishu_adapter.clone()
+    }
+
+    pub fn feishu_mail_adapter(&self) -> Arc<FeishuMailAdapter> {
+        self.feishu_mail_adapter.clone()
     }
 
     pub fn weixin_adapter(&self) -> Arc<WeixinAdapter> {
@@ -469,6 +478,8 @@ impl GatewayService {
                 &update_message_id,
                 &route,
                 &content,
+                destination,
+                &idempotency_key,
             ),
         };
         let delivery_id = stable_id("delivery_", &idempotency_key, 24);
@@ -609,6 +620,8 @@ impl GatewayService {
             .get("id")
             .and_then(Value::as_str)
             .or_else(|| recipient.get("recipient_id").and_then(Value::as_str))
+            .or_else(|| recipient.get("email").and_then(Value::as_str))
+            .or_else(|| recipient.get("mail_address").and_then(Value::as_str))
             .unwrap_or("")
             .trim()
             .to_string();
@@ -1040,6 +1053,8 @@ fn outbound_delivery_metadata(
     update_message_id: &str,
     route: &Value,
     content: &Value,
+    destination: &serde_json::Map<String, Value>,
+    idempotency_key: &str,
 ) -> serde_json::Map<String, Value> {
     let mut metadata = serde_json::Map::new();
     metadata.insert("source".into(), json!("notification_delivery"));
@@ -1077,6 +1092,45 @@ fn outbound_delivery_metadata(
             .cloned()
             .unwrap_or_else(|| json!({})),
     );
+    metadata.insert("idempotency_key".into(), json!(idempotency_key));
+    metadata.insert("mail_dedupe_key".into(), json!(idempotency_key));
+    if let Some(recipient) = destination.get("recipient").cloned() {
+        metadata.insert("recipient".into(), recipient);
+    }
+    if let Some(recipients) = content
+        .get("recipients")
+        .or_else(|| content.pointer("/structured_payload/recipients"))
+        .cloned()
+    {
+        metadata.insert("mail_recipients".into(), recipients);
+    }
+    let subject = content
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !subject.is_empty() {
+        metadata.insert("mail_subject".into(), json!(subject));
+    }
+    let body_plain_text = content
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !body_plain_text.is_empty() {
+        metadata.insert("mail_body_plain_text".into(), json!(body_plain_text));
+    }
+    if let Some(html_body) = content
+        .pointer("/structured_payload/html_body")
+        .or_else(|| content.pointer("/structured_payload/body_html"))
+        .or_else(|| content.get("html_body"))
+        .or_else(|| content.get("body_html"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        metadata.insert("mail_body_html".into(), json!(html_body));
+    }
     metadata
 }
 
@@ -1094,6 +1148,10 @@ fn map_delivery_failure(message: &str) -> (&'static str, bool) {
     } else if lower.contains("not configured")
         || lower.contains("authorization")
         || lower.contains("auth")
+        || lower.contains("permission")
+        || lower.contains("scope")
+        || lower.contains("forbidden")
+        || lower.contains("unauthorized")
     {
         ("PROVIDER_AUTH_FAILED", false)
     } else if lower.contains("unsupported") {
@@ -1148,6 +1206,8 @@ impl IfEmptyThen for String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn webhook_inbound_registers_route_and_replies() {
@@ -1318,6 +1378,90 @@ mod tests {
         assert_eq!(expired.status, axum::http::StatusCode::GONE);
     }
 
+    #[tokio::test]
+    async fn notification_delivery_sends_feishu_mail_via_adapter_preview_shape() {
+        let (base_url, request_handle) = spawn_http_response(
+            200,
+            r#"{"code":0,"data":{"message_id":"om_mail_1","thread_id":"omt_mail_1"}}"#,
+        )
+        .await;
+        let dir = tempdir().unwrap();
+        let gateway = feishu_mail_gateway(dir.path(), &base_url);
+        let payload = json!({
+            "notification": {"notification_id": "notif_mail_1", "trace_id": "trace_mail_1"},
+            "destination": {
+                "platform": "feishu_mail",
+                "recipient": {
+                    "email": "lead@example.com",
+                    "cc": ["ops@example.com"]
+                }
+            },
+            "content": {
+                "title": "[Harbor Outreach Smoke]",
+                "body": "Approved body",
+                "structured_payload": {
+                    "html_body": "<p>Approved body</p>"
+                }
+            },
+            "delivery": {"mode": "send", "idempotency_key": "idem_mail_1", "reply_to_message_id": "", "update_message_id": ""}
+        });
+
+        let response = gateway.handle_notification_delivery(payload).await.unwrap();
+        let request = request_handle.await.unwrap();
+
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["platform"], json!("feishu_mail"));
+        assert_eq!(response["provider_message_id"], json!("om_mail_1"));
+        assert!(request
+            .contains("POST /open-apis/mail/v1/user_mailboxes/sender%40example.com/messages/send"));
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer user-token"));
+        assert!(request.contains(r#""subject":"[Harbor Outreach Smoke]""#));
+        assert!(request.contains(r#""mail_address":"lead@example.com""#));
+        assert!(request.contains(r#""body_plain_text":"Approved body""#));
+        assert!(request.contains(r#""body_html":"<p>Approved body</p>""#));
+        assert!(request.contains(r#""dedupe_key":"idem_mail_1""#));
+    }
+
+    #[tokio::test]
+    async fn notification_delivery_maps_feishu_mail_permission_failure() {
+        let (base_url, request_handle) =
+            spawn_http_response(403, r#"{"code":99991663,"msg":"permission denied"}"#).await;
+        let dir = tempdir().unwrap();
+        let gateway = feishu_mail_gateway(dir.path(), &base_url);
+
+        let response = gateway
+            .handle_notification_delivery(feishu_mail_payload("idem_mail_auth"))
+            .await
+            .unwrap();
+        let _request = request_handle.await.unwrap();
+
+        assert_eq!(response["ok"], json!(false));
+        assert_eq!(response["platform"], json!("feishu_mail"));
+        assert_eq!(response["retryable"], json!(false));
+        assert_eq!(response["error"]["code"], json!("PROVIDER_AUTH_FAILED"));
+    }
+
+    #[tokio::test]
+    async fn notification_delivery_maps_feishu_mail_unavailable_as_retryable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let dir = tempdir().unwrap();
+        let gateway = feishu_mail_gateway(dir.path(), &base_url);
+
+        let response = gateway
+            .handle_notification_delivery(feishu_mail_payload("idem_mail_unavailable"))
+            .await
+            .unwrap();
+
+        assert_eq!(response["ok"], json!(false));
+        assert_eq!(response["platform"], json!("feishu_mail"));
+        assert_eq!(response["retryable"], json!(true));
+        assert_eq!(response["error"]["code"], json!("PLATFORM_UNAVAILABLE"));
+    }
+
     fn notification_payload_for_route(route_key: &str, idempotency_key: &str) -> Value {
         json!({
             "notification": {"notification_id": "notif_route_test", "trace_id": "trace_route_test"},
@@ -1325,6 +1469,83 @@ mod tests {
             "reply": {"kind": "tool_result", "text": "HarborNavi 本地事件通知。"},
             "delivery": {"mode": "send", "idempotency_key": idempotency_key, "reply_to_message_id": null, "update_message_id": null}
         })
+    }
+
+    fn feishu_mail_payload(idempotency_key: &str) -> Value {
+        json!({
+            "notification": {"notification_id": "notif_mail_failure", "trace_id": "trace_mail_failure"},
+            "destination": {
+                "platform": "feishu_mail",
+                "recipient": {"email": "lead@example.com"}
+            },
+            "content": {
+                "title": "Harbor Outreach",
+                "body": "Approved body"
+            },
+            "delivery": {"mode": "send", "idempotency_key": idempotency_key, "reply_to_message_id": "", "update_message_id": ""}
+        })
+    }
+
+    fn feishu_mail_gateway(data_dir: &std::path::Path, base_url: &str) -> GatewayService {
+        let mut config = AppConfig::from_env();
+        config.data_dir = data_dir.to_path_buf();
+        config.harborbeacon_base_url.clear();
+        config.feishu_mail.enabled = true;
+        config.feishu_mail.sender_mailbox = "sender@example.com".into();
+        config.feishu_mail.user_access_token = "user-token".into();
+        config.feishu_mail.default_from_name = "Harbor Ops".into();
+        config.feishu_mail.base_url = base_url.into();
+        config.feishu_mail.timeout_seconds = 1;
+        GatewayService::from_config(&config).unwrap()
+    }
+
+    async fn spawn_http_response(
+        status: u16,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 4096];
+            let mut request = Vec::new();
+            loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if http_request_complete(&request) {
+                    break;
+                }
+            }
+            let status_text = if status == 200 { "OK" } else { "ERROR" };
+            let response = format!(
+                "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (base_url, handle)
+    }
+
+    fn http_request_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                (name.trim().eq_ignore_ascii_case("content-length"))
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        request.len() >= header_end + 4 + content_length
     }
 
     #[test]
