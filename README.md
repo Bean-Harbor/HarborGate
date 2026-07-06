@@ -142,6 +142,24 @@ FEISHU_ENABLE_LIVE_SEND=1
 HARBORGATE_RUST_FEISHU_WEBSOCKET=1
 ```
 
+Feishu Mail delivery:
+
+```text
+FEISHU_MAIL_ENABLED=1
+FEISHU_MAIL_SENDER_MAILBOX=me
+FEISHU_MAIL_DEFAULT_FROM_NAME=HarborOps
+FEISHU_MAIL_USER_ACCESS_TOKEN=<short-lived-user-token>
+FEISHU_MAIL_USER_REFRESH_TOKEN=<rotating-user-refresh-token>
+FEISHU_MAIL_TOKEN_STATE_PATH=/var/lib/harborgate/feishu-mail-token.json
+```
+
+`FEISHU_MAIL_USER_ACCESS_TOKEN` is useful for one-off smoke delivery. For a
+longer-lived HarborOps route, configure the refresh token and token state path;
+Gate will refresh the user token through Feishu's OAuth v2 token endpoint using
+the app credentials and persist the rotated token state. Keep the state file
+private to the Gate host. Beacon and HarborOps must only reference the Gate
+delivery route and must not store Feishu credentials or token material.
+
 Weixin:
 
 ```text

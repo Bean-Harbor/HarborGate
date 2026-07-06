@@ -46,6 +46,8 @@ pub struct FeishuMailConfig {
     pub enabled: bool,
     pub sender_mailbox: String,
     pub user_access_token: String,
+    pub user_refresh_token: String,
+    pub user_token_state_path: String,
     pub default_from_name: String,
     pub app_id: String,
     pub app_secret: String,
@@ -227,6 +229,8 @@ impl FeishuMailConfig {
             enabled: env_flag("FEISHU_MAIL_ENABLED"),
             sender_mailbox: env_trim("FEISHU_MAIL_SENDER_MAILBOX"),
             user_access_token: env_trim("FEISHU_MAIL_USER_ACCESS_TOKEN"),
+            user_refresh_token: env_trim("FEISHU_MAIL_USER_REFRESH_TOKEN"),
+            user_token_state_path: env_trim("FEISHU_MAIL_TOKEN_STATE_PATH"),
             default_from_name: env_trim("FEISHU_MAIL_DEFAULT_FROM_NAME"),
             app_id: env_or_else("FEISHU_MAIL_APP_ID", || feishu.app_id.clone()),
             app_secret: env_or_else("FEISHU_MAIL_APP_SECRET", || feishu.app_secret.clone()),
@@ -244,14 +248,24 @@ impl FeishuMailConfig {
     }
 
     pub fn configured(&self) -> bool {
+        let app_credentials_configured =
+            !self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty();
+        let refresh_configured = (!self.user_refresh_token.trim().is_empty()
+            || !self.user_token_state_path.trim().is_empty())
+            && app_credentials_configured;
         self.enabled
             && !self.sender_mailbox.trim().is_empty()
             && (!self.user_access_token.trim().is_empty()
-                || (!self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty()))
+                || refresh_configured
+                || app_credentials_configured)
     }
 
     pub fn auth_mode(&self) -> &'static str {
-        if !self.user_access_token.trim().is_empty() {
+        if !self.user_refresh_token.trim().is_empty()
+            || !self.user_token_state_path.trim().is_empty()
+        {
+            "user_refresh_token"
+        } else if !self.user_access_token.trim().is_empty() {
             "user_access_token"
         } else if !self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty() {
             "tenant_access_token"
