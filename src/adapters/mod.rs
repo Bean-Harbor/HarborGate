@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 pub mod feishu;
+pub mod feishu_mail;
 pub mod webhook;
 pub mod weixin;
 

@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub harborbeacon_token: String,
     pub harborbeacon_turn_endpoint: String,
     pub feishu: FeishuConfig,
+    pub feishu_mail: FeishuMailConfig,
     pub weixin: WeixinConfig,
     pub enable_feishu_websocket: bool,
     pub enable_weixin_runtime: bool,
@@ -41,6 +42,19 @@ pub struct FeishuConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct FeishuMailConfig {
+    pub enabled: bool,
+    pub sender_mailbox: String,
+    pub user_access_token: String,
+    pub default_from_name: String,
+    pub app_id: String,
+    pub app_secret: String,
+    pub base_url: String,
+    pub auth_base_url: String,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct WeixinConfig {
     pub state_dir: PathBuf,
     pub account_id: String,
@@ -54,6 +68,8 @@ pub struct WeixinConfig {
 
 impl AppConfig {
     pub fn from_env() -> Self {
+        let feishu = FeishuConfig::from_env();
+        let feishu_mail = FeishuMailConfig::from_env(&feishu);
         let data_dir = env_or("IM_AGENT_DATA_DIR", "data/sessions");
         let state_dir = env_or_else("IM_AGENT_STATE_DIR", || {
             PathBuf::from(&data_dir)
@@ -89,7 +105,8 @@ impl AppConfig {
                 "HARBORBEACON_TASK_API_TOKEN",
             ]),
             harborbeacon_turn_endpoint: turn_endpoint,
-            feishu: FeishuConfig::from_env(),
+            feishu,
+            feishu_mail,
             weixin: WeixinConfig::from_env(),
             enable_feishu_websocket: env_flag_default("HARBORGATE_RUST_FEISHU_WEBSOCKET", true),
             enable_weixin_runtime: env_flag_default("HARBORGATE_WEIXIN_RUNTIME_ENABLED", true),
@@ -201,6 +218,46 @@ impl FeishuConfig {
             }
         }
         true
+    }
+}
+
+impl FeishuMailConfig {
+    pub fn from_env(feishu: &FeishuConfig) -> Self {
+        Self {
+            enabled: env_flag("FEISHU_MAIL_ENABLED"),
+            sender_mailbox: env_trim("FEISHU_MAIL_SENDER_MAILBOX"),
+            user_access_token: env_trim("FEISHU_MAIL_USER_ACCESS_TOKEN"),
+            default_from_name: env_trim("FEISHU_MAIL_DEFAULT_FROM_NAME"),
+            app_id: env_or_else("FEISHU_MAIL_APP_ID", || feishu.app_id.clone()),
+            app_secret: env_or_else("FEISHU_MAIL_APP_SECRET", || feishu.app_secret.clone()),
+            base_url: env_or_else("FEISHU_MAIL_BASE_URL", || feishu.base_url.clone()),
+            auth_base_url: env_or_else("FEISHU_MAIL_AUTH_BASE_URL", || {
+                feishu.auth_base_url.clone()
+            }),
+            timeout_seconds: env_or(
+                "FEISHU_MAIL_TIMEOUT_SECONDS",
+                &feishu.timeout_seconds.to_string(),
+            )
+            .parse()
+            .unwrap_or(feishu.timeout_seconds),
+        }
+    }
+
+    pub fn configured(&self) -> bool {
+        self.enabled
+            && !self.sender_mailbox.trim().is_empty()
+            && (!self.user_access_token.trim().is_empty()
+                || (!self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty()))
+    }
+
+    pub fn auth_mode(&self) -> &'static str {
+        if !self.user_access_token.trim().is_empty() {
+            "user_access_token"
+        } else if !self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty() {
+            "tenant_access_token"
+        } else {
+            "unconfigured"
+        }
     }
 }
 
