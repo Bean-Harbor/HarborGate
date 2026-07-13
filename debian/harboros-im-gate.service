@@ -4,6 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
+Environment=IM_AGENT_HOST=127.0.0.1
+Environment=IM_AGENT_PORT=8787
+Environment=IM_AGENT_CONTRACT_VERSION=2.0
 Environment=HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
 EnvironmentFile=-/etc/default/harboros-beacon-gate
 EnvironmentFile=-/etc/default/harboros-im-gate

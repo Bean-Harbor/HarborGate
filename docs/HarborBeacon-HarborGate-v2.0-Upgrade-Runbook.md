@@ -7,8 +7,16 @@ This is the active HarborGate control pack entry for the HarborBeacon seam.
 Authoritative contract:
 
 - `HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
+- `harbor-framework-protocol-map.md`
 
 The v1.5 documents are historical references only.
+
+## Product Boundary Guard
+
+This runbook controls the HarborGate side of the HarborBeacon IM/channel seam
+only. It must not be used to route HarborCloud entitlement, HarborLink MQTT
+command/ack, HarborDock remote home/camera control, or WebUI display state
+through HarborGate business semantics.
 
 ## Daily Start
 
@@ -72,6 +80,8 @@ Stop and ask the user when:
 
 - a new contract field is required.
 - Beacon/Gate ownership changes.
+- the requested change crosses into HarborCloud entitlement, HarborLink MQTT,
+  HarborDock remote-control, or WebUI state ownership.
 - v1.5 runtime compatibility is requested.
 - group chat is needed.
 - live target, credential, DNS, or provider state blocks the path.
