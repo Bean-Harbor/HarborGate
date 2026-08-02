@@ -82,7 +82,16 @@ Beacon-owned admin/config APIs are proxied through HarborGate:
 
 ```text
 /api/beacon/* -> HarborBeacon /api/*
+/api/harbor-gate/api/beacon/* -> HarborBeacon /api/*
 ```
+
+Knowledge search and conversation JSON requests require a fresh 30-second
+single-use HarborOS token in `X-HarborOS-Auth-Token`. HarborGate validates the
+token through middleware, removes all client identity and authorization input,
+and forwards a canonical HarborOS principal with the Gate-to-Beacon service
+bearer. The proxy requires `HARBORBEACON_WEB_API_TOKEN` and never falls back to
+the legacy IM `HARBORBEACON_TASK_API_TOKEN`. Browser clients must never receive
+the service bearer.
 
 Rules that must not drift:
 
@@ -105,6 +114,7 @@ POST /api/notifications/deliveries
 - `GET /api/gateway/status`
 - `POST /api/gateway/turns`
 - `/api/beacon/*`
+- `/api/harbor-gate/api/beacon/*`
 - `POST /messages/webhook`
 - `POST /messages/feishu`
 - `POST /messages/weixin`
@@ -130,6 +140,7 @@ IM_AGENT_CONTRACT_VERSION=2.0
 IM_AGENT_SERVICE_TOKEN=<shared-service-token>
 HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
 HARBORBEACON_WEB_API_TOKEN=<shared-service-token>
+HARBOR_WORKSPACE_ID=home-1
 ```
 
 Feishu:
