@@ -205,8 +205,6 @@ async fn gateway_status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
-    require_service_contract(&state.config, &headers)?;
-    require_service_auth(&state.config, &headers)?;
     Ok(Json(
         state.setup.gateway_status_payload(host_header(&headers)),
     ))
