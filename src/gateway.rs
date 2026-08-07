@@ -15,6 +15,7 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct GatewayService {
@@ -24,6 +25,8 @@ pub struct GatewayService {
     feishu_adapter: Arc<FeishuAdapter>,
     feishu_mail_adapter: Arc<FeishuMailAdapter>,
     weixin_adapter: Arc<WeixinAdapter>,
+    attachment_cache_dir: PathBuf,
+    public_origin: String,
 }
 
 impl GatewayService {
@@ -45,6 +48,8 @@ impl GatewayService {
             feishu_adapter: feishu,
             feishu_mail_adapter: feishu_mail,
             weixin_adapter: weixin,
+            attachment_cache_dir: config.state_dir.join("attachment-cache"),
+            public_origin: config.public_origin.trim_end_matches('/').to_string(),
         })
     }
 
@@ -100,78 +105,114 @@ impl GatewayService {
             .to_string()
             .if_empty_then(|| derive_session_id(&inbound));
 
-        let (reply_text, outbound_attachments, mut outbound_metadata, next_metadata) =
-            if let Some(task_client) = &self.task_client {
-                let task_result = task_client.submit_turn(&inbound, &session_metadata).await?;
-                let attachments =
-                    native_source_bound_attachments(adapter_name, &task_result.response_payload);
-                let reply_text = render_retrieval_reply(
-                    &task_result.text,
-                    &task_result.response_payload,
-                    !attachments.is_empty(),
-                );
-                let mut next_metadata = session_metadata.clone();
-                next_metadata.insert("route_key".into(), json!(task_result.route_key));
-                next_metadata.insert("session_id".into(), json!(resolved_session_id));
-                next_metadata.insert("last_turn_id".into(), json!(task_result.task_id));
-                next_metadata.insert("last_trace_id".into(), json!(task_result.trace_id));
-                if !inbound.message_id.trim().is_empty() {
-                    next_metadata.insert("last_message_id".into(), json!(inbound.message_id));
-                }
-                if let Some(handle) = &task_result.conversation_handle {
-                    next_metadata.insert("conversation_handle".into(), json!(handle));
-                }
-                if let Some(continuation) = &task_result.continuation {
-                    next_metadata.insert("continuation".into(), continuation.clone());
-                } else {
-                    next_metadata.remove("continuation");
-                }
-                if !inbound.message_id.trim().is_empty() {
-                    let mut message_turns = session_metadata
-                        .get("message_turn_ids")
-                        .and_then(Value::as_object)
-                        .cloned()
-                        .unwrap_or_default();
-                    message_turns.insert(inbound.message_id.clone(), json!(task_result.task_id));
-                    next_metadata.insert("message_turn_ids".into(), Value::Object(message_turns));
-                }
-                let mut metadata = serde_json::Map::new();
-                metadata.insert("adapter".into(), json!(adapter_name));
-                metadata.insert("source".into(), json!("harborbeacon"));
-                metadata.insert("turn_id".into(), json!(task_result.task_id));
-                metadata.insert("task_id".into(), json!(task_result.task_id));
-                metadata.insert("trace_id".into(), json!(task_result.trace_id));
-                metadata.insert("status".into(), json!(task_result.status));
-                metadata.insert("route_key".into(), json!(task_result.route_key));
-                metadata.insert(
-                    "conversation_handle".into(),
-                    json!(task_result.conversation_handle),
-                );
-                metadata.insert(
-                    "active_frame".into(),
-                    task_result.active_frame.unwrap_or(Value::Null),
-                );
-                metadata.insert(
-                    "continuation".into(),
-                    task_result.continuation.unwrap_or(Value::Null),
-                );
-                metadata.insert("next_actions".into(), json!(task_result.next_actions));
-                metadata.insert("native_attachment_count".into(), json!(attachments.len()));
-                (reply_text, attachments, metadata, next_metadata)
-            } else {
-                let mut next_metadata = session_metadata.clone();
-                next_metadata.insert("route_key".into(), json!(resolved_route_key));
-                next_metadata.insert("session_id".into(), json!(resolved_session_id));
-                let mut metadata = serde_json::Map::new();
-                metadata.insert("adapter".into(), json!(adapter_name));
-                metadata.insert("source".into(), json!("rule_based_fallback"));
-                (
-                    fallback_reply(&history, &inbound),
-                    vec![],
-                    metadata,
-                    next_metadata,
+        let (
+            reply_text,
+            outbound_attachments,
+            mut outbound_metadata,
+            next_metadata,
+            cache_files,
+            cache_dir,
+        ) = if let Some(task_client) = &self.task_client {
+            let task_result = task_client.submit_turn(&inbound, &session_metadata).await?;
+            let attachment_candidates =
+                native_source_bound_attachments(adapter_name, &task_result.response_payload);
+            let materialized = task_client
+                .materialize_attachments(
+                    attachment_candidates,
+                    &self.attachment_cache_dir,
+                    &task_result.task_id,
                 )
-            };
+                .await;
+            let mut reply_text = render_retrieval_reply(
+                &task_result.text,
+                &task_result.response_payload,
+                !materialized.attachments.is_empty(),
+                &self.public_origin,
+            );
+            if materialized.failed_count > 0 {
+                if !reply_text.is_empty() {
+                    reply_text.push_str("\n\n");
+                }
+                reply_text.push_str("媒体附件暂时无法下载，已保留文字结果，请稍后重试。");
+            }
+            let mut next_metadata = session_metadata.clone();
+            next_metadata.insert("route_key".into(), json!(task_result.route_key));
+            next_metadata.insert("session_id".into(), json!(resolved_session_id));
+            next_metadata.insert("last_turn_id".into(), json!(task_result.task_id));
+            next_metadata.insert("last_trace_id".into(), json!(task_result.trace_id));
+            if !inbound.message_id.trim().is_empty() {
+                next_metadata.insert("last_message_id".into(), json!(inbound.message_id));
+            }
+            if let Some(handle) = &task_result.conversation_handle {
+                next_metadata.insert("conversation_handle".into(), json!(handle));
+            }
+            if let Some(continuation) = &task_result.continuation {
+                next_metadata.insert("continuation".into(), continuation.clone());
+            } else {
+                next_metadata.remove("continuation");
+            }
+            if !inbound.message_id.trim().is_empty() {
+                let mut message_turns = session_metadata
+                    .get("message_turn_ids")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                message_turns.insert(inbound.message_id.clone(), json!(task_result.task_id));
+                next_metadata.insert("message_turn_ids".into(), Value::Object(message_turns));
+            }
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("adapter".into(), json!(adapter_name));
+            metadata.insert("source".into(), json!("harborbeacon"));
+            metadata.insert("turn_id".into(), json!(task_result.task_id));
+            metadata.insert("task_id".into(), json!(task_result.task_id));
+            metadata.insert("trace_id".into(), json!(task_result.trace_id));
+            metadata.insert("status".into(), json!(task_result.status));
+            metadata.insert("route_key".into(), json!(task_result.route_key));
+            metadata.insert(
+                "conversation_handle".into(),
+                json!(task_result.conversation_handle),
+            );
+            metadata.insert(
+                "active_frame".into(),
+                task_result.active_frame.unwrap_or(Value::Null),
+            );
+            metadata.insert(
+                "continuation".into(),
+                task_result.continuation.unwrap_or(Value::Null),
+            );
+            metadata.insert("next_actions".into(), json!(task_result.next_actions));
+            metadata.insert(
+                "native_attachment_count".into(),
+                json!(materialized.attachments.len()),
+            );
+            metadata.insert(
+                "native_attachment_materialize_failed".into(),
+                json!(materialized.failed_count),
+            );
+            (
+                reply_text,
+                materialized.attachments,
+                metadata,
+                next_metadata,
+                materialized.cache_files,
+                materialized.cache_dir,
+            )
+        } else {
+            let mut next_metadata = session_metadata.clone();
+            next_metadata.insert("route_key".into(), json!(resolved_route_key));
+            next_metadata.insert("session_id".into(), json!(resolved_session_id));
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("adapter".into(), json!(adapter_name));
+            metadata.insert("source".into(), json!("rule_based_fallback"));
+            (
+                fallback_reply(&history, &inbound),
+                vec![],
+                metadata,
+                next_metadata,
+                vec![],
+                None,
+            )
+        };
 
         self.store
             .set_metadata(&inbound.platform, &inbound.chat_id, next_metadata)
@@ -217,7 +258,9 @@ impl GatewayService {
             timestamp: crate::models::utc_now_iso(),
             metadata: outbound_metadata,
         };
-        adapter.send_outbound(outbound).await
+        let delivery = adapter.send_outbound(outbound).await;
+        cleanup_attachment_cache(cache_files, cache_dir).await;
+        delivery
     }
 
     pub async fn handle_gateway_turn(&self, payload: Value) -> Result<Value, GatewayError> {
@@ -749,8 +792,8 @@ fn native_source_bound_attachments(adapter_name: &str, response_payload: &Value)
                 .get("mime_type")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let path = artifact.get("path").and_then(Value::as_str).unwrap_or("");
-            kind == "image" && mime_type.starts_with("image/") && !path.trim().is_empty()
+            let location = artifact_media_location(artifact).unwrap_or("");
+            kind == "image" && mime_type.starts_with("image/") && !location.trim().is_empty()
         })
         .collect();
     if images.is_empty() {
@@ -781,8 +824,8 @@ fn weixin_native_attachments(artifacts: Vec<Value>, response_payload: &Value) ->
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_lowercase();
-            let path = artifact.get("path").and_then(Value::as_str).unwrap_or("");
-            !path.trim().is_empty()
+            let location = artifact_media_location(artifact).unwrap_or("");
+            !location.trim().is_empty()
                 && (kind == "image"
                     || kind == "video"
                     || kind == "file"
@@ -811,11 +854,22 @@ fn weixin_native_attachments(artifacts: Vec<Value>, response_payload: &Value) ->
         }
         return if media.len() == 1 { media } else { vec![] };
     }
-    if media.len() == 1 {
-        media
-    } else {
-        vec![]
-    }
+    media
+}
+
+fn artifact_media_location(artifact: &Value) -> Option<&str> {
+    artifact
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            artifact
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn artifact_candidates(response_payload: &Value) -> Vec<Value> {
@@ -868,6 +922,7 @@ fn render_retrieval_reply(
     base_text: &str,
     response_payload: &Value,
     suppress_artifacts: bool,
+    public_origin: &str,
 ) -> String {
     let citations = response_payload
         .pointer("/result/citations")
@@ -908,15 +963,21 @@ fn render_retrieval_reply(
         sections.push(base_text.trim().to_string());
     }
     if !citations.is_empty() {
-        sections.push(format!("引用\n{}", render_entries(&citations, "citation")));
+        sections.push(format!(
+            "引用\n{}",
+            render_entries(&citations, "citation", public_origin)
+        ));
     }
     if !artifacts.is_empty() && !suppress_artifacts {
-        sections.push(format!("附件\n{}", render_entries(&artifacts, "artifact")));
+        sections.push(format!(
+            "附件\n{}",
+            render_entries(&artifacts, "artifact", public_origin)
+        ));
     }
     sections.join("\n\n")
 }
 
-fn render_entries(records: &[Value], kind: &str) -> String {
+fn render_entries(records: &[Value], kind: &str, public_origin: &str) -> String {
     records
         .iter()
         .take(3)
@@ -935,11 +996,17 @@ fn render_entries(records: &[Value], kind: &str) -> String {
                     &["title", "name", "filename", "file_name", "label", "id"],
                 )
             };
-            format!(
-                "{}. {}",
-                index + 1,
-                entry.unwrap_or_else(|| "未命名".to_string())
-            )
+            let label = entry.unwrap_or_else(|| "未命名".to_string());
+            let url = record
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| public_artifact_url(value, public_origin));
+            match url {
+                Some(url) => format!("{}. {}\n{}", index + 1, label, url),
+                None => format!("{}. {}", index + 1, label),
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1580,5 +1647,106 @@ mod tests {
         assert_eq!(turn_payload["conversation"]["channel"], "android");
         assert_eq!(turn_payload["conversation"]["handle"], "conv-android-1");
         assert!(turn_payload["transport"]["metadata"]["push_token"].is_null());
+    }
+
+    #[test]
+    fn weixin_selects_url_backed_media_for_gate_materialization() {
+        let response = json!({
+            "artifacts": [{
+                "kind": "image",
+                "label": "抓拍图片",
+                "mime_type": "image/jpeg",
+                "path": null,
+                "url": "/api/cameras/recordings/artifacts/snapshots~cam-252~frame.jpg"
+            }],
+            "delivery_hints": [{"kind": "native_image", "metadata": {"max_items": 1}}]
+        });
+
+        let attachments = native_source_bound_attachments("weixin", &response);
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0]["url"],
+            "/api/cameras/recordings/artifacts/snapshots~cam-252~frame.jpg"
+        );
+    }
+
+    #[test]
+    fn weixin_selects_mixed_url_backed_snapshot_and_clip() {
+        let response = json!({
+            "artifacts": [
+                {
+                    "kind": "image",
+                    "mime_type": "image/jpeg",
+                    "path": null,
+                    "url": "/api/cameras/recordings/artifacts/snapshot-252"
+                },
+                {
+                    "kind": "video",
+                    "mime_type": "video/mp4",
+                    "path": null,
+                    "url": "/api/cameras/recordings/artifacts/clip-252"
+                }
+            ]
+        });
+
+        let attachments = native_source_bound_attachments("weixin", &response);
+
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0]["kind"], "image");
+        assert_eq!(attachments[1]["kind"], "video");
+    }
+
+    #[test]
+    fn weixin_keeps_all_cat_activity_videos_for_delivery() {
+        let response = json!({
+            "artifacts": (1..=5).map(|index| json!({
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "url": format!("/api/cameras/recordings/artifacts/cat-{index}")
+            })).collect::<Vec<_>>()
+        });
+
+        let attachments = native_source_bound_attachments("weixin", &response);
+
+        assert_eq!(attachments.len(), 5);
+    }
+
+    #[test]
+    fn rendered_link_artifact_contains_clickable_public_url() {
+        let rendered = render_entries(
+            &[json!({
+                "kind": "link",
+                "label": "共享观看链接",
+                "url": "/shared/cameras/token-252"
+            })],
+            "artifact",
+            "http://198.51.100.70",
+        );
+
+        assert!(rendered.contains("http://198.51.100.70/shared/cameras/token-252"));
+    }
+}
+
+fn public_artifact_url(url: &str, public_origin: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return url.to_string();
+    }
+    if url.starts_with('/') && !public_origin.trim().is_empty() {
+        return format!("{}{}", public_origin.trim_end_matches('/'), url);
+    }
+    url.to_string()
+}
+
+async fn cleanup_attachment_cache(cache_files: Vec<PathBuf>, cache_dir: Option<PathBuf>) {
+    for path in cache_files {
+        if let Err(error) = tokio::fs::remove_file(&path).await {
+            tracing::warn!(path = %path.display(), error = %error, "Could not remove Gate attachment cache file");
+        }
+    }
+    if let Some(path) = cache_dir {
+        if let Err(error) = tokio::fs::remove_dir(&path).await {
+            tracing::warn!(path = %path.display(), error = %error, "Could not remove Gate attachment cache directory");
+        }
     }
 }

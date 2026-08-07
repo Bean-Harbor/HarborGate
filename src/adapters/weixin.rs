@@ -429,6 +429,13 @@ impl WeixinAdapter {
         }
     }
 
+    fn update_delivery_batch(&self, batch_id: &str, status: &str, items: &[Value]) {
+        self.update_transport(json_map!({
+            "last_delivery_batch_id": batch_id,
+            "last_delivery_batch": delivery_batch_snapshot(batch_id, status, items),
+        }));
+    }
+
     fn transport_status_value(&self) -> Value {
         self.refresh_account_from_disk();
         let state = self.state.lock().expect("weixin state lock poisoned");
@@ -454,33 +461,6 @@ impl WeixinAdapter {
         }
         transport.insert("configured".into(), json!(account.configured()));
         Value::Object(transport)
-    }
-
-    async fn send_text_chunks(
-        &self,
-        account: &WeixinAccount,
-        chat_id: &str,
-        context_token: &str,
-        text: &str,
-    ) -> Result<String, GatewayError> {
-        let mut last_client_id = String::new();
-        for chunk in split_text_for_weixin(text, MAX_TEXT_CHUNK_LENGTH) {
-            let payload = build_send_message_payload(chat_id, &chunk, Some(context_token), None);
-            last_client_id = payload
-                .pointer("/msg/client_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            self.post_json(
-                &account.base_url,
-                EP_SEND_MESSAGE,
-                payload,
-                Some(&account.token),
-                self.config.timeout_seconds,
-            )
-            .await?;
-        }
-        Ok(last_client_id)
     }
 
     async fn send_message_items(
@@ -872,7 +852,49 @@ impl PlatformAdapter for WeixinAdapter {
         }
 
         let native_attachments = if should_send_native_attachment_reply(&outbound) {
-            resolve_native_media_attachments(&outbound)?
+            match resolve_native_media_attachments(&outbound) {
+                Ok(attachments) => attachments,
+                Err(error) => {
+                    let error_text = redact_sensitive_text(
+                        &error.message,
+                        &[&account.account_id, &account.token, &context_token],
+                    );
+                    let delivery_batch_id = format!("wxbatch_{}", Uuid::new_v4().simple());
+                    let kinds = outbound
+                        .attachments
+                        .iter()
+                        .map(attachment_delivery_kind_from_value)
+                        .collect::<Vec<_>>();
+                    let mut items = planned_delivery_items(&delivery_batch_id, &kinds);
+                    attach_delivery_item_references(&mut items, 0, &outbound.attachments);
+                    for index in 0..items.len() {
+                        mark_delivery_item(
+                            &mut items,
+                            index,
+                            "failed",
+                            None,
+                            false,
+                            Some(&error_text),
+                        );
+                    }
+                    self.update_transport(json_map!({
+                        "status": "send_failed",
+                        "connected": true,
+                        "last_error": error_text.clone(),
+                        "last_send_at": utc_now_iso(),
+                        "last_send_status": "failed",
+                        "last_send_error": error_text,
+                        "last_send_retryable": false,
+                        "last_send_provider_message_id": "",
+                        "last_send_context_token_used": true,
+                        "last_send_attachment_count": outbound.attachments.len(),
+                        "last_send_content_kind": "attachment_resolution_failed",
+                        "last_delivery_batch_id": delivery_batch_id.clone(),
+                        "last_delivery_batch": delivery_batch_snapshot(&delivery_batch_id, "failed", &items),
+                    }));
+                    return Err(error);
+                }
+            }
         } else {
             vec![]
         };
@@ -897,8 +919,13 @@ impl PlatformAdapter for WeixinAdapter {
                 .all(|attachment| attachment.delivery_kind == "image")
             {
                 "image".to_string()
-            } else {
+            } else if native_attachments
+                .iter()
+                .all(|attachment| attachment.delivery_kind == native_attachments[0].delivery_kind)
+            {
                 native_attachments[0].delivery_kind.clone()
+            } else {
+                "mixed".to_string()
             }
         } else {
             String::new()
@@ -908,6 +935,29 @@ impl PlatformAdapter for WeixinAdapter {
         } else {
             outbound.attachments.len()
         };
+        let delivery_batch_id = format!("wxbatch_{}", Uuid::new_v4().simple());
+        let delivery_item_kinds = if has_native_attachments {
+            let mut kinds = Vec::with_capacity(send_unit_count);
+            if !native_caption.is_empty() {
+                kinds.push("text".to_string());
+            }
+            kinds.extend(
+                native_attachments
+                    .iter()
+                    .map(|attachment| attachment.delivery_kind.clone()),
+            );
+            kinds
+        } else {
+            vec!["text".to_string(); chunks.len()]
+        };
+        let mut delivery_items = planned_delivery_items(&delivery_batch_id, &delivery_item_kinds);
+        if has_native_attachments {
+            attach_delivery_item_references(
+                &mut delivery_items,
+                usize::from(!native_caption.is_empty()),
+                &outbound.attachments,
+            );
+        }
 
         self.update_transport(json_map!({
             "status": "sending",
@@ -923,86 +973,167 @@ impl PlatformAdapter for WeixinAdapter {
             "last_send_context_token_used": true,
             "last_send_attachment_count": native_attachment_count,
             "last_send_content_kind": if has_native_attachments { format!("text+{delivered_attachment_kind}") } else { "text".to_string() },
+            "last_delivery_batch_id": delivery_batch_id.clone(),
+            "last_delivery_batch": delivery_batch_snapshot(&delivery_batch_id, "sending", &delivery_items),
         }));
 
         let mut last_client_id = String::new();
         let mut attachment_fallback_used = false;
         let send_result = async {
-            if has_native_attachments
-                && native_attachments
-                    .iter()
-                    .all(|attachment| attachment.delivery_kind == "image")
-            {
-                let mut uploaded_images = Vec::new();
-                for attachment in &native_attachments {
-                    uploaded_images.push(
+            if has_native_attachments {
+                let attachment_item_offset = usize::from(!native_caption.is_empty());
+                let mut uploaded_items = Vec::with_capacity(native_attachments.len());
+                for (index, attachment) in native_attachments.iter().enumerate() {
+                    let upload_result = if attachment.delivery_kind == "image" {
                         self.upload_image(&account, attachment, &outbound.chat_id)
-                            .await?,
-                    );
+                            .await
+                            .map(|uploaded| (build_native_image_message_item(&uploaded), false))
+                    } else {
+                        let media_type = if attachment.delivery_kind == "video" {
+                            UPLOAD_MEDIA_VIDEO
+                        } else {
+                            UPLOAD_MEDIA_FILE
+                        };
+                        self.upload_media(&account, attachment, media_type, &outbound.chat_id)
+                            .await
+                            .map(|uploaded| {
+                                if attachment.delivery_kind == "video" {
+                                    (build_native_video_message_item(&uploaded), false)
+                                } else {
+                                    (
+                                        build_native_file_message_item(
+                                            &uploaded,
+                                            &attachment.file_name,
+                                        ),
+                                        true,
+                                    )
+                                }
+                            })
+                    };
+                    match upload_result {
+                        Ok(item) => uploaded_items.push(item),
+                        Err(error) => {
+                            return Err((error, attachment_item_offset + index));
+                        }
+                    }
                 }
+
+                let mut delivery_item_index = 0;
                 if !native_caption.is_empty() {
-                    last_client_id = self
+                    match self
                         .send_message_items(
                             &account,
                             &outbound.chat_id,
                             &context_token,
                             vec![build_text_message_item(&native_caption)],
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(provider_message_id) => {
+                            last_client_id = provider_message_id;
+                            mark_delivery_item(
+                                &mut delivery_items,
+                                delivery_item_index,
+                                "sent",
+                                Some(&last_client_id),
+                                false,
+                                None,
+                            );
+                            self.update_delivery_batch(
+                                &delivery_batch_id,
+                                "sending",
+                                &delivery_items,
+                            );
+                            delivery_item_index += 1;
+                        }
+                        Err(error) => return Err((error, delivery_item_index)),
+                    }
                 }
-                for uploaded in uploaded_images {
-                    last_client_id = self
-                        .send_message_items(
-                            &account,
-                            &outbound.chat_id,
-                            &context_token,
-                            vec![build_native_image_message_item(&uploaded)],
-                        )
-                        .await?;
+                for (item, used_file_fallback) in uploaded_items {
+                    attachment_fallback_used |= used_file_fallback;
+                    match self
+                        .send_message_items(&account, &outbound.chat_id, &context_token, vec![item])
+                        .await
+                    {
+                        Ok(provider_message_id) => {
+                            last_client_id = provider_message_id;
+                            mark_delivery_item(
+                                &mut delivery_items,
+                                delivery_item_index,
+                                "sent",
+                                Some(&last_client_id),
+                                false,
+                                None,
+                            );
+                            self.update_delivery_batch(
+                                &delivery_batch_id,
+                                "sending",
+                                &delivery_items,
+                            );
+                            delivery_item_index += 1;
+                        }
+                        Err(error) => return Err((error, delivery_item_index)),
+                    }
                 }
-            } else if let Some(attachment) = native_attachments.first() {
-                let media_type = if attachment.delivery_kind == "video" {
-                    UPLOAD_MEDIA_VIDEO
-                } else {
-                    UPLOAD_MEDIA_FILE
-                };
-                let uploaded = self
-                    .upload_media(&account, attachment, media_type, &outbound.chat_id)
-                    .await?;
-                if !native_caption.is_empty() {
-                    last_client_id = self
-                        .send_message_items(
-                            &account,
-                            &outbound.chat_id,
-                            &context_token,
-                            vec![build_text_message_item(&native_caption)],
-                        )
-                        .await?;
-                }
-                let item = if attachment.delivery_kind == "video" {
-                    build_native_video_message_item(&uploaded)
-                } else {
-                    build_native_file_message_item(&uploaded, &attachment.file_name)
-                };
-                if attachment.delivery_kind == "file" {
-                    attachment_fallback_used = true;
-                }
-                last_client_id = self
-                    .send_message_items(&account, &outbound.chat_id, &context_token, vec![item])
-                    .await?;
             } else {
-                last_client_id = self
-                    .send_text_chunks(&account, &outbound.chat_id, &context_token, &outbound.text)
-                    .await?;
+                for (index, chunk) in chunks.iter().enumerate() {
+                    match self
+                        .send_message_items(
+                            &account,
+                            &outbound.chat_id,
+                            &context_token,
+                            vec![build_text_message_item(chunk)],
+                        )
+                        .await
+                    {
+                        Ok(provider_message_id) => {
+                            last_client_id = provider_message_id;
+                            mark_delivery_item(
+                                &mut delivery_items,
+                                index,
+                                "sent",
+                                Some(&last_client_id),
+                                false,
+                                None,
+                            );
+                            self.update_delivery_batch(
+                                &delivery_batch_id,
+                                "sending",
+                                &delivery_items,
+                            );
+                        }
+                        Err(error) => return Err((error, index)),
+                    }
+                }
             }
-            Ok::<(), GatewayError>(())
+            Ok::<(), (GatewayError, usize)>(())
         }
         .await;
 
-        if let Err(error) = send_result {
+        if let Err((error, failed_item_index)) = send_result {
             let error_text = redact_sensitive_text(
                 &error.message,
                 &[&account.account_id, &account.token, &context_token],
+            );
+            let retryable = !has_native_attachments;
+            mark_delivery_item(
+                &mut delivery_items,
+                failed_item_index,
+                "failed",
+                None,
+                retryable,
+                Some(&error_text),
+            );
+            if retryable {
+                mark_remaining_delivery_items_pending_retry(
+                    &mut delivery_items,
+                    failed_item_index + 1,
+                );
+            }
+            self.update_delivery_batch(
+                &delivery_batch_id,
+                if retryable { "pending_retry" } else { "failed" },
+                &delivery_items,
             );
             self.update_transport(json_map!({
                 "status": "send_failed",
@@ -1011,7 +1142,7 @@ impl PlatformAdapter for WeixinAdapter {
                 "last_error": error_text.clone(),
                 "last_send_status": "failed",
                 "last_send_error": error_text,
-                "last_send_retryable": !has_native_attachments,
+                "last_send_retryable": retryable,
                 "last_send_provider_message_id": last_client_id.clone(),
                 "last_send_context_token_used": true,
                 "last_send_attachment_count": native_attachment_count,
@@ -1020,6 +1151,7 @@ impl PlatformAdapter for WeixinAdapter {
             return Err(error);
         }
 
+        self.update_delivery_batch(&delivery_batch_id, "sent", &delivery_items);
         self.update_transport(json_map!({
             "status": "polling_idle",
             "connected": true,
@@ -1062,6 +1194,7 @@ impl PlatformAdapter for WeixinAdapter {
                 "native_attachment_count": native_attachments.len(),
                 "native_attachment_kind": delivered_attachment_kind,
                 "native_attachment_fallback": attachment_fallback_used,
+                "delivery_batch": delivery_batch_snapshot(&delivery_batch_id, "sent", &delivery_items),
             },
         }))
     }
@@ -1110,9 +1243,118 @@ fn default_transport_state(configured: bool) -> serde_json::Map<String, Value> {
         "last_send_context_token_used": false,
         "last_send_attachment_count": 0,
         "last_send_content_kind": "",
+        "last_delivery_batch_id": "",
+        "last_delivery_batch": Value::Null,
         "last_inbound_at": "",
         "last_inbound_message_id": "",
         "last_inbound_chat_id": "",
+    })
+}
+
+fn planned_delivery_items(batch_id: &str, kinds: &[String]) -> Vec<Value> {
+    kinds
+        .iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            json!({
+                "item_id": format!("{batch_id}-{:03}", index + 1),
+                "index": index,
+                "kind": kind,
+                "status": "planned",
+                "provider_message_id": null,
+                "retryable": false,
+                "error": null,
+            })
+        })
+        .collect()
+}
+
+fn mark_delivery_item(
+    items: &mut [Value],
+    index: usize,
+    status: &str,
+    provider_message_id: Option<&str>,
+    retryable: bool,
+    error: Option<&str>,
+) {
+    let Some(item) = items.get_mut(index).and_then(Value::as_object_mut) else {
+        return;
+    };
+    item.insert("status".into(), json!(status));
+    item.insert(
+        "provider_message_id".into(),
+        provider_message_id
+            .filter(|value| !value.trim().is_empty())
+            .map_or(Value::Null, |value| json!(value)),
+    );
+    item.insert("retryable".into(), json!(retryable));
+    item.insert(
+        "error".into(),
+        error
+            .filter(|value| !value.trim().is_empty())
+            .map_or(Value::Null, |value| json!(value)),
+    );
+}
+
+fn mark_remaining_delivery_items_pending_retry(items: &mut [Value], start_index: usize) {
+    for index in start_index..items.len() {
+        if items[index]
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "planned")
+        {
+            mark_delivery_item(items, index, "pending_retry", None, true, None);
+        }
+    }
+}
+
+fn attach_delivery_item_references(items: &mut [Value], offset: usize, attachments: &[Value]) {
+    for (attachment_index, attachment) in attachments.iter().enumerate() {
+        let Some(artifact_ref) = delivery_artifact_ref(attachment) else {
+            continue;
+        };
+        let Some(item) = items
+            .get_mut(offset + attachment_index)
+            .and_then(Value::as_object_mut)
+        else {
+            break;
+        };
+        item.insert("artifact_ref".into(), json!(artifact_ref));
+    }
+}
+
+fn delivery_artifact_ref(attachment: &Value) -> Option<String> {
+    attachment
+        .pointer("/metadata/harborlink_artifact_id")
+        .or_else(|| attachment.get("media_asset_id"))
+        .or_else(|| attachment.get("label"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn delivery_batch_snapshot(batch_id: &str, status: &str, items: &[Value]) -> Value {
+    let count_status = |expected: &str| {
+        items
+            .iter()
+            .filter(|item| {
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|item_status| item_status == expected)
+            })
+            .count()
+    };
+    json!({
+        "delivery_batch_id": batch_id,
+        "status": status,
+        "item_count": items.len(),
+        "planned_count": count_status("planned"),
+        "sent_count": count_status("sent"),
+        "failed_count": count_status("failed"),
+        "pending_retry_count": count_status("pending_retry"),
+        "items": items,
+        "updated_at": utc_now_iso(),
     })
 }
 
@@ -1536,16 +1778,30 @@ fn resolve_native_media_attachments(
             "Weixin native media reply requires at least one attachment",
         ));
     }
-    if resolved.len() > 1
-        && resolved
-            .iter()
-            .any(|attachment| attachment.delivery_kind != "image")
-    {
-        return Err(GatewayError::validation(
-            "Weixin multi-attachment native reply only supports images",
-        ));
+    Ok(resolved)
+}
+
+fn attachment_delivery_kind_from_value(value: &Value) -> String {
+    let kind = value
+        .get("kind")
+        .or_else(|| value.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let mime_type = value
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if kind == "image" || mime_type.starts_with("image/") {
+        "image".to_string()
+    } else if kind == "video" || mime_type.starts_with("video/") {
+        "video".to_string()
+    } else {
+        "file".to_string()
     }
-    Ok(resolved.into_iter().take(3).collect())
 }
 
 fn native_media_attachment_from_value(
@@ -1847,5 +2103,140 @@ mod tests {
         assert_eq!(payload["msg"]["to_user_id"], "wx-user");
         assert_eq!(payload["msg"]["client_id"], "client-1");
         assert_eq!(payload["msg"]["context_token"], "ctx");
+    }
+
+    #[test]
+    fn native_media_resolution_accepts_mixed_image_and_video() {
+        let dir = tempdir().unwrap();
+        let image = dir.path().join("snapshot.jpg");
+        let video = dir.path().join("clip.mp4");
+        fs::write(&image, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        fs::write(&video, b"clip").unwrap();
+        let outbound = OutboundMessage {
+            platform: "weixin".into(),
+            chat_id: "wx-user".into(),
+            text: "照片和视频如下".into(),
+            attachments: vec![
+                json!({"kind": "image", "mime_type": "image/jpeg", "path": image}),
+                json!({"kind": "video", "mime_type": "video/mp4", "path": video}),
+            ],
+            timestamp: utc_now_iso(),
+            metadata: json_map!({"source": "harborbeacon"}),
+        };
+
+        let resolved = resolve_native_media_attachments(&outbound).unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].delivery_kind, "image");
+        assert_eq!(resolved[1].delivery_kind, "video");
+    }
+
+    #[test]
+    fn native_media_resolution_keeps_more_than_three_videos() {
+        let dir = tempdir().unwrap();
+        let attachments = (1..=5)
+            .map(|index| {
+                let video = dir.path().join(format!("cat-{index}.mp4"));
+                fs::write(&video, b"clip").unwrap();
+                json!({"kind": "video", "mime_type": "video/mp4", "path": video})
+            })
+            .collect();
+        let outbound = OutboundMessage {
+            platform: "weixin".into(),
+            chat_id: "wx-user".into(),
+            text: "今日猫活动视频".into(),
+            attachments,
+            timestamp: utc_now_iso(),
+            metadata: json_map!({"source": "harborbeacon"}),
+        };
+
+        let resolved = resolve_native_media_attachments(&outbound).unwrap();
+
+        assert_eq!(resolved.len(), 5);
+    }
+
+    #[test]
+    fn delivery_batch_tracks_each_video_and_pending_retry_item() {
+        let kinds = vec![
+            "text".to_string(),
+            "video".to_string(),
+            "video".to_string(),
+            "video".to_string(),
+        ];
+        let mut items = planned_delivery_items("wxbatch_test", &kinds);
+        mark_delivery_item(&mut items, 0, "sent", Some("provider-text"), false, None);
+        mark_delivery_item(&mut items, 1, "sent", Some("provider-video-1"), false, None);
+        mark_delivery_item(&mut items, 2, "failed", None, true, Some("timeout"));
+        mark_remaining_delivery_items_pending_retry(&mut items, 3);
+
+        let snapshot = delivery_batch_snapshot("wxbatch_test", "pending_retry", &items);
+
+        assert_eq!(snapshot["item_count"], 4);
+        assert_eq!(snapshot["planned_count"], 0);
+        assert_eq!(snapshot["sent_count"], 2);
+        assert_eq!(snapshot["failed_count"], 1);
+        assert_eq!(snapshot["pending_retry_count"], 1);
+        assert_eq!(snapshot["items"][1]["kind"], "video");
+        assert_eq!(
+            snapshot["items"][1]["provider_message_id"],
+            "provider-video-1"
+        );
+        assert_eq!(snapshot["items"][3]["status"], "pending_retry");
+        assert!(snapshot.to_string().find(".mp4").is_none());
+    }
+
+    #[test]
+    fn delivery_batch_correlates_video_without_exposing_local_path() {
+        let attachments = vec![json!({
+            "kind": "video",
+            "path": "/run/harborgate-cache/private-cat-video.mp4",
+            "metadata": {
+                "harborlink_artifact_id": "recordings~camera-252~cat-event-7.mp4"
+            }
+        })];
+        let mut items = planned_delivery_items(
+            "wxbatch_artifact",
+            &["text".to_string(), "video".to_string()],
+        );
+
+        attach_delivery_item_references(&mut items, 1, &attachments);
+
+        assert_eq!(
+            items[1]["artifact_ref"],
+            "recordings~camera-252~cat-event-7.mp4"
+        );
+        assert!(items[1].get("path").is_none());
+        assert!(!items[1].to_string().contains("harborgate-cache"));
+    }
+
+    #[test]
+    fn missing_native_video_is_a_failed_video_item_instead_of_text_success() {
+        let outbound = OutboundMessage {
+            platform: "weixin".into(),
+            chat_id: "wx-user".into(),
+            text: "今日猫活动视频".into(),
+            attachments: vec![json!({
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "path": "missing-cat-video.mp4"
+            })],
+            timestamp: utc_now_iso(),
+            metadata: json_map!({"source": "harborbeacon"}),
+        };
+
+        let error = resolve_native_media_attachments(&outbound).unwrap_err();
+        let kinds = outbound
+            .attachments
+            .iter()
+            .map(attachment_delivery_kind_from_value)
+            .collect::<Vec<_>>();
+        let mut items = planned_delivery_items("wxbatch_missing", &kinds);
+        mark_delivery_item(&mut items, 0, "failed", None, false, Some(&error.message));
+        let snapshot = delivery_batch_snapshot("wxbatch_missing", "failed", &items);
+
+        assert_eq!(snapshot["items"][0]["kind"], "video");
+        assert_eq!(snapshot["items"][0]["status"], "failed");
+        assert_eq!(snapshot["sent_count"], 0);
+        assert_eq!(snapshot["failed_count"], 1);
     }
 }
