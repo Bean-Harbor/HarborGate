@@ -2586,7 +2586,7 @@ mod tests {
         });
 
         adapter
-            .persist_inbound_batch(&[update.clone()])
+            .persist_inbound_batch(std::slice::from_ref(&update))
             .expect("inbox commit must succeed");
 
         assert_eq!(load_sync_buf(dir.path(), "bot-inbox"), "");
