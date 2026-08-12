@@ -728,6 +728,10 @@ fn is_identity_query_key(key: &str) -> bool {
 
 fn requires_harboros_principal(method: &Method, target_path: &str) -> bool {
     let path = target_path.split('?').next().unwrap_or(target_path);
+    const DETECTION_JOBS: &str = "/api/vision/detection-jobs";
+    if path == DETECTION_JOBS || path.starts_with(&format!("{DETECTION_JOBS}/")) {
+        return true;
+    }
     match (method, path) {
         (&Method::POST, "/api/knowledge/search")
         | (&Method::GET, "/api/knowledge/conversations")
@@ -975,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn harboros_authentication_is_limited_to_the_rag_json_contract() {
+    fn harboros_authentication_covers_rag_and_detection_job_contracts() {
         assert!(requires_harboros_principal(
             &axum::http::Method::POST,
             "/api/knowledge/search"
@@ -995,6 +999,30 @@ mod tests {
         assert!(requires_harboros_principal(
             &axum::http::Method::PATCH,
             "/api/knowledge/conversation-settings"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::POST,
+            "/api/vision/detection-jobs"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/vision/detection-jobs"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/vision/detection-jobs/job-1"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::POST,
+            "/api/vision/detection-jobs/job-1/renew"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::DELETE,
+            "/api/vision/detection-jobs/job-1"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::PATCH,
+            "/api/vision/detection-jobs/job-1/results/latest"
         ));
         assert!(!requires_harboros_principal(
             &axum::http::Method::GET,

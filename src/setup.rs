@@ -882,8 +882,8 @@ impl SetupPortalService {
         json!({
             "platform": platform,
             "display_name": display_name,
-            "configured": platform_status.get("configured").cloned().unwrap_or_else(|| json!(false)),
-            "connected": platform_status.get("connected").cloned().unwrap_or_else(|| json!(false)),
+            "configured": platform_status.get("configured").cloned().unwrap_or(json!(false)),
+            "connected": platform_status.get("connected").cloned().unwrap_or(json!(false)),
             "status": platform_status.get("status").cloned().unwrap_or_else(|| json!("")),
             "setup_url": platform_status.get("setup_url").cloned().unwrap_or_else(|| json!("")),
             "manage_url": platform_status.get("manage_url").cloned().unwrap_or_else(|| json!("")),
@@ -1157,9 +1157,7 @@ fn mask_secret(value: &str) -> String {
 
 fn redact_sensitive(value: &str) -> String {
     let mut redacted = value.to_string();
-    for marker in ["Bearer "] {
-        redacted = redacted.replace(marker, "Bearer [REDACTED] ");
-    }
+    redacted = redacted.replace("Bearer ", "Bearer [REDACTED] ");
     redacted
 }
 

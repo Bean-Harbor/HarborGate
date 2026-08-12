@@ -1,12 +1,16 @@
 use crate::config::AppConfig;
 use crate::error::GatewayError;
+use crate::gateway::AttachmentCacheRoot;
 use crate::models::InboundMessage;
 use axum::http::StatusCode;
-use reqwest::Client;
+use futures_util::StreamExt;
+use reqwest::{redirect::Policy, Client};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use url::Url;
 use uuid::Uuid;
 
 pub const DEFAULT_CONTRACT_VERSION: &str = "2.0";
@@ -45,15 +49,20 @@ pub struct MaterializedAttachmentBatch {
 
 impl HarborBeaconTaskClient {
     pub fn from_config(config: &AppConfig) -> Option<Self> {
-        config.harborbeacon_enabled().then(|| Self {
-            base_url: config
-                .harborbeacon_base_url
-                .trim_end_matches('/')
-                .to_string(),
-            api_token: config.harborbeacon_token.clone(),
+        let base_url = config.harborbeacon_base_url.trim_end_matches('/');
+        let api_token = config.harborbeacon_token.trim();
+        if !config.harborbeacon_enabled()
+            || api_token.is_empty()
+            || !valid_beacon_base_url(base_url)
+        {
+            return None;
+        }
+        Some(Self {
+            base_url: base_url.to_string(),
+            api_token: api_token.to_string(),
             turn_endpoint: config.harborbeacon_turn_endpoint.clone(),
             contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
-            http: Client::new(),
+            http: media_http_client(),
         })
     }
 
@@ -91,47 +100,73 @@ impl HarborBeaconTaskClient {
         cache_root: &Path,
         turn_id: &str,
     ) -> MaterializedAttachmentBatch {
+        let count = artifacts.len();
+        let trusted_parent = cache_root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let cache_basename = cache_root.file_name().map(Path::new);
+        let cache_root = match cache_basename
+            .ok_or_else(|| std::io::Error::other("attachment cache path has no basename"))
+            .and_then(|basename| AttachmentCacheRoot::open(trusted_parent, basename))
+        {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(error = %error, "HarborGate could not open the attachment cache root");
+                return MaterializedAttachmentBatch {
+                    failed_count: count,
+                    ..MaterializedAttachmentBatch::default()
+                };
+            }
+        };
+        self.materialize_attachments_in(artifacts, &cache_root, turn_id)
+            .await
+    }
+
+    pub(crate) async fn materialize_attachments_in(
+        &self,
+        artifacts: Vec<Value>,
+        cache_root: &AttachmentCacheRoot,
+        turn_id: &str,
+    ) -> MaterializedAttachmentBatch {
         let mut batch = MaterializedAttachmentBatch::default();
         for mut artifact in artifacts {
-            if artifact
-                .get("path")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .is_some_and(|path| !path.is_empty() && Path::new(path).is_file())
-            {
-                batch.attachments.push(artifact);
-                continue;
-            }
-            let Some(relative_url) = artifact
+            let Some(artifact_url) = artifact
                 .get("url")
                 .and_then(Value::as_str)
-                .and_then(trusted_media_artifact_path)
+                .and_then(|raw| trusted_media_artifact_url(&self.base_url, raw))
             else {
                 batch.failed_count += 1;
                 continue;
             };
             let cache_dir = batch.cache_dir.get_or_insert_with(|| {
-                cache_root.join(format!(
+                cache_root.path().join(format!(
                     "turn-{}-{}",
                     safe_cache_segment(turn_id),
                     Uuid::new_v4().simple()
                 ))
             });
-            if tokio::fs::create_dir_all(&cache_dir).await.is_err() {
+            if cache_root.create_dir(cache_dir).is_err() {
                 batch.failed_count += 1;
                 continue;
             }
             let mime_type = artifact
                 .get("mime_type")
                 .and_then(Value::as_str)
-                .unwrap_or("application/octet-stream");
+                .map(str::trim)
+                .filter(|value| trusted_attachment_mime(value))
+                .unwrap_or("");
+            if mime_type.is_empty() {
+                batch.failed_count += 1;
+                continue;
+            }
             let extension = attachment_extension(mime_type);
             let destination = cache_dir.join(format!(
                 "attachment-{}.{extension}",
                 Uuid::new_v4().simple()
             ));
             match self
-                .download_media_artifact(&relative_url, &destination)
+                .download_media_artifact(cache_root, &artifact_url, mime_type, &destination)
                 .await
             {
                 Ok(()) => {
@@ -145,7 +180,7 @@ impl HarborBeaconTaskClient {
                     batch.attachments.push(artifact);
                 }
                 Err(error) => {
-                    if let Err(remove_error) = tokio::fs::remove_file(&destination).await {
+                    if let Err(remove_error) = cache_root.remove_file(&destination) {
                         if remove_error.kind() != std::io::ErrorKind::NotFound {
                             tracing::warn!(
                                 path = %destination.display(),
@@ -159,23 +194,59 @@ impl HarborBeaconTaskClient {
                 }
             }
         }
+        if batch.failed_count > 0 {
+            for path in batch.cache_files.drain(..) {
+                if let Err(error) = cache_root.remove_file(&path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "HarborGate could not roll back a partial attachment batch"
+                        );
+                    }
+                }
+            }
+            batch.attachments.clear();
+        }
+        if batch.cache_files.is_empty() {
+            if let Some(cache_dir) = batch.cache_dir.take() {
+                if let Err(error) = cache_root.remove_dir(&cache_dir) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            path = %cache_dir.display(),
+                            error = %error,
+                            "HarborGate could not remove an empty attachment cache directory"
+                        );
+                    }
+                }
+            }
+        }
         batch
     }
 
     async fn download_media_artifact(
         &self,
-        relative_url: &str,
+        cache_root: &AttachmentCacheRoot,
+        artifact_url: &Url,
+        expected_mime_type: &str,
         destination: &Path,
     ) -> Result<(), GatewayError> {
-        const MAX_ATTACHMENT_BYTES: usize = 128 * 1024 * 1024;
-        let url = format!("{}{}", self.base_url.trim_end_matches('/'), relative_url);
-        let mut request = self.http.get(url).timeout(Duration::from_secs(45));
-        if !self.api_token.trim().is_empty() {
-            request = request.bearer_auth(&self.api_token);
+        const MAX_ATTACHMENT_BYTES: u64 = 128 * 1024 * 1024;
+        if self.api_token.trim().is_empty() {
+            return Err(GatewayError::validation(
+                "HarborBeacon service token is required for media download",
+            ));
         }
-        let response = request.send().await.map_err(|error| {
-            GatewayError::infrastructure(format!("Beacon media download failed: {error}"))
-        })?;
+        let response = self
+            .http
+            .get(artifact_url.clone())
+            .timeout(Duration::from_secs(45))
+            .bearer_auth(&self.api_token)
+            .send()
+            .await
+            .map_err(|error| {
+                GatewayError::infrastructure(format!("Beacon media download failed: {error}"))
+            })?;
         if !response.status().is_success() {
             return Err(GatewayError::infrastructure(format!(
                 "Beacon media download returned HTTP {}",
@@ -184,22 +255,54 @@ impl HarborBeaconTaskClient {
         }
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_ATTACHMENT_BYTES as u64)
+            .is_some_and(|length| length > MAX_ATTACHMENT_BYTES)
         {
             return Err(GatewayError::validation(
                 "Beacon media attachment exceeds the delivery size limit",
             ));
         }
-        let bytes = response.bytes().await.map_err(|error| {
-            GatewayError::infrastructure(format!("Beacon media body read failed: {error}"))
-        })?;
-        if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT_BYTES {
+        let response_mime_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .unwrap_or("");
+        if !response_mime_type.eq_ignore_ascii_case(expected_mime_type) {
             return Err(GatewayError::validation(
-                "Beacon media attachment is empty or too large",
+                "Beacon media attachment MIME type does not match the artifact contract",
             ));
         }
-        tokio::fs::write(destination, bytes).await.map_err(|error| {
-            GatewayError::infrastructure(format!("Gate media cache write failed: {error}"))
+        let mut file = cache_root
+            .create_new_file(destination)
+            .map(tokio::fs::File::from_std)
+            .map_err(|error| {
+                GatewayError::infrastructure(format!("Gate media cache create failed: {error}"))
+            })?;
+        let mut stream = response.bytes_stream();
+        let mut written = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                GatewayError::infrastructure(format!("Beacon media body read failed: {error}"))
+            })?;
+            written = written.saturating_add(chunk.len() as u64);
+            if written > MAX_ATTACHMENT_BYTES {
+                return Err(GatewayError::validation(
+                    "Beacon media attachment exceeds the delivery size limit",
+                ));
+            }
+            file.write_all(&chunk).await.map_err(|error| {
+                GatewayError::infrastructure(format!("Gate media cache write failed: {error}"))
+            })?;
+        }
+        if written == 0 {
+            return Err(GatewayError::validation("Beacon media attachment is empty"));
+        }
+        file.flush().await.map_err(|error| {
+            GatewayError::infrastructure(format!("Gate media cache flush failed: {error}"))
+        })?;
+        file.sync_all().await.map_err(|error| {
+            GatewayError::infrastructure(format!("Gate media cache sync failed: {error}"))
         })
     }
 
@@ -260,18 +363,75 @@ impl HarborBeaconTaskClient {
     }
 }
 
-fn trusted_media_artifact_path(raw: &str) -> Option<String> {
-    let path = raw.trim();
-    if path.starts_with("/api/cameras/recordings/artifacts/")
-        && !path.contains("..")
-        && !path.contains('\\')
-        && !path.contains('?')
-        && !path.contains('#')
-    {
-        Some(path.to_string())
-    } else {
-        None
+fn valid_beacon_base_url(raw: &str) -> bool {
+    Url::parse(raw).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+fn trusted_media_artifact_url(base_url: &str, raw: &str) -> Option<Url> {
+    let base = Url::parse(base_url).ok()?;
+    if !valid_beacon_base_url(base_url) {
+        return None;
     }
+    let raw = raw.trim();
+    let artifact = if raw.starts_with('/') && !raw.starts_with("//") {
+        base.join(raw).ok()?
+    } else {
+        Url::parse(raw).ok()?
+    };
+    if artifact.scheme() != base.scheme()
+        || artifact.host_str() != base.host_str()
+        || artifact.port_or_known_default() != base.port_or_known_default()
+        || !artifact.username().is_empty()
+        || artifact.password().is_some()
+        || artifact.query().is_some()
+        || artifact.fragment().is_some()
+    {
+        return None;
+    }
+    let decoded_segments = artifact
+        .path_segments()?
+        .map(|segment| {
+            urlencoding::decode(segment)
+                .ok()
+                .map(|value| value.into_owned())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if decoded_segments.len() != 5
+        || decoded_segments[..4] != ["api", "cameras", "recordings", "artifacts"]
+    {
+        return None;
+    }
+    let artifact_id = &decoded_segments[4];
+    if artifact_id.is_empty()
+        || matches!(artifact_id.as_str(), "." | "..")
+        || !artifact_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '~')
+        })
+    {
+        return None;
+    }
+    Some(artifact)
+}
+
+fn trusted_attachment_mime(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "image/jpeg" | "image/png" | "image/webp" | "video/mp4" | "video/quicktime"
+    )
+}
+
+fn media_http_client() -> Client {
+    Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .expect("reqwest client with disabled redirects must build")
 }
 
 fn safe_cache_segment(value: &str) -> String {
@@ -652,7 +812,16 @@ fn metadata_lookup(metadata: &serde_json::Map<String, Value>, key: &str) -> Opti
 mod tests {
     use super::*;
     use crate::models::utc_now_iso;
-    use axum::{routing::get, Router};
+    use axum::{
+        body::{Body, Bytes},
+        http::{header, HeaderMap, HeaderValue, Response, StatusCode},
+        response::IntoResponse,
+        routing::get,
+        Router,
+    };
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -727,32 +896,111 @@ mod tests {
     }
 
     #[test]
-    fn media_artifact_download_accepts_only_beacon_proxy_paths() {
+    fn harborbeacon_client_requires_service_token() {
+        let mut config = AppConfig::from_env();
+        config.harborbeacon_base_url = "https://beacon.example".to_string();
+        config.harborbeacon_token.clear();
+        assert!(HarborBeaconTaskClient::from_config(&config).is_none());
+
+        config.harborbeacon_token = "service-token".to_string();
+        assert!(HarborBeaconTaskClient::from_config(&config).is_some());
+    }
+
+    #[test]
+    fn media_artifact_download_accepts_only_same_origin_single_safe_id() {
+        let base_url = "https://beacon.example:8443";
         assert_eq!(
-            trusted_media_artifact_path(
+            trusted_media_artifact_url(
+                base_url,
                 "/api/cameras/recordings/artifacts/clips~cam-252~1785289217123.mp4"
             )
+            .map(|url| url.to_string())
             .as_deref(),
-            Some("/api/cameras/recordings/artifacts/clips~cam-252~1785289217123.mp4")
+            Some(
+                "https://beacon.example:8443/api/cameras/recordings/artifacts/clips~cam-252~1785289217123.mp4"
+            )
+        );
+        assert_eq!(
+            trusted_media_artifact_url(
+                base_url,
+                "https://beacon.example:8443/api/cameras/recordings/artifacts/video-1.mp4"
+            )
+            .map(|url| url.path().to_string())
+            .as_deref(),
+            Some("/api/cameras/recordings/artifacts/video-1.mp4")
         );
         for rejected in [
             "https://example.com/clip.mp4",
+            "https://beacon.example:9443/api/cameras/recordings/artifacts/clip.mp4",
             "/api/cameras/recordings/artifacts/../secret",
+            "/api/cameras/recordings/artifacts/%2e%2e/secret",
+            "/api/cameras/recordings/artifacts/%2fsecret.mp4",
+            "/api/cameras/recordings/artifacts/%5csecret.mp4",
+            "/api/cameras/recordings/artifacts/clip%2fsecret.mp4",
+            "/api/cameras/recordings/artifacts/clip%5csecret.mp4",
+            "/api/cameras/recordings/artifacts/clip.mp4/extra",
+            "/api/cameras/recordings/artifacts/.",
             "/api/cameras/recordings/artifacts/clip.mp4?token=secret",
+            "/api/cameras/recordings/artifacts/clip.mp4#fragment",
             "/shared/cameras/token-252",
         ] {
             assert!(
-                trusted_media_artifact_path(rejected).is_none(),
+                trusted_media_artifact_url(base_url, rejected).is_none(),
                 "unexpected trusted URL: {rejected}"
             );
         }
     }
 
     #[tokio::test]
+    async fn encoded_or_nonwhitelisted_media_path_never_reaches_http_or_disk() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = hits.clone();
+        let app = Router::new().fallback(get(move || {
+            let server_hits = server_hits.clone();
+            async move {
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NOT_FOUND
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HarborBeaconTaskClient {
+            base_url: format!("http://{address}"),
+            api_token: "service-token".to_string(),
+            turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
+            contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
+            http: media_http_client(),
+        };
+        let cache_root = tempdir().unwrap();
+
+        let batch = client
+            .materialize_attachments(
+                vec![
+                    json!({"artifact_id": "encoded", "kind": "video", "mime_type": "video/mp4", "url": "/api/cameras/recordings/artifacts/clip%2fsecret.mp4"}),
+                    json!({"artifact_id": "other", "kind": "video", "mime_type": "video/mp4", "url": "/api/internal/media/clip.mp4"}),
+                ],
+                cache_root.path(),
+                "turn-invalid-url",
+            )
+            .await;
+
+        server.abort();
+        assert_eq!(batch.failed_count, 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read_dir(cache_root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn materialize_attachments_downloads_into_gate_owned_cache() {
         let app = Router::new().route(
             "/api/cameras/recordings/artifacts/snapshots~cam-252~frame.jpg",
-            get(|| async { [0xFF_u8, 0xD8, 0xFF, 0xD9] }),
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+                    [0xFF_u8, 0xD8, 0xFF, 0xD9],
+                )
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -763,10 +1011,10 @@ mod tests {
         });
         let client = HarborBeaconTaskClient {
             base_url: format!("http://{address}"),
-            api_token: String::new(),
+            api_token: "service-token".to_string(),
             turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
             contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
-            http: Client::new(),
+            http: media_http_client(),
         };
         let cache_root = tempdir().expect("attachment cache root");
 
@@ -795,5 +1043,420 @@ mod tests {
             tokio::fs::read(&cached_path).await.expect("cached bytes"),
             [0xFF, 0xD8, 0xFF, 0xD9]
         );
+    }
+
+    #[tokio::test]
+    async fn materialize_attachments_fails_closed_after_cache_root_is_replaced() {
+        let app = Router::new().route(
+            "/api/cameras/recordings/artifacts/snapshots~cam-252~frame.jpg",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+                    [0xFF_u8, 0xD8, 0xFF, 0xD9],
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HarborBeaconTaskClient {
+            base_url: format!("http://{address}"),
+            api_token: "service-token".to_string(),
+            turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
+            contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
+            http: media_http_client(),
+        };
+        let dir = tempdir().unwrap();
+        #[cfg(windows)]
+        let (cache_root, displaced_cache_root, outside_dir) = {
+            let state_dir = dir.path().join("state");
+            let real_state_dir = dir.path().join("real-state");
+            let outside_state_dir = dir.path().join("outside-state");
+            let outside_dir = outside_state_dir.join("attachment-cache");
+            fs::create_dir_all(&real_state_dir).unwrap();
+            fs::create_dir_all(&outside_dir).unwrap();
+            assert!(std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(&state_dir)
+                .arg(&real_state_dir)
+                .status()
+                .unwrap()
+                .success());
+            let cache_root =
+                AttachmentCacheRoot::open(&state_dir, Path::new("attachment-cache")).unwrap();
+            fs::remove_dir(&state_dir).unwrap();
+            assert!(std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(&state_dir)
+                .arg(&outside_state_dir)
+                .status()
+                .unwrap()
+                .success());
+            (
+                cache_root,
+                real_state_dir.join("attachment-cache"),
+                outside_dir,
+            )
+        };
+        #[cfg(unix)]
+        let (cache_root, displaced_cache_root, outside_dir) = {
+            let state_dir = dir.path().join("state");
+            let visible_cache_root = state_dir.join("attachment-cache");
+            let displaced_cache_root = state_dir.join("attachment-cache-original");
+            let outside_dir = dir.path().join("outside");
+            fs::create_dir_all(&outside_dir).unwrap();
+            let cache_root =
+                AttachmentCacheRoot::open(&state_dir, Path::new("attachment-cache")).unwrap();
+            fs::rename(&visible_cache_root, &displaced_cache_root).unwrap();
+            std::os::unix::fs::symlink(&outside_dir, &visible_cache_root).unwrap();
+            (cache_root, displaced_cache_root, outside_dir)
+        };
+        let outside_marker = outside_dir.join("marker.txt");
+        fs::write(&outside_marker, b"outside-must-survive").unwrap();
+
+        let batch = client
+            .materialize_attachments_in(
+                vec![json!({
+                    "kind": "image",
+                    "mime_type": "image/jpeg",
+                    "url": "/api/cameras/recordings/artifacts/snapshots~cam-252~frame.jpg"
+                })],
+                &cache_root,
+                "turn-root-swap",
+            )
+            .await;
+
+        server.abort();
+        assert_eq!(batch.failed_count, 1);
+        assert!(batch.attachments.is_empty());
+        assert_eq!(fs::read(&outside_marker).unwrap(), b"outside-must-survive");
+        assert_eq!(fs::read_dir(&outside_dir).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&displaced_cache_root).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn materialize_attachments_rejects_beacon_supplied_local_path() {
+        let local = tempdir().expect("local artifact root");
+        let local_path = local.path().join("secret.mp4");
+        tokio::fs::write(&local_path, b"private")
+            .await
+            .expect("write local artifact");
+        let cache_root = tempdir().expect("attachment cache root");
+        let client = HarborBeaconTaskClient {
+            base_url: "http://127.0.0.1:9".to_string(),
+            api_token: "service-secret".to_string(),
+            turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
+            contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
+            http: media_http_client(),
+        };
+
+        let batch = client
+            .materialize_attachments(
+                vec![json!({
+                    "id": "artifact-secret",
+                    "kind": "video",
+                    "mime_type": "video/mp4",
+                    "path": local_path,
+                })],
+                cache_root.path(),
+                "turn-local-path",
+            )
+            .await;
+
+        assert_eq!(batch.failed_count, 1);
+        assert!(batch.attachments.is_empty());
+        assert!(batch.cache_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn materialize_attachments_rejects_mismatched_response_mime() {
+        let app = Router::new().route(
+            "/api/cameras/recordings/artifacts/clip.mp4",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))],
+                    "not a video",
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Beacon");
+        let address = listener.local_addr().expect("mock Beacon address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock Beacon");
+        });
+        let client = HarborBeaconTaskClient {
+            base_url: format!("http://{address}"),
+            api_token: "service-token".to_string(),
+            turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
+            contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
+            http: media_http_client(),
+        };
+        let cache_root = tempdir().expect("attachment cache root");
+
+        let batch = client
+            .materialize_attachments(
+                vec![json!({
+                    "id": "artifact-clip",
+                    "kind": "video",
+                    "mime_type": "video/mp4",
+                    "url": "/api/cameras/recordings/artifacts/clip.mp4",
+                })],
+                cache_root.path(),
+                "turn-wrong-mime",
+            )
+            .await;
+
+        server.abort();
+        assert_eq!(batch.failed_count, 1);
+        assert!(batch.attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn materialize_attachments_does_not_follow_redirects() {
+        let app = Router::new()
+            .route(
+                "/api/cameras/recordings/artifacts/clip.mp4",
+                get(|| async {
+                    (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, HeaderValue::from_static("/secret.mp4"))],
+                    )
+                }),
+            )
+            .route(
+                "/secret.mp4",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"))],
+                        "secret",
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Beacon");
+        let address = listener.local_addr().expect("mock Beacon address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock Beacon");
+        });
+        let client = HarborBeaconTaskClient {
+            base_url: format!("http://{address}"),
+            api_token: "service-token".to_string(),
+            turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
+            contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
+            http: media_http_client(),
+        };
+        let cache_root = tempdir().expect("attachment cache root");
+
+        let batch = client
+            .materialize_attachments(
+                vec![json!({
+                    "id": "artifact-clip",
+                    "kind": "video",
+                    "mime_type": "video/mp4",
+                    "url": "/api/cameras/recordings/artifacts/clip.mp4",
+                })],
+                cache_root.path(),
+                "turn-redirect",
+            )
+            .await;
+
+        server.abort();
+        assert_eq!(batch.failed_count, 1);
+        assert!(batch.attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn materialize_attachments_rejects_wrong_bearer_and_oversized_content_length() {
+        let app = Router::new()
+            .route(
+                "/api/cameras/recordings/artifacts/auth.mp4",
+                get(|headers: HeaderMap| async move {
+                    if headers.get(header::AUTHORIZATION)
+                        == Some(&HeaderValue::from_static("Bearer expected-service-token"))
+                    {
+                        (
+                            [(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"))],
+                            "clip",
+                        )
+                            .into_response()
+                    } else {
+                        StatusCode::UNAUTHORIZED.into_response()
+                    }
+                }),
+            )
+            .route(
+                "/api/cameras/recordings/artifacts/oversized.mp4",
+                get(|| async {
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "video/mp4")
+                        .header(header::CONTENT_LENGTH, "134217729")
+                        .body(Body::from_stream(futures_util::stream::once(async {
+                            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"x"))
+                        })))
+                        .unwrap()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Beacon");
+        let address = listener.local_addr().expect("mock Beacon address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock Beacon");
+        });
+        let cache_root = tempdir().expect("attachment cache root");
+        let artifact = |url: &str| {
+            json!({
+                "artifact_id": "artifact-video",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "url": url,
+            })
+        };
+        let wrong_token_client = HarborBeaconTaskClient {
+            base_url: format!("http://{address}"),
+            api_token: "wrong-token".to_string(),
+            turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
+            contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
+            http: media_http_client(),
+        };
+        let wrong_bearer = wrong_token_client
+            .materialize_attachments(
+                vec![artifact("/api/cameras/recordings/artifacts/auth.mp4")],
+                cache_root.path(),
+                "turn-wrong-bearer",
+            )
+            .await;
+        assert_eq!(wrong_bearer.failed_count, 1);
+        assert!(wrong_bearer.cache_dir.is_none());
+
+        let authorized_client = HarborBeaconTaskClient {
+            api_token: "expected-service-token".to_string(),
+            ..wrong_token_client
+        };
+        let oversized = authorized_client
+            .materialize_attachments(
+                vec![artifact("/api/cameras/recordings/artifacts/oversized.mp4")],
+                cache_root.path(),
+                "turn-oversized",
+            )
+            .await;
+
+        server.abort();
+        assert_eq!(oversized.failed_count, 1);
+        assert!(oversized.cache_files.is_empty());
+        assert!(oversized.cache_dir.is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_length_body_over_limit_is_aborted_and_partial_batch_is_removed() {
+        const CHUNK_SIZE: usize = 1024 * 1024;
+        const CHUNK_COUNT: usize = 129;
+        let app = Router::new().route(
+            "/api/cameras/recordings/artifacts/chunked.mp4",
+            get(|| async {
+                let chunks = futures_util::stream::iter((0..CHUNK_COUNT).map(|_| {
+                    Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![0_u8; CHUNK_SIZE]))
+                }));
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "video/mp4")
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Beacon");
+        let address = listener.local_addr().expect("mock Beacon address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock Beacon");
+        });
+        let client = HarborBeaconTaskClient {
+            base_url: format!("http://{address}"),
+            api_token: "service-token".to_string(),
+            turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
+            contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
+            http: media_http_client(),
+        };
+        let cache_root = tempdir().expect("attachment cache root");
+
+        let batch = client
+            .materialize_attachments(
+                vec![json!({
+                    "artifact_id": "artifact-chunked",
+                    "kind": "video",
+                    "mime_type": "video/mp4",
+                    "url": "/api/cameras/recordings/artifacts/chunked.mp4",
+                })],
+                cache_root.path(),
+                "turn-chunked",
+            )
+            .await;
+
+        server.abort();
+        assert_eq!(batch.failed_count, 1);
+        assert!(batch.attachments.is_empty());
+        assert!(batch.cache_files.is_empty());
+        assert!(batch.cache_dir.is_none());
+        assert_eq!(std::fs::read_dir(cache_root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn later_attachment_error_rolls_back_earlier_files_in_the_same_batch() {
+        let app = Router::new()
+            .route(
+                "/api/cameras/recordings/artifacts/good.jpg",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+                        [0xFF_u8, 0xD8, 0xFF, 0xD9],
+                    )
+                }),
+            )
+            .route(
+                "/api/cameras/recordings/artifacts/bad.mp4",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))],
+                        "not-video",
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HarborBeaconTaskClient {
+            base_url: format!("http://{address}"),
+            api_token: "service-token".to_string(),
+            turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
+            contract_version: DEFAULT_CONTRACT_VERSION.to_string(),
+            http: media_http_client(),
+        };
+        let cache_root = tempdir().unwrap();
+
+        let batch = client
+            .materialize_attachments(
+                vec![
+                    json!({"artifact_id": "good", "kind": "image", "mime_type": "image/jpeg", "url": "/api/cameras/recordings/artifacts/good.jpg"}),
+                    json!({"artifact_id": "bad", "kind": "video", "mime_type": "video/mp4", "url": "/api/cameras/recordings/artifacts/bad.mp4"}),
+                ],
+                cache_root.path(),
+                "turn-partial",
+            )
+            .await;
+
+        server.abort();
+        assert_eq!(batch.failed_count, 1);
+        assert!(batch.attachments.is_empty());
+        assert!(batch.cache_files.is_empty());
+        assert!(batch.cache_dir.is_none());
+        assert_eq!(std::fs::read_dir(cache_root.path()).unwrap().count(), 0);
     }
 }

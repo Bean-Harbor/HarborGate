@@ -2,7 +2,7 @@ use crate::adapters::feishu::FeishuAdapter;
 use crate::adapters::feishu_mail::FeishuMailAdapter;
 use crate::adapters::webhook::WebhookAdapter;
 use crate::adapters::weixin::WeixinAdapter;
-use crate::adapters::PlatformAdapter;
+use crate::adapters::{PlatformAdapter, PreparedOutbound};
 use crate::config::AppConfig;
 use crate::error::GatewayError;
 use crate::harborbeacon::{
@@ -10,13 +10,197 @@ use crate::harborbeacon::{
     HarborBeaconTaskClient,
 };
 use crate::models::{ConversationTurn, InboundMessage, OutboundMessage};
-use crate::store::FileSessionStore;
+use crate::store::{
+    DeliveryItemClaimRequest, DeliveryItemCompletion, DeliveryItemUpload, DeliveryStageCompletion,
+    FileSessionStore,
+};
 use axum::http::StatusCode;
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+use cap_std::io_lifetimes::AsFilelike;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use uuid::Uuid;
+
+pub(crate) struct AttachmentCacheRoot {
+    path: PathBuf,
+    trusted_parent_path: PathBuf,
+    cache_basename: PathBuf,
+    trusted_parent_dir: Dir,
+    dir: Dir,
+}
+
+impl AttachmentCacheRoot {
+    pub(crate) fn open(trusted_parent: &Path, cache_basename: &Path) -> std::io::Result<Self> {
+        Self::open_after_create(trusted_parent, cache_basename, || {})
+    }
+
+    fn open_after_create(
+        trusted_parent: &Path,
+        cache_basename: &Path,
+        after_create: impl FnOnce(),
+    ) -> std::io::Result<Self> {
+        let mut components = cache_basename.components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "attachment cache basename must be one normal path component",
+            ));
+        }
+        fs::create_dir_all(trusted_parent)?;
+        let trusted_parent_dir = Dir::open_ambient_dir(trusted_parent, ambient_authority())?;
+        if let Err(error) = trusted_parent_dir.create_dir(cache_basename) {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+        after_create();
+        let child_dir = cap_primitives::fs::open_dir_nofollow(
+            &trusted_parent_dir.as_filelike_view::<fs::File>(),
+            cache_basename,
+        )?;
+        Ok(Self {
+            path: trusted_parent.join(cache_basename),
+            trusted_parent_path: trusted_parent.to_path_buf(),
+            cache_basename: cache_basename.to_path_buf(),
+            trusted_parent_dir,
+            dir: Dir::from_std_file(child_dir),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn relative_path(&self, candidate: &Path) -> std::io::Result<PathBuf> {
+        let relative = candidate.strip_prefix(&self.path).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "attachment cache path is outside the capability root",
+            )
+        })?;
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "attachment cache path is not a safe root-relative path",
+            ));
+        }
+        Ok(relative.to_path_buf())
+    }
+
+    fn ensure_visible_root(&self) -> std::io::Result<()> {
+        let visible_parent = Dir::open_ambient_dir(&self.trusted_parent_path, ambient_authority())?;
+        if !same_directory(&visible_parent, &self.trusted_parent_dir)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "attachment cache parent was replaced after startup",
+            ));
+        }
+        let visible_root = Dir::from_std_file(cap_primitives::fs::open_dir_nofollow(
+            &visible_parent.as_filelike_view::<fs::File>(),
+            &self.cache_basename,
+        )?);
+        if !same_directory(&visible_root, &self.dir)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "attachment cache root was replaced after startup",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_dir(&self, candidate: &Path) -> std::io::Result<()> {
+        self.ensure_visible_root()?;
+        let relative = self.relative_path(candidate)?;
+        match self.dir.create_dir(&relative) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let opened = cap_primitives::fs::open_dir_nofollow(
+            &self.dir.as_filelike_view::<fs::File>(),
+            &relative,
+        )?;
+        drop(opened);
+        Ok(())
+    }
+
+    pub(crate) fn create_new_file(&self, candidate: &Path) -> std::io::Result<fs::File> {
+        self.ensure_visible_root()?;
+        let relative = self.relative_path(candidate)?;
+        self.dir
+            .open_with(
+                relative,
+                cap_std::fs::OpenOptions::new().create_new(true).write(true),
+            )
+            .map(cap_std::fs::File::into_std)
+    }
+
+    fn entries(&self) -> std::io::Result<cap_std::fs::ReadDir> {
+        self.dir.entries()
+    }
+
+    fn open_dir(&self, candidate: &Path) -> std::io::Result<Dir> {
+        let relative = self.relative_path(candidate)?;
+        cap_primitives::fs::open_dir_nofollow(&self.dir.as_filelike_view::<fs::File>(), &relative)
+            .map(Dir::from_std_file)
+    }
+
+    pub(crate) fn remove_file(&self, candidate: &Path) -> std::io::Result<()> {
+        let relative = self.relative_path(candidate)?;
+        self.dir.remove_file(relative)
+    }
+
+    #[cfg(test)]
+    fn remove_file_with_hook(&self, candidate: &Path, hook: impl FnOnce()) -> std::io::Result<()> {
+        let relative = self.relative_path(candidate)?;
+        hook();
+        self.dir.remove_file(relative)
+    }
+
+    pub(crate) fn remove_dir(&self, candidate: &Path) -> std::io::Result<()> {
+        let relative = self.relative_path(candidate)?;
+        self.dir.remove_dir(relative)
+    }
+}
+
+#[cfg(unix)]
+fn same_directory(left: &Dir, right: &Dir) -> std::io::Result<bool> {
+    use cap_std::fs::MetadataExt;
+
+    let left = left.dir_metadata()?;
+    let right = right.dir_metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(windows)]
+fn same_directory(left: &Dir, right: &Dir) -> std::io::Result<bool> {
+    use cap_primitives::fs::_WindowsByHandle;
+
+    let left = left.dir_metadata()?;
+    let right = right.dir_metadata()?;
+    Ok(matches!(
+        (
+            left.volume_serial_number(),
+            left.file_index(),
+            right.volume_serial_number(),
+            right.file_index(),
+        ),
+        (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index))
+            if left_volume == right_volume && left_index == right_index
+    ))
+}
 
 pub struct GatewayService {
     store: Arc<FileSessionStore>,
@@ -25,13 +209,85 @@ pub struct GatewayService {
     feishu_adapter: Arc<FeishuAdapter>,
     feishu_mail_adapter: Arc<FeishuMailAdapter>,
     weixin_adapter: Arc<WeixinAdapter>,
-    attachment_cache_dir: PathBuf,
+    attachment_cache_root: Arc<AttachmentCacheRoot>,
     public_origin: String,
+    delivery_instance_id: String,
+}
+
+struct AttachmentCacheGuard {
+    root: Arc<AttachmentCacheRoot>,
+    files: Vec<PathBuf>,
+    directory: Option<PathBuf>,
+}
+
+struct DeliveryStageRequest<'a> {
+    claim: &'a Value,
+    delivery_key: &'a str,
+    item_key: &'a str,
+    claim_token: &'a str,
+    stage: &'a str,
+}
+
+impl AttachmentCacheGuard {
+    fn new(
+        root: Arc<AttachmentCacheRoot>,
+        files: Vec<PathBuf>,
+        directory: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            root,
+            files,
+            directory,
+        }
+    }
+
+    fn disarm_path(&mut self, path: &Path) {
+        self.files.retain(|candidate| candidate != path);
+        if self.files.is_empty() {
+            self.directory = None;
+        }
+    }
+}
+
+impl Drop for AttachmentCacheGuard {
+    fn drop(&mut self) {
+        for path in self.files.drain(..) {
+            if let Err(error) = self.root.remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), error = %error, "Could not remove guarded Gate attachment cache file");
+                }
+            }
+        }
+        if let Some(path) = self.directory.take() {
+            if let Err(error) = self.root.remove_dir(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), error = %error, "Could not remove guarded Gate attachment cache directory");
+                }
+            }
+        }
+    }
 }
 
 impl GatewayService {
     pub fn from_config(config: &AppConfig) -> anyhow::Result<Self> {
         let store = Arc::new(FileSessionStore::new(&config.data_dir)?);
+        let attachment_cache_root = Arc::new(AttachmentCacheRoot::open(
+            &config.state_dir,
+            Path::new("attachment-cache"),
+        )?);
+        let cache_reconciliation = store.reconcile_delivery_cache(
+            chrono::Utc::now(),
+            chrono::Duration::from_std(ATTACHMENT_CACHE_TTL)?,
+        )?;
+        remove_reconciled_attachment_cache(
+            &attachment_cache_root,
+            cache_reconciliation.delete_paths,
+        )?;
+        sweep_expired_attachment_cache(
+            &attachment_cache_root,
+            &cache_reconciliation.retained_paths,
+            SystemTime::now(),
+        )?;
         let mut adapters: BTreeMap<String, Arc<dyn PlatformAdapter>> = BTreeMap::new();
         let webhook = Arc::new(WebhookAdapter);
         adapters.insert(webhook.name().to_string(), webhook);
@@ -48,8 +304,9 @@ impl GatewayService {
             feishu_adapter: feishu,
             feishu_mail_adapter: feishu_mail,
             weixin_adapter: weixin,
-            attachment_cache_dir: config.state_dir.join("attachment-cache"),
+            attachment_cache_root,
             public_origin: config.public_origin.trim_end_matches('/').to_string(),
+            delivery_instance_id: Uuid::new_v4().simple().to_string(),
         })
     }
 
@@ -112,17 +369,23 @@ impl GatewayService {
             next_metadata,
             cache_files,
             cache_dir,
+            mut cache_guard,
         ) = if let Some(task_client) = &self.task_client {
             let task_result = task_client.submit_turn(&inbound, &session_metadata).await?;
             let attachment_candidates =
                 native_source_bound_attachments(adapter_name, &task_result.response_payload);
             let materialized = task_client
-                .materialize_attachments(
+                .materialize_attachments_in(
                     attachment_candidates,
-                    &self.attachment_cache_dir,
+                    &self.attachment_cache_root,
                     &task_result.task_id,
                 )
                 .await;
+            let cache_guard = AttachmentCacheGuard::new(
+                self.attachment_cache_root.clone(),
+                materialized.cache_files.clone(),
+                materialized.cache_dir.clone(),
+            );
             let mut reply_text = render_retrieval_reply(
                 &task_result.text,
                 &task_result.response_payload,
@@ -169,6 +432,10 @@ impl GatewayService {
             metadata.insert("status".into(), json!(task_result.status));
             metadata.insert("route_key".into(), json!(task_result.route_key));
             metadata.insert(
+                "delivery_request_fingerprint".into(),
+                json!(fingerprint(&task_result.response_payload)),
+            );
+            metadata.insert(
                 "conversation_handle".into(),
                 json!(task_result.conversation_handle),
             );
@@ -196,6 +463,7 @@ impl GatewayService {
                 next_metadata,
                 materialized.cache_files,
                 materialized.cache_dir,
+                cache_guard,
             )
         } else {
             let mut next_metadata = session_metadata.clone();
@@ -211,6 +479,7 @@ impl GatewayService {
                 next_metadata,
                 vec![],
                 None,
+                AttachmentCacheGuard::new(self.attachment_cache_root.clone(), vec![], None),
             )
         };
 
@@ -258,8 +527,31 @@ impl GatewayService {
             timestamp: crate::models::utc_now_iso(),
             metadata: outbound_metadata,
         };
-        let delivery = adapter.send_outbound(outbound).await;
-        cleanup_attachment_cache(cache_files, cache_dir).await;
+        let delivery_key = outbound
+            .metadata
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let delivery_fingerprint = outbound
+            .metadata
+            .get("delivery_request_fingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+            .if_empty_then(|| fingerprint(&json!({"turn_id": delivery_key})));
+        let delivery = self
+            .deliver_outbound_items_guarded(
+                adapter,
+                outbound,
+                &delivery_key,
+                &delivery_fingerprint,
+                Some(&mut cache_guard),
+            )
+            .await;
+        if delivery.is_ok() {
+            cleanup_attachment_cache(&self.attachment_cache_root, cache_files, cache_dir).await;
+        }
         delivery
     }
 
@@ -489,11 +781,54 @@ impl GatewayService {
                 .with_trace(trace_id));
             }
             if let Some(response) = record.get("response_payload") {
-                return Ok(response.clone());
+                let retryable_failure = response
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|ok| !ok)
+                    && response
+                        .get("retryable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                if !retryable_failure {
+                    return Ok(response.clone());
+                }
             }
         }
 
         let content = delivery_content(&payload);
+        let planned_attachments = hinted_notification_attachments(&content);
+        let mut notification_cache_guard = None;
+        let outbound_attachments = if adapter_name == "weixin" && !planned_attachments.is_empty() {
+            let task_client = self.task_client.as_ref().ok_or_else(|| {
+                GatewayError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "HARBORBEACON_DISABLED",
+                    "HarborBeacon media proxy is not configured",
+                )
+                .with_trace(trace_id.clone())
+            })?;
+            let materialized = task_client
+                .materialize_attachments_in(
+                    planned_attachments,
+                    &self.attachment_cache_root,
+                    &delivery_idempotency_cache_segment(&idempotency_key),
+                )
+                .await;
+            notification_cache_guard = Some(AttachmentCacheGuard::new(
+                self.attachment_cache_root.clone(),
+                materialized.cache_files.clone(),
+                materialized.cache_dir.clone(),
+            ));
+            if materialized.failed_count > 0 {
+                return Err(GatewayError::infrastructure(
+                    "One or more hinted delivery artifacts could not be materialized",
+                )
+                .with_trace(trace_id));
+            }
+            materialized.attachments
+        } else {
+            planned_attachments
+        };
         let outbound = OutboundMessage {
             platform: route
                 .get("platform")
@@ -506,27 +841,32 @@ impl GatewayService {
                 .unwrap_or("")
                 .to_string(),
             text: notification_text(&content),
-            attachments: content
-                .get("attachments")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
+            attachments: outbound_attachments,
             timestamp: crate::models::utc_now_iso(),
-            metadata: outbound_delivery_metadata(
-                &notification_id,
-                &trace_id,
-                &mode,
-                &route_key,
-                &reply_to_message_id,
-                &update_message_id,
-                &route,
-                &content,
+            metadata: outbound_delivery_metadata(NotificationDeliveryMetadata {
+                notification_id: &notification_id,
+                trace_id: &trace_id,
+                mode: &mode,
+                route_key: &route_key,
+                reply_to_message_id: &reply_to_message_id,
+                update_message_id: &update_message_id,
+                route: &route,
+                content: &content,
                 destination,
-                &idempotency_key,
-            ),
+                idempotency_key: &idempotency_key,
+            }),
         };
         let delivery_id = stable_id("delivery_", &idempotency_key, 24);
-        let response_payload = match adapter.send_outbound(outbound).await {
+        let response_payload = match self
+            .deliver_outbound_items_guarded(
+                adapter,
+                outbound,
+                &idempotency_key,
+                &fingerprint,
+                notification_cache_guard.as_mut(),
+            )
+            .await
+        {
             Ok(adapter_response) => {
                 let provider_message_id = adapter_response
                     .get("message_id")
@@ -549,6 +889,12 @@ impl GatewayService {
             }
             Err(error) => {
                 let (code, retryable) = map_delivery_failure(&error.message);
+                let provider_message_id = error
+                    .delivery_failure
+                    .as_ref()
+                    .and_then(|item| item.get("provider_message_id"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 json!({
                     "delivery_id": delivery_id,
                     "notification_id": notification_id,
@@ -556,7 +902,7 @@ impl GatewayService {
                     "ok": false,
                     "status": "failed",
                     "platform": route.get("platform").and_then(Value::as_str).unwrap_or(&adapter_name),
-                    "provider_message_id": null,
+                    "provider_message_id": provider_message_id,
                     "retryable": retryable,
                     "error": {
                         "code": code,
@@ -565,16 +911,471 @@ impl GatewayService {
                 })
             }
         };
-        let classification = classify_delivery_attempt(&route, &response_payload);
-        self.store
-            .save_delivery_record(
-                &idempotency_key,
-                &fingerprint,
-                response_payload.clone(),
-                classification,
-            )
-            .map_err(|err| GatewayError::infrastructure(err.to_string()).with_trace(trace_id))?;
+        if response_payload
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let classification = classify_delivery_attempt(&route, &response_payload);
+            self.store
+                .save_delivery_record(
+                    &idempotency_key,
+                    &fingerprint,
+                    response_payload.clone(),
+                    classification,
+                )
+                .map_err(|err| {
+                    GatewayError::infrastructure(err.to_string()).with_trace(trace_id)
+                })?;
+        }
         Ok(response_payload)
+    }
+
+    async fn send_delivery_stage(
+        &self,
+        adapter: &Arc<dyn PlatformAdapter>,
+        outbound: OutboundMessage,
+        request: DeliveryStageRequest<'_>,
+    ) -> (Result<Value, GatewayError>, Option<PreparedOutbound>) {
+        let DeliveryStageRequest {
+            claim,
+            delivery_key,
+            item_key,
+            claim_token,
+            stage,
+        } = request;
+        let stage_pointer = format!("/item/stages/{stage}");
+        let stage_item = claim.pointer(&stage_pointer).unwrap_or(&Value::Null);
+        let mut prepared = stage_item
+            .get("provider_media_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|provider_media_id| PreparedOutbound {
+                provider_media_id: provider_media_id.to_string(),
+                provider_client_id: stage_item
+                    .get("provider_client_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                state: stage_item
+                    .get("provider_media_state")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            });
+        if prepared.is_none() && stage == "native" {
+            prepared = claim
+                .pointer("/item/provider_media_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|provider_media_id| PreparedOutbound {
+                    provider_media_id: provider_media_id.to_string(),
+                    provider_client_id: claim
+                        .pointer("/item/provider_client_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                    state: claim
+                        .pointer("/item/provider_media_state")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                });
+        }
+
+        let result = if prepared.is_none() {
+            match adapter.prepare_outbound(&outbound).await {
+                Ok(Some(value)) => {
+                    if let Err(error) = self.store.record_delivery_item_upload(DeliveryItemUpload {
+                        delivery_key,
+                        item_key,
+                        claim_token,
+                        stage,
+                        provider_media_id: &value.provider_media_id,
+                        provider_media_state: value.state.clone(),
+                        provider_client_id: value.provider_client_id.as_deref(),
+                    }) {
+                        return (
+                            Err(GatewayError::infrastructure(error.to_string())),
+                            Some(value),
+                        );
+                    }
+                    prepared = Some(value);
+                    adapter
+                        .send_prepared_outbound(outbound, prepared.as_ref())
+                        .await
+                }
+                Ok(None) => adapter.send_prepared_outbound(outbound, None).await,
+                Err(error) => Err(error),
+            }
+        } else {
+            adapter
+                .send_prepared_outbound(outbound, prepared.as_ref())
+                .await
+        };
+
+        let stage_completion = match &result {
+            Ok(response) => DeliveryStageCompletion {
+                delivery_key,
+                item_key,
+                claim_token,
+                stage,
+                status: "succeeded",
+                provider_media_id: response
+                    .get("provider_media_id")
+                    .or_else(|| response.get("media_id"))
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        prepared
+                            .as_ref()
+                            .map(|value| value.provider_media_id.as_str())
+                    }),
+                provider_client_id: response
+                    .get("provider_client_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        prepared
+                            .as_ref()
+                            .and_then(|value| value.provider_client_id.as_deref())
+                    }),
+                provider_message_id: response
+                    .get("provider_message_id")
+                    .or_else(|| response.get("message_id"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty()),
+                retryable: false,
+                last_error: None,
+            },
+            Err(error) => {
+                let unsupported = should_fallback_to_file(error);
+                let (_, retryable) = map_delivery_failure(&error.message);
+                DeliveryStageCompletion {
+                    delivery_key,
+                    item_key,
+                    claim_token,
+                    stage,
+                    status: if unsupported { "unsupported" } else { "failed" },
+                    provider_media_id: prepared
+                        .as_ref()
+                        .map(|value| value.provider_media_id.as_str()),
+                    provider_client_id: prepared
+                        .as_ref()
+                        .and_then(|value| value.provider_client_id.as_deref()),
+                    provider_message_id: None,
+                    retryable: !unsupported && retryable,
+                    last_error: Some(&error.message),
+                }
+            }
+        };
+        if let Err(error) = self.store.finish_delivery_stage(stage_completion) {
+            return (
+                Err(GatewayError::infrastructure(error.to_string())),
+                prepared,
+            );
+        }
+        (result, prepared)
+    }
+
+    #[cfg(test)]
+    async fn deliver_outbound_items(
+        &self,
+        adapter: Arc<dyn PlatformAdapter>,
+        outbound: OutboundMessage,
+        delivery_key: &str,
+        request_fingerprint: &str,
+    ) -> Result<Value, GatewayError> {
+        self.deliver_outbound_items_guarded(
+            adapter,
+            outbound,
+            delivery_key,
+            request_fingerprint,
+            None,
+        )
+        .await
+    }
+
+    async fn deliver_outbound_items_guarded(
+        &self,
+        adapter: Arc<dyn PlatformAdapter>,
+        outbound: OutboundMessage,
+        delivery_key: &str,
+        request_fingerprint: &str,
+        mut cache_guard: Option<&mut AttachmentCacheGuard>,
+    ) -> Result<Value, GatewayError> {
+        if delivery_key.trim().is_empty() {
+            return adapter.send_outbound(outbound).await;
+        }
+        let mut last_response = json!({});
+        for (artifact_id, kind, mut item_outbound) in split_outbound_items(outbound) {
+            let item_key = format!("{delivery_key}:{artifact_id}");
+            let cache_path = item_outbound
+                .attachments
+                .first()
+                .and_then(|attachment| attachment.get("path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from);
+            let claim = self
+                .store
+                .claim_delivery_item(DeliveryItemClaimRequest {
+                    delivery_key,
+                    request_fingerprint,
+                    item_key: &item_key,
+                    artifact_id: &artifact_id,
+                    kind: &kind,
+                    owner: &self.delivery_instance_id,
+                    cache_path: cache_path.as_deref(),
+                    lease_seconds: adapter.delivery_claim_lease_seconds(),
+                })
+                .map_err(|error| {
+                    if error.to_string().contains("fingerprint conflict") {
+                        GatewayError::new(
+                            StatusCode::CONFLICT,
+                            "IDEMPOTENCY_CONFLICT",
+                            "delivery key was reused with a different effective request",
+                        )
+                    } else {
+                        GatewayError::infrastructure(error.to_string())
+                    }
+                })?;
+            match claim.get("claim").and_then(Value::as_str) {
+                Some("succeeded") => {
+                    last_response = json!({
+                        "message_id": claim.pointer("/item/provider_message_id").cloned().unwrap_or(Value::Null),
+                        "provider_message_id": claim.pointer("/item/provider_message_id").cloned().unwrap_or(Value::Null),
+                        "provider_media_id": claim.pointer("/item/provider_media_id").cloned().unwrap_or(Value::Null),
+                        "provider_client_id": claim.pointer("/item/provider_client_id").cloned().unwrap_or(Value::Null),
+                    });
+                    continue;
+                }
+                Some("terminal_failed") => {
+                    let item = claim.get("item").cloned().unwrap_or(Value::Null);
+                    let message = item
+                        .get("last_error")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("delivery item previously failed terminally")
+                        .to_string();
+                    return Err(GatewayError::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "DELIVERY_TERMINAL_FAILED",
+                        message,
+                    )
+                    .with_delivery_failure(item));
+                }
+                Some("busy") => {
+                    return Err(GatewayError::infrastructure(
+                        "delivery item is already being sent",
+                    ));
+                }
+                Some("claimed") => {
+                    if let (Some(cache_path), Some(cache_guard)) =
+                        (cache_path.as_deref(), cache_guard.as_deref_mut())
+                    {
+                        cache_guard.disarm_path(cache_path);
+                    }
+                }
+                _ => {
+                    return Err(GatewayError::infrastructure(
+                        "delivery item ledger returned an invalid claim",
+                    ));
+                }
+            }
+            let claim_token = claim
+                .get("claim_token")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    GatewayError::infrastructure(
+                        "delivery item ledger returned a claim without a fencing token",
+                    )
+                })?;
+            item_outbound
+                .metadata
+                .insert("delivery_key".into(), json!(delivery_key));
+            item_outbound
+                .metadata
+                .insert("delivery_item_key".into(), json!(item_key));
+            if let Some(metadata) = item_outbound
+                .attachments
+                .first_mut()
+                .and_then(Value::as_object_mut)
+                .and_then(|attachment| attachment.get_mut("metadata"))
+                .and_then(Value::as_object_mut)
+            {
+                metadata.insert("delivery_item_key".into(), json!(item_key));
+            }
+            let fallback_outbound = native_video_file_fallback(&item_outbound);
+            let native_is_unsupported = claim
+                .pointer("/item/stages/native/status")
+                .and_then(Value::as_str)
+                == Some("unsupported");
+            let (send_result, prepared, fallback_used) = if native_is_unsupported {
+                if let Some(fallback_outbound) = fallback_outbound {
+                    let (result, prepared) = self
+                        .send_delivery_stage(
+                            &adapter,
+                            fallback_outbound,
+                            DeliveryStageRequest {
+                                claim: &claim,
+                                delivery_key,
+                                item_key: &item_key,
+                                claim_token,
+                                stage: "fallback",
+                            },
+                        )
+                        .await;
+                    (result, prepared, true)
+                } else {
+                    (
+                        Err(GatewayError::infrastructure(
+                            "native delivery is unsupported and no fallback is available",
+                        )),
+                        None,
+                        false,
+                    )
+                }
+            } else {
+                let (native_result, native_prepared) = self
+                    .send_delivery_stage(
+                        &adapter,
+                        item_outbound,
+                        DeliveryStageRequest {
+                            claim: &claim,
+                            delivery_key,
+                            item_key: &item_key,
+                            claim_token,
+                            stage: "native",
+                        },
+                    )
+                    .await;
+                match (native_result, fallback_outbound) {
+                    (Err(native_error), Some(fallback_outbound))
+                        if should_fallback_to_file(&native_error) =>
+                    {
+                        let (result, prepared) = self
+                            .send_delivery_stage(
+                                &adapter,
+                                fallback_outbound,
+                                DeliveryStageRequest {
+                                    claim: &claim,
+                                    delivery_key,
+                                    item_key: &item_key,
+                                    claim_token,
+                                    stage: "fallback",
+                                },
+                            )
+                            .await;
+                        (result, prepared, true)
+                    }
+                    (result, _) => (result, native_prepared, false),
+                }
+            };
+            match send_result {
+                Ok(response) => {
+                    let provider_message_id = response
+                        .get("provider_message_id")
+                        .or_else(|| response.get("message_id"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty());
+                    let provider_media_id = response
+                        .get("provider_media_id")
+                        .or_else(|| response.get("media_id"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| {
+                            prepared
+                                .as_ref()
+                                .map(|value| value.provider_media_id.as_str())
+                        });
+                    let provider_client_id = response
+                        .get("provider_client_id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| {
+                            prepared
+                                .as_ref()
+                                .and_then(|value| value.provider_client_id.as_deref())
+                        });
+                    let terminal_cache_path = self
+                        .store
+                        .finish_delivery_item(DeliveryItemCompletion {
+                            delivery_key,
+                            item_key: &item_key,
+                            claim_token,
+                            status: "succeeded",
+                            provider_media_id,
+                            provider_client_id,
+                            provider_message_id,
+                            retryable: false,
+                            last_error: None,
+                            fallback_used,
+                        })
+                        .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+                    if let Some(path) = terminal_cache_path {
+                        cleanup_attachment_cache(
+                            &self.attachment_cache_root,
+                            vec![path.clone()],
+                            path.parent().map(Path::to_path_buf),
+                        )
+                        .await;
+                    }
+                    if let Some(previous) = claim
+                        .get("previous_cache_path")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from)
+                        .filter(|path| cache_path.as_ref() != Some(path))
+                    {
+                        cleanup_attachment_cache(
+                            &self.attachment_cache_root,
+                            vec![previous.clone()],
+                            previous.parent().map(Path::to_path_buf),
+                        )
+                        .await;
+                    }
+                    last_response = response;
+                }
+                Err(error) => {
+                    let (_, retryable) = map_delivery_failure(&error.message);
+                    let terminal_cache_path = self
+                        .store
+                        .finish_delivery_item(DeliveryItemCompletion {
+                            delivery_key,
+                            item_key: &item_key,
+                            claim_token,
+                            status: "failed",
+                            provider_media_id: prepared
+                                .as_ref()
+                                .map(|value| value.provider_media_id.as_str()),
+                            provider_client_id: prepared
+                                .as_ref()
+                                .and_then(|value| value.provider_client_id.as_deref()),
+                            provider_message_id: None,
+                            retryable,
+                            last_error: Some(&error.message),
+                            fallback_used,
+                        })
+                        .map_err(|store_error| {
+                            GatewayError::infrastructure(store_error.to_string())
+                        })?;
+                    if let Some(path) = terminal_cache_path {
+                        cleanup_attachment_cache(
+                            &self.attachment_cache_root,
+                            vec![path.clone()],
+                            path.parent().map(Path::to_path_buf),
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(last_response)
     }
 
     pub fn status(&self) -> Value {
@@ -683,6 +1484,189 @@ impl GatewayService {
             "route_source": if destination.get("id").is_some() { "platform_id" } else { "recipient" },
         }))
     }
+}
+
+fn split_outbound_items(outbound: OutboundMessage) -> Vec<(String, String, OutboundMessage)> {
+    let mut items = Vec::new();
+    if !outbound.text.trim().is_empty() {
+        let mut text_outbound = outbound.clone();
+        text_outbound.attachments.clear();
+        items.push(("__text".to_string(), "text".to_string(), text_outbound));
+    }
+    for attachment in &outbound.attachments {
+        let Some(artifact_id) = delivery_artifact_id(attachment) else {
+            continue;
+        };
+        let kind = attachment
+            .get("kind")
+            .or_else(|| attachment.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("file")
+            .trim()
+            .to_string();
+        let mut attachment_outbound = outbound.clone();
+        attachment_outbound.text.clear();
+        attachment_outbound.attachments = vec![attachment.clone()];
+        items.push((artifact_id, kind, attachment_outbound));
+    }
+    if items.is_empty() {
+        items.push(("__text".to_string(), "text".to_string(), outbound));
+    }
+    items
+}
+
+fn native_video_file_fallback(outbound: &OutboundMessage) -> Option<OutboundMessage> {
+    let attachment = outbound.attachments.first()?;
+    if outbound.attachments.len() != 1
+        || attachment
+            .pointer("/metadata/native_attachment_fallback")
+            .and_then(Value::as_str)
+            != Some("file")
+    {
+        return None;
+    }
+    let is_video = attachment
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "video")
+        || attachment
+            .get("mime_type")
+            .and_then(Value::as_str)
+            .is_some_and(|mime_type| mime_type.starts_with("video/"));
+    if !is_video {
+        return None;
+    }
+    let mut fallback = outbound.clone();
+    if let Some(object) = fallback
+        .attachments
+        .first_mut()
+        .and_then(Value::as_object_mut)
+    {
+        object.insert("kind".into(), json!("file"));
+        object.insert("mime_type".into(), json!("application/octet-stream"));
+    }
+    fallback
+        .metadata
+        .insert("native_attachment_fallback_used".into(), json!(true));
+    Some(fallback)
+}
+
+fn should_fallback_to_file(error: &GatewayError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "UNSUPPORTED_NATIVE_VIDEO" | "NATIVE_MEDIA_PRE_SEND_FAILED"
+    )
+}
+
+fn hinted_notification_attachments(content: &Value) -> Vec<Value> {
+    let artifacts = content
+        .get("attachments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut selected = hinted_native_videos(&artifacts, content);
+    if let Some(limit) = native_image_limit(content) {
+        let images = artifacts.into_iter().filter(|artifact| {
+            artifact
+                .get("mime_type")
+                .and_then(Value::as_str)
+                .is_some_and(|mime_type| mime_type.starts_with("image/"))
+                && artifact_media_location(artifact).is_some()
+        });
+        selected.extend(images.take(limit));
+    }
+    selected
+}
+
+fn delivery_idempotency_cache_segment(delivery_key: &str) -> String {
+    stable_id("delivery-", delivery_key, 24)
+}
+
+const ATTACHMENT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn remove_reconciled_attachment_cache(
+    cache_root: &AttachmentCacheRoot,
+    paths: Vec<PathBuf>,
+) -> std::io::Result<()> {
+    let mut directories = HashSet::new();
+    for path in paths {
+        if let Some(parent) = path.parent() {
+            directories.insert(parent.to_path_buf());
+        }
+        if let Err(error) = cache_root.remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error);
+            }
+        }
+    }
+    for directory in directories {
+        if let Err(error) = cache_root.remove_dir(&directory) {
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sweep_expired_attachment_cache(
+    cache_root: &AttachmentCacheRoot,
+    retryable_cache_paths: &[PathBuf],
+    now: SystemTime,
+) -> std::io::Result<()> {
+    let retryable = retryable_cache_paths.iter().collect::<HashSet<_>>();
+    for entry in cache_root.entries()? {
+        let entry = entry?;
+        let path = cache_root.path().join(entry.file_name());
+        let batch_dir = match cache_root.open_dir(&path) {
+            Ok(directory) => directory,
+            Err(error) => {
+                if entry.file_type()?.is_dir() {
+                    return Err(error);
+                }
+                continue;
+            }
+        };
+        let metadata = batch_dir.dir_metadata()?;
+        let expired = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified.into_std()).ok())
+            .is_some_and(|age| age > ATTACHMENT_CACHE_TTL);
+        if !expired {
+            continue;
+        }
+        let mut children = Vec::new();
+        let mut can_remove = true;
+        let mut has_retryable_child = false;
+        for child in batch_dir.entries()? {
+            let child = child?;
+            let child_name = child.file_name();
+            let child_path = path.join(&child_name);
+            let child_type = child.file_type()?;
+            has_retryable_child |= retryable.contains(&child_path);
+            if child_type.is_file() || child_type.is_symlink() {
+                children.push(child_name);
+            } else {
+                can_remove = false;
+                break;
+            }
+        }
+        if has_retryable_child {
+            continue;
+        }
+        if can_remove {
+            for child in children {
+                batch_dir.remove_file(child)?;
+            }
+            drop(batch_dir);
+            cache_root.remove_dir(&path)?;
+        }
+    }
+    Ok(())
 }
 
 fn gateway_turn_to_inbound(payload: &Value) -> Result<InboundMessage, GatewayError> {
@@ -811,7 +1795,7 @@ fn native_source_bound_attachments(adapter_name: &str, response_payload: &Value)
 
 fn weixin_native_attachments(artifacts: Vec<Value>, response_payload: &Value) -> Vec<Value> {
     let media: Vec<Value> = artifacts
-        .into_iter()
+        .iter()
         .filter(|artifact| {
             let kind = artifact
                 .get("kind")
@@ -832,29 +1816,109 @@ fn weixin_native_attachments(artifacts: Vec<Value>, response_payload: &Value) ->
                     || mime_type.starts_with("image/")
                     || mime_type.starts_with("video/"))
         })
+        .cloned()
         .collect();
     if media.is_empty() {
         return vec![];
     }
-    let all_images = media.iter().all(|artifact| {
-        let kind = artifact
-            .get("kind")
-            .or_else(|| artifact.get("type"))
+    let images = media
+        .iter()
+        .filter(|artifact| {
+            let kind = artifact
+                .get("kind")
+                .or_else(|| artifact.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let mime_type = artifact
+                .get("mime_type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            kind == "image" || mime_type.starts_with("image/")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut selected = if let Some(limit) = native_image_limit(response_payload) {
+        images.into_iter().take(limit).collect()
+    } else if images.len() == 1 && media.len() == 1 {
+        images
+    } else {
+        vec![]
+    };
+    selected.extend(hinted_native_videos(&artifacts, response_payload));
+    selected
+}
+
+fn hinted_native_videos(artifacts: &[Value], response_payload: &Value) -> Vec<Value> {
+    let hints = response_payload
+        .get("delivery_hints")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut selected = Vec::new();
+    for hint in hints {
+        if hint.get("kind").and_then(Value::as_str) != Some("native_video")
+            || hint.get("fallback").and_then(Value::as_str) != Some("file")
+        {
+            continue;
+        }
+        let Some(artifact_id) = hint
+            .get("artifact_id")
             .and_then(Value::as_str)
-            .unwrap_or("");
-        let mime_type = artifact
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(mut artifact) = artifacts
+            .iter()
+            .find(|artifact| hint_artifact_id(artifact) == Some(artifact_id))
+            .cloned()
+        else {
+            continue;
+        };
+        let is_video = artifact
             .get("mime_type")
             .and_then(Value::as_str)
-            .unwrap_or("");
-        kind == "image" || mime_type.starts_with("image/")
-    });
-    if all_images {
-        if let Some(limit) = native_image_limit(response_payload) {
-            return media.into_iter().take(limit).collect();
+            .is_some_and(|mime_type| mime_type.starts_with("video/"));
+        if !is_video || artifact_media_location(&artifact).is_none() {
+            continue;
         }
-        return if media.len() == 1 { media } else { vec![] };
+        if let Some(object) = artifact.as_object_mut() {
+            let metadata = object
+                .entry("metadata")
+                .or_insert_with(|| json!({}))
+                .as_object_mut();
+            if let Some(metadata) = metadata {
+                metadata.insert("native_attachment_fallback".into(), json!("file"));
+            }
+        }
+        if !selected
+            .iter()
+            .any(|existing| hint_artifact_id(existing) == Some(artifact_id))
+        {
+            selected.push(artifact);
+        }
     }
-    media
+    selected
+}
+
+fn hint_artifact_id(artifact: &Value) -> Option<&str> {
+    artifact
+        .get("artifact_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn delivery_artifact_id(artifact: &Value) -> Option<String> {
+    artifact
+        .get("artifact_id")
+        .or_else(|| artifact.get("id"))
+        .or_else(|| artifact.pointer("/metadata/harborlink_artifact_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn artifact_media_location(artifact: &Value) -> Option<&str> {
@@ -1078,7 +2142,28 @@ fn notification_trace_id(payload: &Value) -> String {
 
 fn delivery_content(payload: &Value) -> Value {
     if let Some(content) = payload.get("content").filter(|value| value.is_object()) {
-        return content.clone();
+        let mut content = content.clone();
+        if let Some(object) = content.as_object_mut() {
+            object.insert(
+                "attachments".into(),
+                payload.get("artifacts").cloned().unwrap_or_else(|| {
+                    object
+                        .get("attachments")
+                        .cloned()
+                        .unwrap_or_else(|| json!([]))
+                }),
+            );
+            object.insert(
+                "delivery_hints".into(),
+                payload.get("delivery_hints").cloned().unwrap_or_else(|| {
+                    object
+                        .get("delivery_hints")
+                        .cloned()
+                        .unwrap_or_else(|| json!([]))
+                }),
+            );
+        }
+        return content;
     }
     let reply = payload.get("reply").and_then(Value::as_object);
     json!({
@@ -1111,18 +2196,34 @@ fn notification_text(content: &Value) -> String {
     }
 }
 
+struct NotificationDeliveryMetadata<'a> {
+    notification_id: &'a str,
+    trace_id: &'a str,
+    mode: &'a str,
+    route_key: &'a str,
+    reply_to_message_id: &'a str,
+    update_message_id: &'a str,
+    route: &'a Value,
+    content: &'a Value,
+    destination: &'a serde_json::Map<String, Value>,
+    idempotency_key: &'a str,
+}
+
 fn outbound_delivery_metadata(
-    notification_id: &str,
-    trace_id: &str,
-    mode: &str,
-    route_key: &str,
-    reply_to_message_id: &str,
-    update_message_id: &str,
-    route: &Value,
-    content: &Value,
-    destination: &serde_json::Map<String, Value>,
-    idempotency_key: &str,
+    input: NotificationDeliveryMetadata<'_>,
 ) -> serde_json::Map<String, Value> {
+    let NotificationDeliveryMetadata {
+        notification_id,
+        trace_id,
+        mode,
+        route_key,
+        reply_to_message_id,
+        update_message_id,
+        route,
+        content,
+        destination,
+        idempotency_key,
+    } = input;
     let mut metadata = serde_json::Map::new();
     metadata.insert("source".into(), json!("notification_delivery"));
     metadata.insert("notification_id".into(), json!(notification_id));
@@ -1269,12 +2370,388 @@ impl IfEmptyThen for String {
     }
 }
 
+fn public_artifact_url(url: &str, public_origin: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return url.to_string();
+    }
+    if url.starts_with('/') && !public_origin.trim().is_empty() {
+        return format!("{}{}", public_origin.trim_end_matches('/'), url);
+    }
+    url.to_string()
+}
+
+async fn cleanup_attachment_cache(
+    cache_root: &AttachmentCacheRoot,
+    cache_files: Vec<PathBuf>,
+    cache_dir: Option<PathBuf>,
+) {
+    for path in cache_files {
+        if let Err(error) = cache_root.remove_file(&path) {
+            tracing::warn!(path = %path.display(), error = %error, "Could not remove Gate attachment cache file");
+        }
+    }
+    if let Some(path) = cache_dir {
+        if let Err(error) = cache_root.remove_dir(&path) {
+            tracing::warn!(path = %path.display(), error = %error, "Could not remove Gate attachment cache directory");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    struct RetryOnceAdapter {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for RetryOnceAdapter {
+        fn name(&self) -> &str {
+            "retry_once"
+        }
+
+        fn normalize_inbound(&self, _payload: Value) -> Result<InboundMessage, GatewayError> {
+            unreachable!("test adapter is outbound-only")
+        }
+
+        async fn send_outbound(&self, _outbound: OutboundMessage) -> Result<Value, GatewayError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == 1 {
+                return Err(GatewayError::infrastructure("temporary provider timeout"));
+            }
+            Ok(json!({
+                "message_id": format!("provider-{attempt}"),
+                "provider_message_id": format!("provider-{attempt}"),
+            }))
+        }
+
+        fn profile(&self) -> Value {
+            json!({"adapter_name": "retry_once"})
+        }
+    }
+
+    struct FailSecondItemAdapter {
+        calls: Arc<StdMutex<Vec<String>>>,
+        failed_once: Arc<AtomicUsize>,
+    }
+
+    struct VideoFallbackAdapter {
+        kinds: Arc<StdMutex<Vec<String>>>,
+    }
+
+    struct RetryableVideoAdapter {
+        kinds: Arc<StdMutex<Vec<String>>>,
+    }
+
+    struct CaptureAttachmentAdapter {
+        sent_attachments: Arc<StdMutex<Vec<Vec<Value>>>>,
+    }
+
+    struct TerminalFailureAdapter {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    struct StagedFallbackAdapter {
+        uploads: Arc<StdMutex<Vec<String>>>,
+        sends: Arc<StdMutex<Vec<String>>>,
+        fallback_sends: Arc<AtomicUsize>,
+    }
+
+    impl StagedFallbackAdapter {
+        fn send_stage(&self, outbound: OutboundMessage) -> Result<Value, GatewayError> {
+            let kind = outbound
+                .attachments
+                .first()
+                .and_then(|artifact| artifact.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or("text")
+                .to_string();
+            self.sends.lock().unwrap().push(kind.clone());
+            if kind == "video" {
+                return Err(GatewayError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "UNSUPPORTED_NATIVE_VIDEO",
+                    "provider explicitly rejected native video",
+                ));
+            }
+            if self.fallback_sends.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(GatewayError::infrastructure("fallback send timeout"));
+            }
+            Ok(json!({
+                "provider_media_id": "file-media",
+                "provider_client_id": "file-client",
+                "provider_message_id": "file-message",
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for StagedFallbackAdapter {
+        fn name(&self) -> &str {
+            "staged_fallback"
+        }
+
+        fn normalize_inbound(&self, _payload: Value) -> Result<InboundMessage, GatewayError> {
+            unreachable!("test adapter is outbound-only")
+        }
+
+        async fn send_outbound(&self, outbound: OutboundMessage) -> Result<Value, GatewayError> {
+            self.send_stage(outbound)
+        }
+
+        async fn prepare_outbound(
+            &self,
+            outbound: &OutboundMessage,
+        ) -> Result<Option<PreparedOutbound>, GatewayError> {
+            let kind = outbound
+                .attachments
+                .first()
+                .and_then(|artifact| artifact.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or("text")
+                .to_string();
+            self.uploads.lock().unwrap().push(kind.clone());
+            Ok(Some(PreparedOutbound {
+                provider_media_id: format!("{kind}-media"),
+                provider_client_id: Some(format!("{kind}-client")),
+                state: json!({
+                    "kind": kind,
+                }),
+            }))
+        }
+
+        async fn send_prepared_outbound(
+            &self,
+            outbound: OutboundMessage,
+            _prepared: Option<&PreparedOutbound>,
+        ) -> Result<Value, GatewayError> {
+            self.send_stage(outbound)
+        }
+
+        fn profile(&self) -> Value {
+            json!({"adapter_name": "staged_fallback"})
+        }
+    }
+
+    struct UploadThenFailAdapter {
+        uploads: Arc<AtomicUsize>,
+        sends: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for UploadThenFailAdapter {
+        fn name(&self) -> &str {
+            "upload_then_fail"
+        }
+
+        fn normalize_inbound(&self, _payload: Value) -> Result<InboundMessage, GatewayError> {
+            unreachable!("test adapter is outbound-only")
+        }
+
+        async fn send_outbound(&self, _outbound: OutboundMessage) -> Result<Value, GatewayError> {
+            unreachable!("staged test adapter must use send_prepared_outbound")
+        }
+
+        async fn prepare_outbound(
+            &self,
+            _outbound: &OutboundMessage,
+        ) -> Result<Option<PreparedOutbound>, GatewayError> {
+            let upload = self.uploads.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Some(PreparedOutbound {
+                provider_media_id: format!("provider-media-{upload}"),
+                provider_client_id: Some(format!("provider-client-{upload}")),
+                state: json!({"upload": upload}),
+            }))
+        }
+
+        async fn send_prepared_outbound(
+            &self,
+            _outbound: OutboundMessage,
+            prepared: Option<&PreparedOutbound>,
+        ) -> Result<Value, GatewayError> {
+            let media_id = prepared
+                .expect("staged send requires prepared media")
+                .provider_media_id
+                .clone();
+            let send = self.sends.fetch_add(1, Ordering::SeqCst) + 1;
+            if send == 2 {
+                return Err(GatewayError::infrastructure("provider send timeout"));
+            }
+            Ok(json!({
+                "provider_media_id": media_id,
+                "provider_message_id": format!("provider-message-{send}"),
+            }))
+        }
+
+        fn profile(&self) -> Value {
+            json!({"adapter_name": "upload_then_fail"})
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for VideoFallbackAdapter {
+        fn name(&self) -> &str {
+            "video_fallback"
+        }
+
+        fn normalize_inbound(&self, _payload: Value) -> Result<InboundMessage, GatewayError> {
+            unreachable!("test adapter is outbound-only")
+        }
+
+        async fn send_outbound(&self, outbound: OutboundMessage) -> Result<Value, GatewayError> {
+            let kind = outbound
+                .attachments
+                .first()
+                .and_then(|artifact| artifact.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or("text")
+                .to_string();
+            self.kinds.lock().unwrap().push(kind.clone());
+            if kind == "video" {
+                return Err(GatewayError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "UNSUPPORTED_NATIVE_VIDEO",
+                    "provider explicitly does not support native video",
+                ));
+            }
+            Ok(json!({"provider_message_id": "provider-file-1"}))
+        }
+
+        fn profile(&self) -> Value {
+            json!({"adapter_name": "video_fallback"})
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for RetryableVideoAdapter {
+        fn name(&self) -> &str {
+            "retryable_video"
+        }
+
+        fn normalize_inbound(&self, _payload: Value) -> Result<InboundMessage, GatewayError> {
+            unreachable!("test adapter is outbound-only")
+        }
+
+        async fn send_outbound(&self, outbound: OutboundMessage) -> Result<Value, GatewayError> {
+            let kind = outbound
+                .attachments
+                .first()
+                .and_then(|artifact| artifact.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or("text")
+                .to_string();
+            self.kinds.lock().unwrap().push(kind.clone());
+            if kind == "video" {
+                return Err(GatewayError::infrastructure("provider send timeout"));
+            }
+            Ok(json!({"provider_message_id": "unexpected-file-message"}))
+        }
+
+        fn profile(&self) -> Value {
+            json!({"adapter_name": "retryable_video"})
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for CaptureAttachmentAdapter {
+        fn name(&self) -> &str {
+            "weixin"
+        }
+
+        fn normalize_inbound(&self, payload: Value) -> Result<InboundMessage, GatewayError> {
+            Ok(InboundMessage {
+                platform: "weixin".into(),
+                chat_id: "wx-chat-turn".into(),
+                user_id: "wx-user".into(),
+                text: "cat clips".into(),
+                message_id: "wx-message".into(),
+                chat_type: "p2p".into(),
+                route_key: String::new(),
+                session_id: String::new(),
+                mentions: vec![],
+                attachments: vec![],
+                metadata: serde_json::Map::new(),
+                timestamp: crate::models::utc_now_iso(),
+                raw_payload: payload,
+            })
+        }
+
+        async fn send_outbound(&self, outbound: OutboundMessage) -> Result<Value, GatewayError> {
+            self.sent_attachments
+                .lock()
+                .unwrap()
+                .push(outbound.attachments);
+            Ok(json!({"provider_message_id": "provider-text-only"}))
+        }
+
+        fn profile(&self) -> Value {
+            json!({"adapter_name": "weixin"})
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for TerminalFailureAdapter {
+        fn name(&self) -> &str {
+            "terminal_failure"
+        }
+
+        fn normalize_inbound(&self, _payload: Value) -> Result<InboundMessage, GatewayError> {
+            unreachable!("test adapter is outbound-only")
+        }
+
+        async fn send_outbound(&self, _outbound: OutboundMessage) -> Result<Value, GatewayError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(GatewayError::validation(
+                "provider authorization failed deterministically",
+            ))
+        }
+
+        fn profile(&self) -> Value {
+            json!({"adapter_name": "terminal_failure"})
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for FailSecondItemAdapter {
+        fn name(&self) -> &str {
+            "item_delivery"
+        }
+
+        fn normalize_inbound(&self, _payload: Value) -> Result<InboundMessage, GatewayError> {
+            unreachable!("test adapter is outbound-only")
+        }
+
+        async fn send_outbound(&self, outbound: OutboundMessage) -> Result<Value, GatewayError> {
+            let item = outbound
+                .attachments
+                .first()
+                .and_then(delivery_artifact_id)
+                .unwrap_or_else(|| "__text".to_string());
+            let call_number = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(item.clone());
+                calls.len()
+            };
+            if call_number == 2 && self.failed_once.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(GatewayError::infrastructure("temporary item timeout"));
+            }
+            Ok(json!({
+                "message_id": format!("provider-{item}"),
+                "provider_message_id": format!("provider-{item}"),
+            }))
+        }
+
+        fn profile(&self) -> Value {
+            json!({"adapter_name": "item_delivery"})
+        }
+    }
 
     #[tokio::test]
     async fn webhook_inbound_registers_route_and_replies() {
@@ -1340,6 +2817,492 @@ mod tests {
             .unwrap();
         let second = gateway.handle_notification_delivery(payload).await.unwrap();
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn retryable_notification_failure_is_retried_instead_of_cached_forever() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url.clear();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut gateway = GatewayService::from_config(&config).unwrap();
+        gateway.adapters.insert(
+            "retry_once".to_string(),
+            Arc::new(RetryOnceAdapter {
+                attempts: attempts.clone(),
+            }),
+        );
+        gateway
+            .store
+            .register_route(
+                "gw_retry_once",
+                json!({
+                    "platform": "retry_once",
+                    "adapter_name": "retry_once",
+                    "chat_id": "chat-1",
+                    "status": "active"
+                }),
+            )
+            .unwrap();
+        let payload = notification_payload_for_route("gw_retry_once", "idem_retry_once");
+
+        let first = gateway
+            .handle_notification_delivery(payload.clone())
+            .await
+            .unwrap();
+        let delivery_records: Value = fs::read_to_string(dir.path().join("_deliveries.json"))
+            .ok()
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .unwrap_or_else(|| json!({}));
+        assert!(delivery_records.get("idem_retry_once").is_none());
+        let second = gateway.handle_notification_delivery(payload).await.unwrap();
+
+        assert_eq!(first["ok"], false);
+        assert_eq!(first["retryable"], true);
+        assert_eq!(second["ok"], true);
+        assert_eq!(second["provider_message_id"], "provider-2");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn notification_delivery_resumes_failed_item_after_restart_without_resending_success() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url.clear();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let failed_once = Arc::new(AtomicUsize::new(0));
+        let build_gateway = || {
+            let mut gateway = GatewayService::from_config(&config).unwrap();
+            gateway.adapters.insert(
+                "item_delivery".to_string(),
+                Arc::new(FailSecondItemAdapter {
+                    calls: calls.clone(),
+                    failed_once: failed_once.clone(),
+                }),
+            );
+            gateway
+        };
+        let gateway = build_gateway();
+        gateway
+            .store
+            .register_route(
+                "gw_item_delivery",
+                json!({
+                    "platform": "item_delivery",
+                    "adapter_name": "item_delivery",
+                    "chat_id": "chat-1",
+                    "status": "active"
+                }),
+            )
+            .unwrap();
+        let payload = json!({
+            "notification": {"notification_id": "notif-items", "trace_id": "trace-items"},
+            "destination": {"route_key": "gw_item_delivery"},
+            "reply": {"kind": "tool_result", "text": "cat clips"},
+            "artifacts": [
+                {"artifact_id": "artifact-1", "kind": "video", "mime_type": "video/mp4", "url": "/api/cameras/recordings/artifacts/artifact-1"},
+                {"artifact_id": "artifact-2", "kind": "video", "mime_type": "video/mp4", "url": "/api/cameras/recordings/artifacts/artifact-2"}
+            ],
+            "delivery_hints": [
+                {"kind": "native_video", "artifact_id": "artifact-1", "fallback": "file"},
+                {"kind": "native_video", "artifact_id": "artifact-2", "fallback": "file"}
+            ],
+            "delivery": {"mode": "send", "idempotency_key": "idem-items", "reply_to_message_id": null, "update_message_id": null}
+        });
+
+        let first = gateway
+            .handle_notification_delivery(payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(first["ok"], false);
+        drop(gateway);
+
+        let gateway = build_gateway();
+        let recovered = gateway
+            .handle_notification_delivery(payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(recovered["ok"], true);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["__text", "artifact-1", "artifact-1", "artifact-2"]
+        );
+        let item_ledger: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            item_ledger["idem-items"]["items"]["idem-items:__text"]["provider_message_id"],
+            "provider-__text"
+        );
+        drop(gateway);
+
+        let gateway = build_gateway();
+        let replay = gateway.handle_notification_delivery(payload).await.unwrap();
+        assert_eq!(replay, recovered);
+        assert_eq!(calls.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn native_video_failure_falls_back_to_file_and_persists_item_state() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url.clear();
+        let kinds = Arc::new(StdMutex::new(Vec::new()));
+        let mut gateway = GatewayService::from_config(&config).unwrap();
+        gateway.adapters.insert(
+            "video_fallback".to_string(),
+            Arc::new(VideoFallbackAdapter {
+                kinds: kinds.clone(),
+            }),
+        );
+        gateway
+            .store
+            .register_route(
+                "gw_video_fallback",
+                json!({
+                    "platform": "video_fallback",
+                    "adapter_name": "video_fallback",
+                    "chat_id": "chat-1",
+                    "status": "active"
+                }),
+            )
+            .unwrap();
+        let payload = json!({
+            "notification": {"notification_id": "notif-fallback", "trace_id": "trace-fallback"},
+            "destination": {"route_key": "gw_video_fallback"},
+            "reply": {"kind": "tool_result", "text": ""},
+            "artifacts": [{
+                "artifact_id": "artifact-video",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "url": "/api/cameras/recordings/artifacts/artifact-video"
+            }],
+            "delivery_hints": [{
+                "kind": "native_video",
+                "artifact_id": "artifact-video",
+                "fallback": "file"
+            }],
+            "delivery": {"mode": "send", "idempotency_key": "idem-fallback", "reply_to_message_id": null, "update_message_id": null}
+        });
+
+        let response = gateway.handle_notification_delivery(payload).await.unwrap();
+
+        assert_eq!(response["ok"], true);
+        assert_eq!(kinds.lock().unwrap().as_slice(), ["video", "file"]);
+        let ledger: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        let item = &ledger["idem-fallback"]["items"]["idem-fallback:artifact-video"];
+        assert_eq!(item["status"], "succeeded");
+        assert_eq!(item["fallback_used"], true);
+        assert_eq!(item["provider_message_id"], "provider-file-1");
+    }
+
+    #[tokio::test]
+    async fn retryable_native_video_failure_does_not_fallback_to_file() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url.clear();
+        let kinds = Arc::new(StdMutex::new(Vec::new()));
+        let gateway = GatewayService::from_config(&config).unwrap();
+        let outbound = OutboundMessage {
+            platform: "retryable_video".to_string(),
+            chat_id: "chat-1".to_string(),
+            text: String::new(),
+            attachments: vec![json!({
+                "artifact_id": "artifact-video",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "path": "gate-owned-video.mp4",
+                "metadata": {"native_attachment_fallback": "file"}
+            })],
+            timestamp: crate::models::utc_now_iso(),
+            metadata: serde_json::Map::new(),
+        };
+
+        let error = gateway
+            .deliver_outbound_items(
+                Arc::new(RetryableVideoAdapter {
+                    kinds: kinds.clone(),
+                }),
+                outbound,
+                "idem-retryable-video",
+                "fingerprint",
+            )
+            .await
+            .expect_err("ambiguous provider timeout must remain on native retry path");
+
+        assert!(map_delivery_failure(&error.message).1);
+        assert_eq!(kinds.lock().unwrap().as_slice(), ["video"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_stage_restart_reuses_both_uploads_and_only_retries_fallback_send() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url.clear();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let sends = Arc::new(StdMutex::new(Vec::new()));
+        let fallback_sends = Arc::new(AtomicUsize::new(0));
+        let adapter = || {
+            Arc::new(StagedFallbackAdapter {
+                uploads: uploads.clone(),
+                sends: sends.clone(),
+                fallback_sends: fallback_sends.clone(),
+            }) as Arc<dyn PlatformAdapter>
+        };
+        let outbound = OutboundMessage {
+            platform: "staged_fallback".to_string(),
+            chat_id: "chat-1".to_string(),
+            text: String::new(),
+            attachments: vec![json!({
+                "artifact_id": "artifact-video",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "path": "gate-owned-video.mp4",
+                "metadata": {"native_attachment_fallback": "file"}
+            })],
+            timestamp: crate::models::utc_now_iso(),
+            metadata: serde_json::Map::new(),
+        };
+        let gateway = GatewayService::from_config(&config).unwrap();
+        gateway
+            .deliver_outbound_items(
+                adapter(),
+                outbound.clone(),
+                "idem-staged-fallback",
+                "fingerprint",
+            )
+            .await
+            .expect_err("first fallback send must time out");
+        drop(gateway);
+
+        let failed_ledger: Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        let failed =
+            &failed_ledger["idem-staged-fallback"]["items"]["idem-staged-fallback:artifact-video"];
+        assert_eq!(
+            failed["stages"]["native"]["provider_media_id"],
+            "video-media"
+        );
+        assert_eq!(
+            failed["stages"]["native"]["provider_client_id"],
+            "video-client"
+        );
+        assert_eq!(failed["stages"]["native"]["status"], "unsupported");
+        assert_eq!(
+            failed["stages"]["fallback"]["provider_media_id"],
+            "file-media"
+        );
+        assert_eq!(
+            failed["stages"]["fallback"]["provider_client_id"],
+            "file-client"
+        );
+        assert_eq!(failed["stages"]["fallback"]["status"], "failed");
+
+        let gateway = GatewayService::from_config(&config).unwrap();
+        gateway
+            .deliver_outbound_items(adapter(), outbound, "idem-staged-fallback", "fingerprint")
+            .await
+            .unwrap();
+
+        assert_eq!(uploads.lock().unwrap().as_slice(), ["video", "file"]);
+        assert_eq!(sends.lock().unwrap().as_slice(), ["video", "file", "file"]);
+        let ledger: Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        let item = &ledger["idem-staged-fallback"]["items"]["idem-staged-fallback:artifact-video"];
+        assert_eq!(item["status"], "succeeded");
+        assert_eq!(item["provider_client_id"], "file-client");
+        assert_eq!(item["provider_message_id"], "file-message");
+        assert_eq!(item["stages"]["fallback"]["status"], "succeeded");
+        assert_eq!(
+            item["stages"]["fallback"]["provider_message_id"],
+            "file-message"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_plan_drift_conflicts_without_another_provider_call() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url.clear();
+        let attempts = Arc::new(AtomicUsize::new(1));
+        let mut gateway = GatewayService::from_config(&config).unwrap();
+        gateway.adapters.insert(
+            "retry_once".to_string(),
+            Arc::new(RetryOnceAdapter {
+                attempts: attempts.clone(),
+            }),
+        );
+        gateway
+            .store
+            .register_route(
+                "gw_plan_conflict",
+                json!({"platform": "retry_once", "adapter_name": "retry_once", "chat_id": "chat-1", "status": "active"}),
+            )
+            .unwrap();
+        let mut original = notification_payload_for_route("gw_plan_conflict", "idem-plan");
+        original["artifacts"] = json!([{
+            "artifact_id": "artifact-plan",
+            "kind": "video",
+            "mime_type": "video/mp4",
+            "url": "/api/cameras/recordings/artifacts/artifact-plan"
+        }]);
+        original["delivery_hints"] = json!([{
+            "kind": "native_video",
+            "artifact_id": "artifact-plan",
+            "fallback": "file"
+        }]);
+        let first = gateway
+            .handle_notification_delivery(original.clone())
+            .await
+            .unwrap();
+        let replay = gateway
+            .handle_notification_delivery(original.clone())
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
+        let provider_calls = attempts.load(Ordering::SeqCst);
+
+        let mut changed_content = original.clone();
+        changed_content["reply"]["text"] = json!("changed content");
+        let mut changed_artifact = original.clone();
+        changed_artifact["artifacts"][0]["url"] =
+            json!("/api/cameras/recordings/artifacts/other-artifact");
+        let mut changed_hint = original;
+        changed_hint["delivery_hints"][0]["fallback"] = json!("changed-fallback");
+        for changed in [changed_content, changed_artifact, changed_hint] {
+            let error = gateway
+                .handle_notification_delivery(changed)
+                .await
+                .expect_err("same delivery key with a changed plan must conflict");
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert_eq!(error.code, "IDEMPOTENCY_CONFLICT");
+            assert_eq!(attempts.load(Ordering::SeqCst), provider_calls);
+        }
+    }
+
+    #[test]
+    fn truncated_delivery_ledger_fails_closed_without_rewriting_bytes() {
+        let dir = tempdir().unwrap();
+        let corrupt = dir.path().join("_delivery_items.json");
+        let original = b"{\"idem\":";
+        fs::write(&corrupt, original).unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url.clear();
+
+        let result = GatewayService::from_config(&config);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(corrupt).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn restart_reuses_uploaded_media_after_send_failure() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url.clear();
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let adapter = || {
+            Arc::new(UploadThenFailAdapter {
+                uploads: uploads.clone(),
+                sends: sends.clone(),
+            }) as Arc<dyn PlatformAdapter>
+        };
+        let outbound = OutboundMessage {
+            platform: "upload_then_fail".to_string(),
+            chat_id: "chat-1".to_string(),
+            text: String::new(),
+            attachments: vec![
+                json!({
+                    "artifact_id": "artifact-file-1",
+                    "kind": "file",
+                    "mime_type": "application/octet-stream",
+                    "path": "gate-owned-cache-file-1"
+                }),
+                json!({
+                    "artifact_id": "artifact-file-2",
+                    "kind": "file",
+                    "mime_type": "application/octet-stream",
+                    "path": "gate-owned-cache-file-2"
+                }),
+            ],
+            timestamp: crate::models::utc_now_iso(),
+            metadata: serde_json::Map::new(),
+        };
+        let gateway = GatewayService::from_config(&config).unwrap();
+        gateway
+            .deliver_outbound_items(adapter(), outbound.clone(), "idem-upload", "fingerprint")
+            .await
+            .expect_err("first send must fail after upload");
+        let first_ledger: Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        let first_items = &first_ledger["idem-upload"]["items"];
+        assert_eq!(
+            first_items["idem-upload:artifact-file-1"]["status"],
+            "succeeded"
+        );
+        assert_eq!(
+            first_items["idem-upload:artifact-file-1"]["provider_message_id"],
+            "provider-message-1"
+        );
+        assert_eq!(
+            first_items["idem-upload:artifact-file-2"]["status"],
+            "failed"
+        );
+        assert_eq!(
+            first_items["idem-upload:artifact-file-2"]["provider_media_id"],
+            "provider-media-2"
+        );
+        assert!(first_items["idem-upload:artifact-file-2"]["provider_message_id"].is_null());
+        drop(gateway);
+
+        let gateway = GatewayService::from_config(&config).unwrap();
+        gateway
+            .deliver_outbound_items(adapter(), outbound, "idem-upload", "fingerprint")
+            .await
+            .unwrap();
+
+        assert_eq!(uploads.load(Ordering::SeqCst), 2);
+        assert_eq!(sends.load(Ordering::SeqCst), 3);
+        let ledger: Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        let items = &ledger["idem-upload"]["items"];
+        assert_eq!(
+            items["idem-upload:artifact-file-1"]["provider_media_id"],
+            "provider-media-1"
+        );
+        assert_eq!(
+            items["idem-upload:artifact-file-1"]["provider_message_id"],
+            "provider-message-1"
+        );
+        assert_eq!(
+            items["idem-upload:artifact-file-2"]["provider_media_id"],
+            "provider-media-2"
+        );
+        assert_eq!(
+            items["idem-upload:artifact-file-2"]["provider_message_id"],
+            "provider-message-3"
+        );
     }
 
     #[tokio::test]
@@ -1598,6 +3561,39 @@ mod tests {
         (base_url, handle)
     }
 
+    async fn spawn_turn_and_media_server(
+        response_payload: Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let response_payload = Arc::new(response_payload);
+        let turn_payload = response_payload.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/web/turns",
+                axum::routing::post(move || {
+                    let response_payload = turn_payload.clone();
+                    async move { axum::Json((*response_payload).clone()) }
+                }),
+            )
+            .route(
+                "/api/cameras/recordings/artifacts/artifact-cache-guard",
+                axum::routing::get(|| async {
+                    (
+                        [
+                            (axum::http::header::CONTENT_TYPE, "video/mp4"),
+                            (axum::http::header::CONTENT_LENGTH, "4"),
+                        ],
+                        "clip",
+                    )
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base_url, server)
+    }
+
     fn http_request_complete(request: &[u8]) -> bool {
         let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
             return false;
@@ -1682,11 +3678,17 @@ mod tests {
                     "url": "/api/cameras/recordings/artifacts/snapshot-252"
                 },
                 {
+                    "artifact_id": "clip-252",
                     "kind": "video",
                     "mime_type": "video/mp4",
                     "path": null,
-                    "url": "/api/cameras/recordings/artifacts/clip-252"
+                    "url": "/api/cameras/recordings/artifacts/clip-252",
+                    "metadata": {"harborlink_artifact_id": "clip-252"}
                 }
+            ],
+            "delivery_hints": [
+                {"kind": "native_image", "metadata": {"max_items": 1}},
+                {"kind": "native_video", "artifact_id": "clip-252", "fallback": "file"}
             ]
         });
 
@@ -1701,15 +3703,947 @@ mod tests {
     fn weixin_keeps_all_cat_activity_videos_for_delivery() {
         let response = json!({
             "artifacts": (1..=5).map(|index| json!({
+                "artifact_id": format!("cat-{index}"),
                 "kind": "video",
                 "mime_type": "video/mp4",
-                "url": format!("/api/cameras/recordings/artifacts/cat-{index}")
+                "url": format!("/api/cameras/recordings/artifacts/cat-{index}"),
+                "metadata": {"harborlink_artifact_id": format!("cat-{index}")}
+            })).collect::<Vec<_>>(),
+            "delivery_hints": (1..=5).map(|index| json!({
+                "kind": "native_video",
+                "artifact_id": format!("cat-{index}"),
+                "fallback": "file"
             })).collect::<Vec<_>>()
         });
 
         let attachments = native_source_bound_attachments("weixin", &response);
 
         assert_eq!(attachments.len(), 5);
+    }
+
+    #[test]
+    fn weixin_video_delivery_rejects_missing_hint_wrong_id_and_non_target_artifacts() {
+        let artifacts = vec![
+            json!({
+                "artifact_id": "cat-1",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "url": "/api/cameras/recordings/artifacts/cat-1",
+                "metadata": {"harborlink_artifact_id": "cat-1"}
+            }),
+            json!({
+                "artifact_id": "cat-2",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "url": "/api/cameras/recordings/artifacts/cat-2",
+                "metadata": {"harborlink_artifact_id": "cat-2"}
+            }),
+        ];
+        assert!(hinted_native_videos(&artifacts, &json!({})).is_empty());
+        assert!(hinted_native_videos(
+            &artifacts,
+            &json!({"delivery_hints": [{
+                "kind": "native_video",
+                "artifact_id": "missing",
+                "fallback": "file"
+            }]})
+        )
+        .is_empty());
+
+        let selected = hinted_native_videos(
+            &artifacts,
+            &json!({"delivery_hints": [{
+                "kind": "native_video",
+                "artifact_id": "cat-2",
+                "fallback": "file"
+            }]}),
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(delivery_artifact_id(&selected[0]).as_deref(), Some("cat-2"));
+        assert_eq!(
+            selected[0]["metadata"]["native_attachment_fallback"],
+            "file"
+        );
+    }
+
+    #[test]
+    fn native_video_hint_rejects_artifact_id_aliases() {
+        for artifact in [
+            json!({
+                "id": "artifact-alias",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "url": "/api/cameras/recordings/artifacts/artifact-alias"
+            }),
+            json!({
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "url": "/api/cameras/recordings/artifacts/artifact-alias",
+                "metadata": {"harborlink_artifact_id": "artifact-alias"}
+            }),
+        ] {
+            let selected = hinted_native_videos(
+                &[artifact],
+                &json!({"delivery_hints": [{
+                    "kind": "native_video",
+                    "artifact_id": "artifact-alias",
+                    "fallback": "file"
+                }]}),
+            );
+            assert!(selected.is_empty());
+        }
+    }
+
+    #[test]
+    fn turn_and_notification_use_the_same_strict_native_video_plan() {
+        let payload = json!({
+            "reply": {"kind": "tool_result", "text": "cat clips"},
+            "artifacts": [
+                {"artifact_id": "artifact-1", "kind": "video", "mime_type": "video/mp4", "url": "/api/cameras/recordings/artifacts/artifact-1"},
+                {"artifact_id": "artifact-2", "kind": "video", "mime_type": "video/mp4", "url": "/api/cameras/recordings/artifacts/artifact-2"}
+            ],
+            "delivery_hints": [{
+                "kind": "native_video",
+                "artifact_id": "artifact-2",
+                "fallback": "file"
+            }]
+        });
+
+        let turn_plan = native_source_bound_attachments("weixin", &payload);
+        let notification_plan = hinted_notification_attachments(&delivery_content(&payload));
+
+        assert_eq!(turn_plan, notification_plan);
+        assert_eq!(turn_plan.len(), 1);
+        assert_eq!(
+            delivery_artifact_id(&turn_plan[0]).as_deref(),
+            Some("artifact-2")
+        );
+
+        let without_hints = json!({"artifacts": payload["artifacts"].clone()});
+        assert!(native_source_bound_attachments("weixin", &without_hints).is_empty());
+        assert!(hinted_notification_attachments(&delivery_content(&without_hints)).is_empty());
+
+        let wrong_id = json!({
+            "artifacts": payload["artifacts"].clone(),
+            "delivery_hints": [{
+                "kind": "native_video",
+                "artifact_id": "artifact-missing",
+                "fallback": "file"
+            }]
+        });
+        assert!(native_source_bound_attachments("weixin", &wrong_id).is_empty());
+        assert!(hinted_notification_attachments(&delivery_content(&wrong_id)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn turn_and_notification_handlers_do_not_send_alias_only_video_artifacts() {
+        let (base_url, request_handle) = spawn_http_response(
+            200,
+            r#"{"turn":{"turn_id":"turn-alias","trace_id":"trace-alias","status":"completed"},"reply":{"text":"cat clips"},"artifacts":[{"id":"artifact-alias","kind":"video","mime_type":"video/mp4","url":"/api/cameras/recordings/artifacts/artifact-alias"}],"delivery_hints":[{"kind":"native_video","artifact_id":"artifact-alias","fallback":"file"}]}"#,
+        )
+        .await;
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().to_path_buf();
+        config.state_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url = base_url;
+        config.harborbeacon_token = "service-token".into();
+        let sent_attachments = Arc::new(StdMutex::new(Vec::new()));
+        let mut gateway = GatewayService::from_config(&config).unwrap();
+        gateway.adapters.insert(
+            "weixin".into(),
+            Arc::new(CaptureAttachmentAdapter {
+                sent_attachments: sent_attachments.clone(),
+            }),
+        );
+
+        gateway
+            .handle_inbound("weixin", json!({"event": "turn"}))
+            .await
+            .unwrap();
+        let _request = request_handle.await.unwrap();
+        gateway
+            .handle_notification_delivery(json!({
+                "notification": {"notification_id": "notification-alias", "trace_id": "trace-notification-alias"},
+                "destination": {"platform": "weixin", "id": "wx-chat-notification"},
+                "reply": {"kind": "tool_result", "text": "cat clips"},
+                "artifacts": [{
+                    "kind": "video",
+                    "mime_type": "video/mp4",
+                    "url": "/api/cameras/recordings/artifacts/artifact-alias",
+                    "metadata": {"harborlink_artifact_id": "artifact-alias"}
+                }],
+                "delivery_hints": [{
+                    "kind": "native_video",
+                    "artifact_id": "artifact-alias",
+                    "fallback": "file"
+                }],
+                "delivery": {"mode": "send", "idempotency_key": "idem-notification-alias", "reply_to_message_id": null, "update_message_id": null}
+            }))
+            .await
+            .unwrap();
+
+        let sent_attachments = sent_attachments.lock().unwrap();
+        assert_eq!(sent_attachments.len(), 2);
+        assert!(sent_attachments.iter().all(Vec::is_empty));
+    }
+
+    #[tokio::test]
+    async fn materialized_turn_cache_is_cleaned_on_metadata_early_return() {
+        assert_materialized_turn_cache_cleanup("metadata").await;
+    }
+
+    #[tokio::test]
+    async fn materialized_turn_cache_is_cleaned_on_route_early_return() {
+        assert_materialized_turn_cache_cleanup("route").await;
+    }
+
+    #[tokio::test]
+    async fn materialized_turn_cache_is_cleaned_on_history_early_return() {
+        assert_materialized_turn_cache_cleanup("history").await;
+    }
+
+    #[tokio::test]
+    async fn materialized_notification_cache_is_cleaned_on_busy_claim() {
+        assert_materialized_notification_cache_cleanup("busy").await;
+    }
+
+    #[tokio::test]
+    async fn materialized_notification_cache_is_cleaned_on_claim_error() {
+        assert_materialized_notification_cache_cleanup("claim_error").await;
+    }
+
+    #[tokio::test]
+    async fn materialized_notification_cache_is_cleaned_on_ledger_error() {
+        assert_materialized_notification_cache_cleanup("ledger_error").await;
+    }
+
+    async fn assert_materialized_notification_cache_cleanup(failure: &str) {
+        let (base_url, server) = spawn_turn_and_media_server(json!({})).await;
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_base_url = base_url;
+        config.harborbeacon_token = "service-token".into();
+        let sent_attachments = Arc::new(StdMutex::new(Vec::new()));
+        let mut gateway = GatewayService::from_config(&config).unwrap();
+        gateway.adapters.insert(
+            "weixin".into(),
+            Arc::new(CaptureAttachmentAdapter {
+                sent_attachments: sent_attachments.clone(),
+            }),
+        );
+        let route = json!({
+            "platform": "weixin",
+            "adapter_name": "weixin",
+            "chat_id": "wx-notification-guard",
+            "status": "active"
+        });
+        gateway
+            .store
+            .register_route("gw_notification_guard", route.clone())
+            .unwrap();
+        let payload = json!({
+            "notification": {"notification_id": "notification-guard", "trace_id": "trace-notification-guard"},
+            "destination": {"route_key": "gw_notification_guard"},
+            "reply": {"kind": "tool_result", "text": "cat clip"},
+            "artifacts": [{
+                "artifact_id": "artifact-cache-guard",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "url": "/api/cameras/recordings/artifacts/artifact-cache-guard"
+            }],
+            "delivery_hints": [{
+                "kind": "native_video",
+                "artifact_id": "artifact-cache-guard",
+                "fallback": "file"
+            }],
+            "delivery": {"mode": "send", "idempotency_key": "notification-guard-key", "reply_to_message_id": null, "update_message_id": null}
+        });
+        let request_fingerprint = fingerprint(&json!({
+            "notification_id": "notification-guard",
+            "trace_id": "trace-notification-guard",
+            "destination": {
+                "route_key": "gw_notification_guard",
+                "platform": route["platform"].clone(),
+                "chat_id": route["chat_id"].clone(),
+                "recipient": null,
+            },
+            "content": delivery_content(&payload),
+            "delivery": {
+                "mode": "send",
+                "reply_to_message_id": "",
+                "update_message_id": "",
+            },
+        }));
+        match failure {
+            "busy" | "claim_error" => {
+                gateway
+                    .store
+                    .claim_delivery_item(DeliveryItemClaimRequest {
+                        delivery_key: "notification-guard-key",
+                        request_fingerprint: if failure == "busy" {
+                            &request_fingerprint
+                        } else {
+                            "conflicting-fingerprint"
+                        },
+                        item_key: "notification-guard-key:__text",
+                        artifact_id: "__text",
+                        kind: "text",
+                        owner: "other-gateway",
+                        cache_path: None,
+                        lease_seconds: 300,
+                    })
+                    .unwrap();
+            }
+            "ledger_error" => {
+                fs::write(
+                    config.data_dir.join("_delivery_items.json"),
+                    b"{\"notification-guard-key\":",
+                )
+                .unwrap();
+            }
+            _ => unreachable!("unknown notification cache failure fixture"),
+        }
+
+        let response = gateway.handle_notification_delivery(payload).await.unwrap();
+        server.abort();
+
+        assert_eq!(response["ok"], false);
+        assert!(sent_attachments.lock().unwrap().is_empty());
+        let cache_root = config.state_dir.join("attachment-cache");
+        assert!(fs::read_dir(cache_root).unwrap().next().is_none());
+    }
+
+    async fn assert_materialized_turn_cache_cleanup(failed_write: &'static str) {
+        let response_payload = json!({
+            "turn": {"turn_id": "turn-cache-guard", "trace_id": "trace-cache-guard", "status": "completed"},
+            "reply": {"text": "cat clip"},
+            "artifacts": [{
+                "artifact_id": "artifact-cache-guard",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "url": "/api/cameras/recordings/artifacts/artifact-cache-guard"
+            }],
+            "delivery_hints": [{
+                "kind": "native_video",
+                "artifact_id": "artifact-cache-guard",
+                "fallback": "file"
+            }]
+        });
+        let (base_url, server) = spawn_turn_and_media_server(response_payload).await;
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_base_url = base_url;
+        config.harborbeacon_token = "service-token".into();
+        let sent_attachments = Arc::new(StdMutex::new(Vec::new()));
+        let mut gateway = GatewayService::from_config(&config).unwrap();
+        gateway.adapters.insert(
+            "weixin".into(),
+            Arc::new(CaptureAttachmentAdapter {
+                sent_attachments: sent_attachments.clone(),
+            }),
+        );
+        gateway.store.fail_next_write(failed_write);
+
+        let error = gateway
+            .handle_inbound("weixin", json!({"event": "turn"}))
+            .await
+            .expect_err("store write must fail after materialization");
+        server.abort();
+
+        assert!(error
+            .message
+            .contains(&format!("injected {failed_write} write failure")));
+        assert!(sent_attachments.lock().unwrap().is_empty());
+        let cache_root = config.state_dir.join("attachment-cache");
+        assert!(
+            !cache_root.exists() || fs::read_dir(cache_root).unwrap().next().is_none(),
+            "materialized cache leaked after {failed_write} early return"
+        );
+    }
+
+    #[test]
+    fn startup_cache_sweep_preserves_ledger_retained_cache_and_removes_unreferenced_cache() {
+        let root = tempdir().unwrap();
+        let cache_path = root.path().join("attachment-cache");
+        let retry_dir = cache_path.join("retry");
+        let terminal_dir = cache_path.join("terminal");
+        fs::create_dir_all(&retry_dir).unwrap();
+        fs::create_dir_all(&terminal_dir).unwrap();
+        let retry_file = retry_dir.join("clip.mp4");
+        let terminal_file = terminal_dir.join("clip.mp4");
+        fs::write(&retry_file, b"retry").unwrap();
+        fs::write(&terminal_file, b"done").unwrap();
+
+        let now = fs::metadata(&terminal_dir).unwrap().modified().unwrap()
+            + ATTACHMENT_CACHE_TTL
+            + Duration::from_secs(1);
+        let cache_root =
+            AttachmentCacheRoot::open(root.path(), Path::new("attachment-cache")).unwrap();
+        sweep_expired_attachment_cache(&cache_root, std::slice::from_ref(&retry_file), now)
+            .unwrap();
+
+        assert!(retry_file.exists());
+        assert!(!terminal_dir.exists());
+    }
+
+    #[test]
+    fn startup_cache_sweep_preserves_recent_unclaimed_batch_across_instances() {
+        let root = tempdir().unwrap();
+        let materializing_gateway =
+            AttachmentCacheRoot::open(root.path(), Path::new("attachment-cache")).unwrap();
+        let sweeping_gateway =
+            AttachmentCacheRoot::open(root.path(), Path::new("attachment-cache")).unwrap();
+        let batch_dir = materializing_gateway.path().join("materializing-unclaimed");
+        fs::create_dir_all(&batch_dir).unwrap();
+        fs::write(batch_dir.join("clip.partial"), b"in progress").unwrap();
+        let modified_at = fs::metadata(&batch_dir).unwrap().modified().unwrap();
+
+        sweep_expired_attachment_cache(
+            &sweeping_gateway,
+            &[],
+            modified_at + ATTACHMENT_CACHE_TTL - Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert!(batch_dir.exists());
+        sweep_expired_attachment_cache(
+            &sweeping_gateway,
+            &[],
+            modified_at + ATTACHMENT_CACHE_TTL + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(!batch_dir.exists());
+    }
+
+    #[test]
+    fn cache_sweep_uses_held_root_after_visible_path_is_replaced() {
+        let root = tempdir().unwrap();
+        #[cfg(windows)]
+        let (cache_root, displaced_cache_root, outside_dir) = {
+            let state_dir = root.path().join("state");
+            let real_state_dir = root.path().join("real-state");
+            let outside_state_dir = root.path().join("outside-state");
+            let outside_dir = outside_state_dir.join("attachment-cache");
+            fs::create_dir_all(&real_state_dir).unwrap();
+            fs::create_dir_all(&outside_dir).unwrap();
+            assert!(std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(&state_dir)
+                .arg(&real_state_dir)
+                .status()
+                .unwrap()
+                .success());
+            let cache_root =
+                AttachmentCacheRoot::open(&state_dir, Path::new("attachment-cache")).unwrap();
+            fs::remove_dir(&state_dir).unwrap();
+            assert!(std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(&state_dir)
+                .arg(&outside_state_dir)
+                .status()
+                .unwrap()
+                .success());
+            (
+                cache_root,
+                real_state_dir.join("attachment-cache"),
+                outside_dir,
+            )
+        };
+        #[cfg(unix)]
+        let (cache_root, displaced_cache_root, outside_dir) = {
+            let visible_cache_root = root.path().join("attachment-cache");
+            let displaced_cache_root = root.path().join("attachment-cache-original");
+            let outside_dir = root.path().join("outside");
+            fs::create_dir_all(&outside_dir).unwrap();
+            let cache_root =
+                AttachmentCacheRoot::open(root.path(), Path::new("attachment-cache")).unwrap();
+            fs::rename(&visible_cache_root, &displaced_cache_root).unwrap();
+            std::os::unix::fs::symlink(&outside_dir, &visible_cache_root).unwrap();
+            (cache_root, displaced_cache_root, outside_dir)
+        };
+        let original_batch = displaced_cache_root.join("expired-original");
+        let original_file = original_batch.join("clip.mp4");
+        let outside_batch = outside_dir.join("expired-outside");
+        let outside_file = outside_batch.join("marker.txt");
+        fs::create_dir_all(&original_batch).unwrap();
+        fs::create_dir_all(&outside_batch).unwrap();
+        fs::write(&original_file, b"inside").unwrap();
+        fs::write(&outside_file, b"outside-must-survive").unwrap();
+        let now = fs::metadata(&outside_batch).unwrap().modified().unwrap()
+            + ATTACHMENT_CACHE_TTL
+            + Duration::from_secs(1);
+
+        sweep_expired_attachment_cache(&cache_root, &[], now).unwrap();
+
+        assert!(outside_file.exists());
+        assert!(!displaced_cache_root.join("expired-original").exists());
+    }
+
+    #[test]
+    fn startup_expires_retryable_cache_by_ledger_timestamp_before_deleting_file() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("sessions");
+        let state_dir = dir.path().join("state");
+        let batch_dir = state_dir.join("attachment-cache").join("expired-retryable");
+        let legacy_batch_dir = state_dir.join("attachment-cache").join("legacy-retryable");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&batch_dir).unwrap();
+        fs::create_dir_all(&legacy_batch_dir).unwrap();
+        let cache_file = batch_dir.join("clip.mp4");
+        let legacy_cache_file = legacy_batch_dir.join("clip.mp4");
+        fs::write(&cache_file, b"clip").unwrap();
+        fs::write(&legacy_cache_file, b"legacy").unwrap();
+        let expired_at = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        fs::write(
+            data_dir.join("_delivery_items.json"),
+            serde_json::to_vec_pretty(&json!({
+                "delivery-expired": {
+                    "request_fingerprint": "fingerprint-expired",
+                    "items": {
+                        "delivery-expired:artifact-expired": {
+                            "item_key": "delivery-expired:artifact-expired",
+                            "artifact_id": "artifact-expired",
+                            "kind": "video",
+                            "status": "failed",
+                            "retryable": true,
+                            "cache_path": cache_file,
+                            "updated_at": expired_at
+                        }
+                    }
+                },
+                "delivery-legacy": {
+                    "request_fingerprint": "fingerprint-legacy",
+                    "items": {
+                        "delivery-legacy:artifact-legacy": {
+                            "item_key": "delivery-legacy:artifact-legacy",
+                            "artifact_id": "artifact-legacy",
+                            "kind": "video",
+                            "status": "failed",
+                            "retryable": true,
+                            "cache_path": legacy_cache_file
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = data_dir.clone();
+        config.state_dir = state_dir;
+        config.harborbeacon_base_url.clear();
+
+        let _gateway = GatewayService::from_config(&config).unwrap();
+
+        let ledger: Value = serde_json::from_str(
+            &fs::read_to_string(data_dir.join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        let item = &ledger["delivery-expired"]["items"]["delivery-expired:artifact-expired"];
+        assert_eq!(item["status"], "expired");
+        assert!(item["cache_path"].is_null());
+        assert!(!cache_file.exists());
+        let legacy_item = &ledger["delivery-legacy"]["items"]["delivery-legacy:artifact-legacy"];
+        assert_eq!(legacy_item["status"], "failed");
+        assert_eq!(legacy_item["cache_path"], json!(legacy_cache_file));
+        assert!(legacy_item["updated_at"].as_str().is_some());
+        assert!(legacy_cache_file.exists());
+    }
+
+    #[tokio::test]
+    async fn successful_delivery_cleanup_removes_files_and_batch_directory() {
+        let root = tempdir().unwrap();
+        let batch_dir = root.path().join("attachment-cache").join("turn-success");
+        fs::create_dir_all(&batch_dir).unwrap();
+        let file = batch_dir.join("clip.mp4");
+        fs::write(&file, b"clip").unwrap();
+        let cache_root =
+            AttachmentCacheRoot::open(root.path(), Path::new("attachment-cache")).unwrap();
+
+        cleanup_attachment_cache(&cache_root, vec![file.clone()], Some(batch_dir.clone())).await;
+
+        assert!(!file.exists());
+        assert!(!batch_dir.exists());
+    }
+
+    #[test]
+    fn safe_cache_removal_rejects_parent_traversal_and_symlinked_directory() {
+        let dir = tempdir().unwrap();
+        let cache_root = dir.path().join("attachment-cache");
+        let outside_dir = dir.path().join("outside");
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_marker = outside_dir.join("marker.txt");
+        fs::write(&outside_marker, b"must survive").unwrap();
+        let cache = AttachmentCacheRoot::open(dir.path(), Path::new("attachment-cache")).unwrap();
+
+        let traversal = cache_root
+            .join("batch")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("marker.txt");
+        assert!(cache.remove_file(&traversal).is_err());
+
+        let linked_dir = cache_root.join("linked-outside");
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&linked_dir)
+            .arg(&outside_dir)
+            .status()
+            .unwrap()
+            .success());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_dir, &linked_dir).unwrap();
+        assert!(cache.remove_file(&linked_dir.join("marker.txt")).is_err());
+        assert_eq!(fs::read(outside_marker).unwrap(), b"must survive");
+    }
+
+    #[test]
+    fn capability_cache_delete_rejects_directory_swap_after_relative_resolution() {
+        let dir = tempdir().unwrap();
+        let cache_root = dir.path().join("attachment-cache");
+        let batch_dir = cache_root.join("batch");
+        let moved_batch_dir = cache_root.join("batch-original");
+        let outside_dir = dir.path().join("outside");
+        fs::create_dir_all(&batch_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        let candidate = batch_dir.join("marker.txt");
+        let moved_candidate = moved_batch_dir.join("marker.txt");
+        let outside_marker = outside_dir.join("marker.txt");
+        let ledger_path = dir.path().join("_delivery_items.json");
+        fs::write(&candidate, b"inside").unwrap();
+        fs::write(&outside_marker, b"outside-must-survive").unwrap();
+        fs::write(&ledger_path, b"ledger-must-survive").unwrap();
+        let cache = AttachmentCacheRoot::open(dir.path(), Path::new("attachment-cache")).unwrap();
+
+        let result = cache.remove_file_with_hook(&candidate, || {
+            fs::rename(&batch_dir, &moved_batch_dir).unwrap();
+            #[cfg(windows)]
+            assert!(std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(&batch_dir)
+                .arg(&outside_dir)
+                .status()
+                .unwrap()
+                .success());
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside_dir, &batch_dir).unwrap();
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&outside_marker).unwrap(), b"outside-must-survive");
+        assert_eq!(fs::read(&moved_candidate).unwrap(), b"inside");
+        assert_eq!(fs::read(&ledger_path).unwrap(), b"ledger-must-survive");
+    }
+
+    #[test]
+    fn attachment_cache_root_rejects_preexisting_root_link() {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("trusted-state");
+        let cache_root = state_dir.join("attachment-cache");
+        let outside_dir = dir.path().join("outside");
+        let data_dir = dir.path().join("sessions");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        let outside_marker = outside_dir.join("marker.txt");
+        let ledger_path = data_dir.join("_delivery_items.json");
+        let ledger_bytes = b"{}";
+        fs::write(&outside_marker, b"outside-must-survive").unwrap();
+        fs::write(&ledger_path, ledger_bytes).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&cache_root)
+            .arg(&outside_dir)
+            .status()
+            .unwrap()
+            .success());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_dir, &cache_root).unwrap();
+
+        assert!(AttachmentCacheRoot::open(&state_dir, Path::new("attachment-cache")).is_err());
+        let mut config = AppConfig::from_env();
+        config.data_dir = data_dir;
+        config.state_dir = state_dir;
+        config.harborbeacon_base_url.clear();
+        assert!(GatewayService::from_config(&config).is_err());
+        assert_eq!(fs::read(&outside_marker).unwrap(), b"outside-must-survive");
+        assert_eq!(fs::read(&ledger_path).unwrap(), ledger_bytes);
+    }
+
+    #[test]
+    fn attachment_cache_root_rejects_link_swapped_between_create_and_open() {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("trusted-state");
+        let cache_root = state_dir.join("attachment-cache");
+        let displaced_cache_root = state_dir.join("attachment-cache-original");
+        let outside_dir = dir.path().join("outside");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_marker = outside_dir.join("marker.txt");
+        fs::write(&outside_marker, b"outside-must-survive").unwrap();
+
+        let result = AttachmentCacheRoot::open_after_create(
+            &state_dir,
+            Path::new("attachment-cache"),
+            || {
+                fs::rename(&cache_root, &displaced_cache_root).unwrap();
+                #[cfg(windows)]
+                assert!(std::process::Command::new("cmd")
+                    .arg("/C")
+                    .arg("mklink")
+                    .arg("/J")
+                    .arg(&cache_root)
+                    .arg(&outside_dir)
+                    .status()
+                    .unwrap()
+                    .success());
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&outside_dir, &cache_root).unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(displaced_cache_root.is_dir());
+        assert_eq!(fs::read(outside_marker).unwrap(), b"outside-must-survive");
+    }
+
+    #[test]
+    fn attachment_cache_root_requires_a_single_relative_basename() {
+        let dir = tempdir().unwrap();
+
+        assert!(AttachmentCacheRoot::open(dir.path(), Path::new("../attachment-cache")).is_err());
+        assert!(
+            AttachmentCacheRoot::open(dir.path(), Path::new("nested/attachment-cache")).is_err()
+        );
+        assert!(AttachmentCacheRoot::open(dir.path(), dir.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_item_terminally_clears_ledger_cache_path_and_file() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_base_url.clear();
+        let batch_dir = config
+            .state_dir
+            .join("attachment-cache")
+            .join("terminal-success");
+        fs::create_dir_all(&batch_dir).unwrap();
+        let cache_file = batch_dir.join("clip.mp4");
+        fs::write(&cache_file, b"clip").unwrap();
+        let gateway = GatewayService::from_config(&config).unwrap();
+        gateway
+            .deliver_outbound_items(
+                Arc::new(RetryOnceAdapter {
+                    attempts: Arc::new(AtomicUsize::new(1)),
+                }),
+                OutboundMessage {
+                    platform: "retry_once".into(),
+                    chat_id: "chat-terminal-success".into(),
+                    text: String::new(),
+                    attachments: vec![json!({
+                        "artifact_id": "artifact-terminal-success",
+                        "kind": "file",
+                        "mime_type": "application/octet-stream",
+                        "path": cache_file
+                    })],
+                    timestamp: crate::models::utc_now_iso(),
+                    metadata: serde_json::Map::new(),
+                },
+                "delivery-terminal-success",
+                "fingerprint-terminal-success",
+            )
+            .await
+            .unwrap();
+
+        let ledger: Value = serde_json::from_str(
+            &fs::read_to_string(config.data_dir.join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        let item = &ledger["delivery-terminal-success"]["items"]
+            ["delivery-terminal-success:artifact-terminal-success"];
+        assert!(item["cache_path"].is_null());
+        assert!(!cache_file.exists());
+        assert!(!batch_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn nonretryable_failure_terminally_clears_ledger_cache_path_and_file() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_base_url.clear();
+        let batch_dir = config
+            .state_dir
+            .join("attachment-cache")
+            .join("terminal-failure");
+        fs::create_dir_all(&batch_dir).unwrap();
+        let cache_file = batch_dir.join("clip.mp4");
+        fs::write(&cache_file, b"clip").unwrap();
+        let gateway = GatewayService::from_config(&config).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let adapter = Arc::new(TerminalFailureAdapter {
+            attempts: attempts.clone(),
+        }) as Arc<dyn PlatformAdapter>;
+        let outbound = OutboundMessage {
+            platform: "terminal_failure".into(),
+            chat_id: "chat-terminal-failure".into(),
+            text: String::new(),
+            attachments: vec![json!({
+                "artifact_id": "artifact-terminal-failure",
+                "kind": "file",
+                "mime_type": "application/octet-stream",
+                "path": cache_file
+            })],
+            timestamp: crate::models::utc_now_iso(),
+            metadata: serde_json::Map::new(),
+        };
+
+        let error = gateway
+            .deliver_outbound_items(
+                adapter.clone(),
+                outbound.clone(),
+                "delivery-terminal-failure",
+                "fingerprint-terminal-failure",
+            )
+            .await
+            .expect_err("authorization failure must be terminal");
+
+        assert!(error.message.contains("authorization failed"));
+        let mut ledger: Value = serde_json::from_str(
+            &fs::read_to_string(config.data_dir.join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        let item = &mut ledger["delivery-terminal-failure"]["items"]
+            ["delivery-terminal-failure:artifact-terminal-failure"];
+        assert_eq!(item["status"], "failed");
+        assert_eq!(item["retryable"], false);
+        assert!(item["cache_path"].is_null());
+        assert!(!cache_file.exists());
+        assert!(!batch_dir.exists());
+        item["provider_media_id"] = json!("provider-media-terminal");
+        item["provider_client_id"] = json!("provider-client-terminal");
+        item["provider_message_id"] = json!("provider-message-terminal");
+        fs::write(
+            config.data_dir.join("_delivery_items.json"),
+            serde_json::to_vec_pretty(&ledger).unwrap(),
+        )
+        .unwrap();
+
+        let replay = gateway
+            .deliver_outbound_items(
+                adapter,
+                outbound,
+                "delivery-terminal-failure",
+                "fingerprint-terminal-failure",
+            )
+            .await
+            .expect_err("terminal failure must replay without provider access");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            replay.delivery_failure.as_ref().unwrap()["provider_media_id"],
+            "provider-media-terminal"
+        );
+        assert_eq!(
+            replay.delivery_failure.as_ref().unwrap()["provider_client_id"],
+            "provider-client-terminal"
+        );
+        assert_eq!(
+            replay.delivery_failure.as_ref().unwrap()["provider_message_id"],
+            "provider-message-terminal"
+        );
+        assert!(replay.message.contains("authorization failed"));
+        assert!(!config.data_dir.join("_deliveries.json").exists());
+    }
+
+    #[tokio::test]
+    async fn tampered_previous_cache_path_cannot_delete_outside_marker() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("sessions");
+        let state_dir = dir.path().join("state");
+        let safe_batch_dir = state_dir.join("attachment-cache").join("safe-retry");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&safe_batch_dir).unwrap();
+        let safe_cache_file = safe_batch_dir.join("clip.mp4");
+        fs::write(&safe_cache_file, b"clip").unwrap();
+        let outside_marker = dir.path().join("outside-marker.txt");
+        fs::write(&outside_marker, b"must survive").unwrap();
+        fs::write(
+            data_dir.join("_delivery_items.json"),
+            serde_json::to_vec_pretty(&json!({
+                "delivery-tampered": {
+                    "request_fingerprint": "fingerprint-tampered",
+                    "items": {
+                        "delivery-tampered:artifact-tampered": {
+                            "item_key": "delivery-tampered:artifact-tampered",
+                            "artifact_id": "artifact-tampered",
+                            "kind": "file",
+                            "status": "failed",
+                            "attempts": 1,
+                            "retryable": true,
+                            "cache_path": outside_marker,
+                            "updated_at": crate::models::utc_now_iso()
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = data_dir;
+        config.state_dir = state_dir;
+        config.harborbeacon_base_url.clear();
+        let gateway = GatewayService::from_config(&config).unwrap();
+
+        gateway
+            .deliver_outbound_items(
+                Arc::new(RetryOnceAdapter {
+                    attempts: Arc::new(AtomicUsize::new(1)),
+                }),
+                OutboundMessage {
+                    platform: "retry_once".into(),
+                    chat_id: "chat-tampered".into(),
+                    text: String::new(),
+                    attachments: vec![json!({
+                        "artifact_id": "artifact-tampered",
+                        "kind": "file",
+                        "mime_type": "application/octet-stream",
+                        "path": safe_cache_file
+                    })],
+                    timestamp: crate::models::utc_now_iso(),
+                    metadata: serde_json::Map::new(),
+                },
+                "delivery-tampered",
+                "fingerprint-tampered",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read(&outside_marker).unwrap(), b"must survive");
+        assert!(!safe_cache_file.exists());
     }
 
     #[test]
@@ -1725,28 +4659,5 @@ mod tests {
         );
 
         assert!(rendered.contains("http://198.51.100.70/shared/cameras/token-252"));
-    }
-}
-
-fn public_artifact_url(url: &str, public_origin: &str) -> String {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return url.to_string();
-    }
-    if url.starts_with('/') && !public_origin.trim().is_empty() {
-        return format!("{}{}", public_origin.trim_end_matches('/'), url);
-    }
-    url.to_string()
-}
-
-async fn cleanup_attachment_cache(cache_files: Vec<PathBuf>, cache_dir: Option<PathBuf>) {
-    for path in cache_files {
-        if let Err(error) = tokio::fs::remove_file(&path).await {
-            tracing::warn!(path = %path.display(), error = %error, "Could not remove Gate attachment cache file");
-        }
-    }
-    if let Some(path) = cache_dir {
-        if let Err(error) = tokio::fs::remove_dir(&path).await {
-            tracing::warn!(path = %path.display(), error = %error, "Could not remove Gate attachment cache directory");
-        }
     }
 }

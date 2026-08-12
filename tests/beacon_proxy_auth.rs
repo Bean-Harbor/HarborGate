@@ -254,6 +254,126 @@ async fn every_proxy_alias_requires_authentication_for_conversation_json() {
 }
 
 #[tokio::test]
+async fn detection_job_control_and_results_require_authentication() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+
+    for (method, path) in [
+        (Method::GET, "/api/beacon/vision/detection-jobs"),
+        (
+            Method::PATCH,
+            "/api/beacon/vision/detection-jobs/job-1/results/latest",
+        ),
+        (Method::GET, "/api/harbor-assistant/vision/detection-jobs"),
+        (
+            Method::PATCH,
+            "/api/harbor-assistant/vision/detection-jobs/job-1/results/latest",
+        ),
+        (
+            Method::GET,
+            "/api/harbor-gate/api/beacon/vision/detection-jobs",
+        ),
+        (
+            Method::PATCH,
+            "/api/harbor-gate/api/beacon/vision/detection-jobs/job-1/results/latest",
+        ),
+        (
+            Method::POST,
+            "/api/harbor-gate/api/beacon/vision/detection-jobs",
+        ),
+        (
+            Method::GET,
+            "/api/harbor-gate/api/beacon/vision/detection-jobs/job-1",
+        ),
+        (
+            Method::POST,
+            "/api/harbor-gate/api/beacon/vision/detection-jobs/job-1/renew",
+        ),
+        (
+            Method::DELETE,
+            "/api/harbor-gate/api/beacon/vision/detection-jobs/job-1",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    assert!(captured.lock().await.is_empty());
+    assert!(authenticator.tokens().await.is_empty());
+}
+
+#[tokio::test]
+async fn authenticated_detection_job_request_replaces_spoofed_principal() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let request =
+        Request::patch("/api/harbor-gate/api/beacon/vision/detection-jobs/job-1/results/latest")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer browser-controlled")
+            .header("x-harboros-auth-token", "one-time-detection-token")
+            .header("x-harbor-principal-source", "client")
+            .header("x-harbor-principal-id", "client:spoof")
+            .header("x-harbor-principal-roles", "SUPERUSER")
+            .header("x-harbor-workspace-id", "evil")
+            .body(Body::from(r#"{"device_id":"camera-252"}"#))
+            .unwrap();
+
+    let response = router(state).oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    let upstream = &requests[0];
+    assert_eq!(
+        upstream.path_and_query,
+        "/api/vision/detection-jobs/job-1/results/latest"
+    );
+    assert_eq!(
+        upstream.headers.get("authorization").unwrap(),
+        "Bearer beacon-service-secret"
+    );
+    assert_eq!(
+        upstream.headers.get("x-harbor-principal-id").unwrap(),
+        "harboros:uid:42"
+    );
+    assert_eq!(
+        upstream.headers.get("x-harbor-principal-roles").unwrap(),
+        "FULL_ADMIN,SYSTEM_READ"
+    );
+    assert_eq!(
+        upstream.headers.get("x-harbor-workspace-id").unwrap(),
+        "home-1"
+    );
+    assert!(upstream.headers.get("x-harboros-auth-token").is_none());
+    drop(requests);
+    assert_eq!(
+        authenticator.tokens().await,
+        vec!["one-time-detection-token"]
+    );
+}
+
+#[tokio::test]
 async fn authentication_failures_have_stable_statuses_and_redact_tokens() {
     let (beacon_url, captured) = mock_beacon().await;
     let cases = [

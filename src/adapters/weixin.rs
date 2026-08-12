@@ -1,4 +1,4 @@
-use crate::adapters::PlatformAdapter;
+use crate::adapters::{PlatformAdapter, PreparedOutbound};
 use crate::config::WeixinConfig;
 use crate::error::GatewayError;
 use crate::models::{utc_now_iso, InboundMessage, OutboundMessage};
@@ -72,6 +72,7 @@ struct NativeWeixinAttachment {
 
 #[derive(Debug, Clone)]
 struct WeixinUploadedImage {
+    provider_media_id: String,
     original_download_param: String,
     aeskey_hex: String,
     original_ciphertext_size: usize,
@@ -79,10 +80,17 @@ struct WeixinUploadedImage {
 
 #[derive(Debug, Clone)]
 struct WeixinUploadedMedia {
+    provider_media_id: String,
     download_param: String,
     aeskey_hex: String,
     plaintext_size: usize,
     ciphertext_size: usize,
+}
+
+#[derive(Debug, Clone)]
+struct WeixinSendReceipt {
+    provider_client_id: String,
+    provider_message_id: Option<String>,
 }
 
 pub struct WeixinAdapter {
@@ -469,23 +477,28 @@ impl WeixinAdapter {
         chat_id: &str,
         context_token: &str,
         item_list: Vec<Value>,
-    ) -> Result<String, GatewayError> {
+        client_id: Option<&str>,
+    ) -> Result<WeixinSendReceipt, GatewayError> {
         let payload =
-            build_send_message_payload_items(chat_id, item_list, Some(context_token), None);
+            build_send_message_payload_items(chat_id, item_list, Some(context_token), client_id);
         let client_id = payload
             .pointer("/msg/client_id")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        self.post_json(
-            &account.base_url,
-            EP_SEND_MESSAGE,
-            payload,
-            Some(&account.token),
-            self.config.timeout_seconds,
-        )
-        .await?;
-        Ok(client_id)
+        let response = self
+            .post_json(
+                &account.base_url,
+                EP_SEND_MESSAGE,
+                payload,
+                Some(&account.token),
+                self.config.timeout_seconds,
+            )
+            .await?;
+        Ok(WeixinSendReceipt {
+            provider_client_id: client_id,
+            provider_message_id: weixin_provider_message_id(&response),
+        })
     }
 
     async fn upload_image(
@@ -537,6 +550,7 @@ impl WeixinAdapter {
             )
             .await?;
         Ok(WeixinUploadedImage {
+            provider_media_id: filekey,
             original_download_param: download_param,
             aeskey_hex: hex_lower(&aeskey),
             original_ciphertext_size: aes_ecb_padded_size(bytes.len()),
@@ -593,6 +607,7 @@ impl WeixinAdapter {
             )
             .await?;
         Ok(WeixinUploadedMedia {
+            provider_media_id: filekey,
             download_param,
             aeskey_hex: hex_lower(&aeskey),
             plaintext_size: bytes.len(),
@@ -743,6 +758,15 @@ impl PlatformAdapter for WeixinAdapter {
         "weixin"
     }
 
+    fn delivery_claim_lease_seconds(&self) -> u64 {
+        let upload_and_send_http_calls = CDN_UPLOAD_MAX_RETRIES as u64 + 2;
+        self.config
+            .timeout_seconds
+            .saturating_mul(upload_and_send_http_calls)
+            .saturating_mul(2)
+            .saturating_add(30)
+    }
+
     fn normalize_inbound(&self, payload: Value) -> Result<InboundMessage, GatewayError> {
         let sender_id = payload
             .get("from_user_id")
@@ -851,8 +875,24 @@ impl PlatformAdapter for WeixinAdapter {
             )));
         }
 
+        let prepared_media_state = outbound.metadata.get("provider_media_state");
         let native_attachments = if should_send_native_attachment_reply(&outbound) {
-            match resolve_native_media_attachments(&outbound) {
+            let resolved = prepared_media_state
+                .and_then(|state| state.get("message_item"))
+                .map(|_| {
+                    vec![NativeWeixinAttachment {
+                        delivery_kind: prepared_media_state
+                            .and_then(|state| state.get("delivery_kind"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("file")
+                            .to_string(),
+                        path: PathBuf::new(),
+                        file_name: String::new(),
+                    }]
+                })
+                .map(Ok)
+                .unwrap_or_else(|| resolve_native_media_attachments(&outbound));
+            match resolved {
                 Ok(attachments) => attachments,
                 Err(error) => {
                     let error_text = redact_sensitive_text(
@@ -935,7 +975,21 @@ impl PlatformAdapter for WeixinAdapter {
         } else {
             outbound.attachments.len()
         };
-        let delivery_batch_id = format!("wxbatch_{}", Uuid::new_v4().simple());
+        let delivery_item_key = outbound
+            .metadata
+            .get("delivery_item_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let prepared_provider_client_id = outbound
+            .metadata
+            .get("provider_client_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let delivery_batch_id = delivery_item_key
+            .map(|key| stable_weixin_delivery_id("wxbatch", key, 0))
+            .unwrap_or_else(|| format!("wxbatch_{}", Uuid::new_v4().simple()));
         let delivery_item_kinds = if has_native_attachments {
             let mut kinds = Vec::with_capacity(send_unit_count);
             if !native_caption.is_empty() {
@@ -978,13 +1032,32 @@ impl PlatformAdapter for WeixinAdapter {
         }));
 
         let mut last_client_id = String::new();
+        let mut last_provider_message_id = None;
         let mut attachment_fallback_used = false;
         let send_result = async {
             if has_native_attachments {
                 let attachment_item_offset = usize::from(!native_caption.is_empty());
                 let mut uploaded_items = Vec::with_capacity(native_attachments.len());
                 for (index, attachment) in native_attachments.iter().enumerate() {
-                    let upload_result = if attachment.delivery_kind == "image" {
+                    let prepared_item = if index == 0 {
+                        prepared_media_state
+                            .and_then(|state| state.get("message_item"))
+                            .cloned()
+                            .map(|item| {
+                                (
+                                    item,
+                                    prepared_media_state
+                                        .and_then(|state| state.get("used_file_fallback"))
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                )
+                            })
+                    } else {
+                        None
+                    };
+                    let upload_result = if let Some(item) = prepared_item {
+                        Ok(item)
+                    } else if attachment.delivery_kind == "image" {
                         self.upload_image(&account, attachment, &outbound.chat_id)
                             .await
                             .map(|uploaded| (build_native_image_message_item(&uploaded), false))
@@ -1026,16 +1099,20 @@ impl PlatformAdapter for WeixinAdapter {
                             &outbound.chat_id,
                             &context_token,
                             vec![build_text_message_item(&native_caption)],
+                            delivery_item_key
+                                .map(|key| stable_weixin_delivery_id("wxmsg", key, 0))
+                                .as_deref(),
                         )
                         .await
                     {
-                        Ok(provider_message_id) => {
-                            last_client_id = provider_message_id;
+                        Ok(receipt) => {
+                            last_client_id = receipt.provider_client_id;
+                            last_provider_message_id = receipt.provider_message_id;
                             mark_delivery_item(
                                 &mut delivery_items,
                                 delivery_item_index,
                                 "sent",
-                                Some(&last_client_id),
+                                last_provider_message_id.as_deref(),
                                 false,
                                 None,
                             );
@@ -1049,19 +1126,34 @@ impl PlatformAdapter for WeixinAdapter {
                         Err(error) => return Err((error, delivery_item_index)),
                     }
                 }
-                for (item, used_file_fallback) in uploaded_items {
+                for (attachment_index, (item, used_file_fallback)) in
+                    uploaded_items.into_iter().enumerate()
+                {
                     attachment_fallback_used |= used_file_fallback;
+                    let provider_client_id =
+                        prepared_provider_client_id.map(str::to_string).or_else(|| {
+                            delivery_item_key.map(|key| {
+                                stable_weixin_delivery_id("wxmsg", key, attachment_index + 1)
+                            })
+                        });
                     match self
-                        .send_message_items(&account, &outbound.chat_id, &context_token, vec![item])
+                        .send_message_items(
+                            &account,
+                            &outbound.chat_id,
+                            &context_token,
+                            vec![item],
+                            provider_client_id.as_deref(),
+                        )
                         .await
                     {
-                        Ok(provider_message_id) => {
-                            last_client_id = provider_message_id;
+                        Ok(receipt) => {
+                            last_client_id = receipt.provider_client_id;
+                            last_provider_message_id = receipt.provider_message_id;
                             mark_delivery_item(
                                 &mut delivery_items,
                                 delivery_item_index,
                                 "sent",
-                                Some(&last_client_id),
+                                last_provider_message_id.as_deref(),
                                 false,
                                 None,
                             );
@@ -1083,16 +1175,20 @@ impl PlatformAdapter for WeixinAdapter {
                             &outbound.chat_id,
                             &context_token,
                             vec![build_text_message_item(chunk)],
+                            delivery_item_key
+                                .map(|key| stable_weixin_delivery_id("wxmsg", key, index))
+                                .as_deref(),
                         )
                         .await
                     {
-                        Ok(provider_message_id) => {
-                            last_client_id = provider_message_id;
+                        Ok(receipt) => {
+                            last_client_id = receipt.provider_client_id;
+                            last_provider_message_id = receipt.provider_message_id;
                             mark_delivery_item(
                                 &mut delivery_items,
                                 index,
                                 "sent",
-                                Some(&last_client_id),
+                                last_provider_message_id.as_deref(),
                                 false,
                                 None,
                             );
@@ -1115,7 +1211,7 @@ impl PlatformAdapter for WeixinAdapter {
                 &error.message,
                 &[&account.account_id, &account.token, &context_token],
             );
-            let retryable = !has_native_attachments;
+            let retryable = true;
             mark_delivery_item(
                 &mut delivery_items,
                 failed_item_index,
@@ -1143,7 +1239,7 @@ impl PlatformAdapter for WeixinAdapter {
                 "last_send_status": "failed",
                 "last_send_error": error_text,
                 "last_send_retryable": retryable,
-                "last_send_provider_message_id": last_client_id.clone(),
+                "last_send_provider_message_id": last_provider_message_id.clone().unwrap_or_default(),
                 "last_send_context_token_used": true,
                 "last_send_attachment_count": native_attachment_count,
                 "last_send_content_kind": if has_native_attachments { format!("text+{delivered_attachment_kind}") } else { "text".to_string() },
@@ -1160,7 +1256,7 @@ impl PlatformAdapter for WeixinAdapter {
             "last_send_status": "sent",
             "last_send_error": "",
             "last_send_retryable": false,
-            "last_send_provider_message_id": last_client_id.clone(),
+            "last_send_provider_message_id": last_provider_message_id.clone().unwrap_or_default(),
             "last_send_context_token_used": true,
             "last_send_attachment_count": native_attachment_count,
             "last_send_content_kind": if has_native_attachments { format!("text+{delivered_attachment_kind}") } else { "text".to_string() },
@@ -1183,8 +1279,9 @@ impl PlatformAdapter for WeixinAdapter {
             "timestamp": outbound.timestamp,
             "delivery": "weixin",
             "sent": true,
-            "message_id": last_client_id,
-            "provider_message_id": last_client_id,
+            "message_id": last_provider_message_id,
+            "provider_message_id": last_provider_message_id,
+            "provider_client_id": last_client_id,
             "attachments": response_attachments,
             "metadata": {
                 "context_token_used": true,
@@ -1197,6 +1294,112 @@ impl PlatformAdapter for WeixinAdapter {
                 "delivery_batch": delivery_batch_snapshot(&delivery_batch_id, "sent", &delivery_items),
             },
         }))
+    }
+
+    async fn prepare_outbound(
+        &self,
+        outbound: &OutboundMessage,
+    ) -> Result<Option<PreparedOutbound>, GatewayError> {
+        if !should_send_native_attachment_reply(outbound) || outbound.attachments.len() != 1 {
+            return Ok(None);
+        }
+        self.refresh_account_from_disk();
+        let account = self.account();
+        if !account.configured() {
+            return Err(GatewayError::validation(
+                "Weixin adapter is not configured. Open Weixin setup first.",
+            ));
+        }
+        let context_token = load_context_tokens(&self.config.state_dir, &account.account_id)
+            .get(&outbound.chat_id)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if context_token.is_empty() {
+            return Err(GatewayError::validation(format!(
+                "No Weixin context_token cached for chat_id={}. Send a DM from WeChat first.",
+                outbound.chat_id
+            )));
+        }
+        let attachment = native_media_attachment_from_value(&outbound.attachments[0])?;
+        let (provider_media_id, message_item, used_file_fallback) =
+            if attachment.delivery_kind == "image" {
+                let uploaded = self
+                    .upload_image(&account, &attachment, &outbound.chat_id)
+                    .await?;
+                (
+                    uploaded.provider_media_id.clone(),
+                    build_native_image_message_item(&uploaded),
+                    false,
+                )
+            } else {
+                let media_type = if attachment.delivery_kind == "video" {
+                    UPLOAD_MEDIA_VIDEO
+                } else {
+                    UPLOAD_MEDIA_FILE
+                };
+                let uploaded = self
+                    .upload_media(&account, &attachment, media_type, &outbound.chat_id)
+                    .await?;
+                let message_item = if attachment.delivery_kind == "video" {
+                    build_native_video_message_item(&uploaded)
+                } else {
+                    build_native_file_message_item(&uploaded, &attachment.file_name)
+                };
+                (
+                    uploaded.provider_media_id.clone(),
+                    message_item,
+                    attachment.delivery_kind == "file",
+                )
+            };
+        let delivery_item_key = outbound
+            .metadata
+            .get("delivery_item_key")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let stage = if attachment.delivery_kind == "file" {
+            "fallback"
+        } else {
+            "native"
+        };
+        let provider_client_id =
+            stable_weixin_delivery_id("wxmsg", &format!("{delivery_item_key}|{stage}"), 1);
+        Ok(Some(PreparedOutbound {
+            provider_media_id,
+            provider_client_id: Some(provider_client_id),
+            state: json!({
+                "message_item": message_item,
+                "delivery_kind": attachment.delivery_kind,
+                "used_file_fallback": used_file_fallback,
+            }),
+        }))
+    }
+
+    async fn send_prepared_outbound(
+        &self,
+        mut outbound: OutboundMessage,
+        prepared: Option<&PreparedOutbound>,
+    ) -> Result<Value, GatewayError> {
+        let Some(prepared) = prepared else {
+            return self.send_outbound(outbound).await;
+        };
+        outbound
+            .metadata
+            .insert("provider_media_state".into(), prepared.state.clone());
+        if let Some(provider_client_id) = &prepared.provider_client_id {
+            outbound
+                .metadata
+                .insert("provider_client_id".into(), json!(provider_client_id));
+        }
+        let mut response = self.send_outbound(outbound).await?;
+        if let Some(object) = response.as_object_mut() {
+            object.insert(
+                "provider_media_id".into(),
+                json!(prepared.provider_media_id),
+            );
+        }
+        Ok(response)
     }
 
     fn profile(&self) -> Value {
@@ -1703,6 +1906,24 @@ fn build_send_message_payload_items(
     json!({"msg": msg})
 }
 
+fn stable_weixin_delivery_id(prefix: &str, delivery_item_key: &str, index: usize) -> String {
+    let digest = format!(
+        "{:x}",
+        md5::compute(format!("{delivery_item_key}|{index}").as_bytes())
+    );
+    format!("{prefix}_{}", &digest[..24])
+}
+
+fn weixin_provider_message_id(response: &Value) -> Option<String> {
+    response
+        .get("message_id")
+        .or_else(|| response.pointer("/data/msg_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn build_text_message_item(text: &str) -> Value {
     json!({"type": ITEM_TEXT, "text_item": {"text": text}})
 }
@@ -1757,8 +1978,7 @@ fn should_send_native_attachment_reply(outbound: &OutboundMessage) -> bool {
         .metadata
         .get("source")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        == "harborbeacon"
+        .is_some_and(|source| matches!(source, "harborbeacon" | "notification_delivery"))
         && !outbound.attachments.is_empty()
 }
 
@@ -2067,6 +2287,26 @@ mod tests {
     }
 
     #[test]
+    fn delivery_claim_lease_exceeds_native_and_fallback_http_budget() {
+        let dir = tempdir().unwrap();
+        let timeout_seconds = 45;
+        let adapter = WeixinAdapter::new(WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-1".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds,
+            poll_timeout_ms: 35000,
+        });
+        let upload_and_send_http_calls = CDN_UPLOAD_MAX_RETRIES as u64 + 2;
+        let native_and_fallback_budget = timeout_seconds * upload_and_send_http_calls * 2;
+
+        assert!(adapter.delivery_claim_lease_seconds() > native_and_fallback_budget);
+    }
+
+    #[test]
     fn normalize_inbound_stores_context_token() {
         let dir = tempdir().unwrap();
         let config = WeixinConfig {
@@ -2103,6 +2343,38 @@ mod tests {
         assert_eq!(payload["msg"]["to_user_id"], "wx-user");
         assert_eq!(payload["msg"]["client_id"], "client-1");
         assert_eq!(payload["msg"]["context_token"], "ctx");
+    }
+
+    #[test]
+    fn stable_delivery_item_key_reuses_provider_client_id() {
+        let first = stable_weixin_delivery_id("wxmsg", "idem-1:artifact-1", 0);
+        let replay = stable_weixin_delivery_id("wxmsg", "idem-1:artifact-1", 0);
+        let other = stable_weixin_delivery_id("wxmsg", "idem-1:artifact-2", 0);
+
+        assert_eq!(first, replay);
+        assert_ne!(first, other);
+        let payload = build_send_message_payload_items(
+            "wx-user",
+            vec![build_text_message_item("clip")],
+            Some("ctx"),
+            Some(&first),
+        );
+        assert_eq!(payload["msg"]["client_id"], first);
+    }
+
+    #[test]
+    fn provider_message_id_never_falls_back_to_client_id() {
+        assert_eq!(
+            weixin_provider_message_id(&json!({"message_id": "provider-message-1"})).as_deref(),
+            Some("provider-message-1")
+        );
+        assert_eq!(
+            weixin_provider_message_id(&json!({"data": {"msg_id": "provider-message-2"}}))
+                .as_deref(),
+            Some("provider-message-2")
+        );
+        assert!(weixin_provider_message_id(&json!({"client_id": "wxmsg-client-only"})).is_none());
+        assert!(weixin_provider_message_id(&json!({})).is_none());
     }
 
     #[test]
