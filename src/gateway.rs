@@ -11,8 +11,8 @@ use crate::harborbeacon::{
 };
 use crate::models::{ConversationTurn, InboundMessage, OutboundMessage};
 use crate::store::{
-    DeliveryItemClaimRequest, DeliveryItemCompletion, DeliveryItemUpload, DeliveryStageCompletion,
-    FileSessionStore,
+    DeliveryItemClaimRequest, DeliveryItemCompletion, DeliveryItemUpload,
+    DeliveryMaterializationCompletion, DeliveryPlanItem, DeliveryStageCompletion, FileSessionStore,
 };
 use axum::http::StatusCode;
 use cap_std::ambient_authority;
@@ -326,6 +326,56 @@ impl GatewayService {
         self.weixin_adapter.clone()
     }
 
+    pub async fn retry_pending_deliveries(&self) -> Result<usize, GatewayError> {
+        let plans = self
+            .store
+            .retryable_delivery_plans()
+            .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+        let mut attempted = 0usize;
+        for plan in plans {
+            let delivery_key = plan
+                .get("delivery_key")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let request_fingerprint = plan
+                .get("request_fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let outbound: OutboundMessage = serde_json::from_value(
+                plan.get("planned_outbound").cloned().unwrap_or(Value::Null),
+            )
+            .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+            let adapter_name = outbound
+                .metadata
+                .get("adapter")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(&outbound.platform);
+            let Some(adapter) = self.adapter(adapter_name) else {
+                tracing::warn!(
+                    delivery_key,
+                    adapter = adapter_name,
+                    "Could not recover delivery because its adapter is unavailable"
+                );
+                continue;
+            };
+            attempted = attempted.saturating_add(1);
+            if let Err(error) = self
+                .deliver_outbound_items_guarded(
+                    adapter,
+                    outbound,
+                    delivery_key,
+                    request_fingerprint,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(delivery_key, error = %error, "Retryable delivery recovery failed");
+            }
+        }
+        Ok(attempted)
+    }
+
     pub async fn handle_inbound(
         &self,
         adapter_name: &str,
@@ -362,126 +412,87 @@ impl GatewayService {
             .to_string()
             .if_empty_then(|| derive_session_id(&inbound));
 
-        let (
-            reply_text,
-            outbound_attachments,
-            mut outbound_metadata,
-            next_metadata,
-            cache_files,
-            cache_dir,
-            mut cache_guard,
-        ) = if let Some(task_client) = &self.task_client {
-            let task_result = task_client.submit_turn(&inbound, &session_metadata).await?;
-            let attachment_candidates =
-                native_source_bound_attachments(adapter_name, &task_result.response_payload);
-            let materialized = task_client
-                .materialize_attachments_in(
-                    attachment_candidates,
-                    &self.attachment_cache_root,
-                    &task_result.task_id,
-                )
-                .await;
-            let cache_guard = AttachmentCacheGuard::new(
-                self.attachment_cache_root.clone(),
-                materialized.cache_files.clone(),
-                materialized.cache_dir.clone(),
-            );
-            let mut reply_text = render_retrieval_reply(
-                &task_result.text,
-                &task_result.response_payload,
-                !materialized.attachments.is_empty(),
-                &self.public_origin,
-            );
-            if materialized.failed_count > 0 {
-                if !reply_text.is_empty() {
-                    reply_text.push_str("\n\n");
+        let (reply_text, outbound_attachments, mut outbound_metadata, next_metadata) =
+            if let Some(task_client) = &self.task_client {
+                let task_result = task_client.submit_turn(&inbound, &session_metadata).await?;
+                let attachment_candidates =
+                    native_source_bound_attachments(adapter_name, &task_result.response_payload);
+                let reply_text = render_retrieval_reply(
+                    &task_result.text,
+                    &task_result.response_payload,
+                    !attachment_candidates.is_empty(),
+                    &self.public_origin,
+                );
+                let mut next_metadata = session_metadata.clone();
+                next_metadata.insert("route_key".into(), json!(task_result.route_key));
+                next_metadata.insert("session_id".into(), json!(resolved_session_id));
+                next_metadata.insert("last_turn_id".into(), json!(task_result.task_id));
+                next_metadata.insert("last_trace_id".into(), json!(task_result.trace_id));
+                if !inbound.message_id.trim().is_empty() {
+                    next_metadata.insert("last_message_id".into(), json!(inbound.message_id));
                 }
-                reply_text.push_str("媒体附件暂时无法下载，已保留文字结果，请稍后重试。");
-            }
-            let mut next_metadata = session_metadata.clone();
-            next_metadata.insert("route_key".into(), json!(task_result.route_key));
-            next_metadata.insert("session_id".into(), json!(resolved_session_id));
-            next_metadata.insert("last_turn_id".into(), json!(task_result.task_id));
-            next_metadata.insert("last_trace_id".into(), json!(task_result.trace_id));
-            if !inbound.message_id.trim().is_empty() {
-                next_metadata.insert("last_message_id".into(), json!(inbound.message_id));
-            }
-            if let Some(handle) = &task_result.conversation_handle {
-                next_metadata.insert("conversation_handle".into(), json!(handle));
-            }
-            if let Some(continuation) = &task_result.continuation {
-                next_metadata.insert("continuation".into(), continuation.clone());
+                if let Some(handle) = &task_result.conversation_handle {
+                    next_metadata.insert("conversation_handle".into(), json!(handle));
+                }
+                if let Some(continuation) = &task_result.continuation {
+                    next_metadata.insert("continuation".into(), continuation.clone());
+                } else {
+                    next_metadata.remove("continuation");
+                }
+                if !inbound.message_id.trim().is_empty() {
+                    let mut message_turns = session_metadata
+                        .get("message_turn_ids")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    message_turns.insert(inbound.message_id.clone(), json!(task_result.task_id));
+                    next_metadata.insert("message_turn_ids".into(), Value::Object(message_turns));
+                }
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("adapter".into(), json!(adapter_name));
+                metadata.insert("source".into(), json!("harborbeacon"));
+                metadata.insert("turn_id".into(), json!(task_result.task_id));
+                metadata.insert("task_id".into(), json!(task_result.task_id));
+                metadata.insert("trace_id".into(), json!(task_result.trace_id));
+                metadata.insert("status".into(), json!(task_result.status));
+                metadata.insert("route_key".into(), json!(task_result.route_key));
+                metadata.insert(
+                    "delivery_request_fingerprint".into(),
+                    json!(fingerprint(&task_result.response_payload)),
+                );
+                metadata.insert(
+                    "conversation_handle".into(),
+                    json!(task_result.conversation_handle),
+                );
+                metadata.insert(
+                    "active_frame".into(),
+                    task_result.active_frame.unwrap_or(Value::Null),
+                );
+                metadata.insert(
+                    "continuation".into(),
+                    task_result.continuation.unwrap_or(Value::Null),
+                );
+                metadata.insert("next_actions".into(), json!(task_result.next_actions));
+                metadata.insert(
+                    "native_attachment_count".into(),
+                    json!(attachment_candidates.len()),
+                );
+                metadata.insert("native_attachment_materialize_failed".into(), json!(0));
+                (reply_text, attachment_candidates, metadata, next_metadata)
             } else {
-                next_metadata.remove("continuation");
-            }
-            if !inbound.message_id.trim().is_empty() {
-                let mut message_turns = session_metadata
-                    .get("message_turn_ids")
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default();
-                message_turns.insert(inbound.message_id.clone(), json!(task_result.task_id));
-                next_metadata.insert("message_turn_ids".into(), Value::Object(message_turns));
-            }
-            let mut metadata = serde_json::Map::new();
-            metadata.insert("adapter".into(), json!(adapter_name));
-            metadata.insert("source".into(), json!("harborbeacon"));
-            metadata.insert("turn_id".into(), json!(task_result.task_id));
-            metadata.insert("task_id".into(), json!(task_result.task_id));
-            metadata.insert("trace_id".into(), json!(task_result.trace_id));
-            metadata.insert("status".into(), json!(task_result.status));
-            metadata.insert("route_key".into(), json!(task_result.route_key));
-            metadata.insert(
-                "delivery_request_fingerprint".into(),
-                json!(fingerprint(&task_result.response_payload)),
-            );
-            metadata.insert(
-                "conversation_handle".into(),
-                json!(task_result.conversation_handle),
-            );
-            metadata.insert(
-                "active_frame".into(),
-                task_result.active_frame.unwrap_or(Value::Null),
-            );
-            metadata.insert(
-                "continuation".into(),
-                task_result.continuation.unwrap_or(Value::Null),
-            );
-            metadata.insert("next_actions".into(), json!(task_result.next_actions));
-            metadata.insert(
-                "native_attachment_count".into(),
-                json!(materialized.attachments.len()),
-            );
-            metadata.insert(
-                "native_attachment_materialize_failed".into(),
-                json!(materialized.failed_count),
-            );
-            (
-                reply_text,
-                materialized.attachments,
-                metadata,
-                next_metadata,
-                materialized.cache_files,
-                materialized.cache_dir,
-                cache_guard,
-            )
-        } else {
-            let mut next_metadata = session_metadata.clone();
-            next_metadata.insert("route_key".into(), json!(resolved_route_key));
-            next_metadata.insert("session_id".into(), json!(resolved_session_id));
-            let mut metadata = serde_json::Map::new();
-            metadata.insert("adapter".into(), json!(adapter_name));
-            metadata.insert("source".into(), json!("rule_based_fallback"));
-            (
-                fallback_reply(&history, &inbound),
-                vec![],
-                metadata,
-                next_metadata,
-                vec![],
-                None,
-                AttachmentCacheGuard::new(self.attachment_cache_root.clone(), vec![], None),
-            )
-        };
+                let mut next_metadata = session_metadata.clone();
+                next_metadata.insert("route_key".into(), json!(resolved_route_key));
+                next_metadata.insert("session_id".into(), json!(resolved_session_id));
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("adapter".into(), json!(adapter_name));
+                metadata.insert("source".into(), json!("rule_based_fallback"));
+                (
+                    fallback_reply(&history, &inbound),
+                    vec![],
+                    metadata,
+                    next_metadata,
+                )
+            };
 
         self.store
             .set_metadata(&inbound.platform, &inbound.chat_id, next_metadata)
@@ -540,19 +551,14 @@ impl GatewayService {
             .unwrap_or("")
             .to_string()
             .if_empty_then(|| fingerprint(&json!({"turn_id": delivery_key})));
-        let delivery = self
-            .deliver_outbound_items_guarded(
-                adapter,
-                outbound,
-                &delivery_key,
-                &delivery_fingerprint,
-                Some(&mut cache_guard),
-            )
-            .await;
-        if delivery.is_ok() {
-            cleanup_attachment_cache(&self.attachment_cache_root, cache_files, cache_dir).await;
-        }
-        delivery
+        self.deliver_outbound_items_guarded(
+            adapter,
+            outbound,
+            &delivery_key,
+            &delivery_fingerprint,
+            None,
+        )
+        .await
     }
 
     pub async fn handle_gateway_turn(&self, payload: Value) -> Result<Value, GatewayError> {
@@ -796,39 +802,7 @@ impl GatewayService {
         }
 
         let content = delivery_content(&payload);
-        let planned_attachments = hinted_notification_attachments(&content);
-        let mut notification_cache_guard = None;
-        let outbound_attachments = if adapter_name == "weixin" && !planned_attachments.is_empty() {
-            let task_client = self.task_client.as_ref().ok_or_else(|| {
-                GatewayError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "HARBORBEACON_DISABLED",
-                    "HarborBeacon media proxy is not configured",
-                )
-                .with_trace(trace_id.clone())
-            })?;
-            let materialized = task_client
-                .materialize_attachments_in(
-                    planned_attachments,
-                    &self.attachment_cache_root,
-                    &delivery_idempotency_cache_segment(&idempotency_key),
-                )
-                .await;
-            notification_cache_guard = Some(AttachmentCacheGuard::new(
-                self.attachment_cache_root.clone(),
-                materialized.cache_files.clone(),
-                materialized.cache_dir.clone(),
-            ));
-            if materialized.failed_count > 0 {
-                return Err(GatewayError::infrastructure(
-                    "One or more hinted delivery artifacts could not be materialized",
-                )
-                .with_trace(trace_id));
-            }
-            materialized.attachments
-        } else {
-            planned_attachments
-        };
+        let outbound_attachments = hinted_notification_attachments(&content);
         let outbound = OutboundMessage {
             platform: route
                 .get("platform")
@@ -858,13 +832,7 @@ impl GatewayService {
         };
         let delivery_id = stable_id("delivery_", &idempotency_key, 24);
         let response_payload = match self
-            .deliver_outbound_items_guarded(
-                adapter,
-                outbound,
-                &idempotency_key,
-                &fingerprint,
-                notification_cache_guard.as_mut(),
-            )
+            .deliver_outbound_items_guarded(adapter, outbound, &idempotency_key, &fingerprint, None)
             .await
         {
             Ok(adapter_response) => {
@@ -1107,9 +1075,51 @@ impl GatewayService {
         if delivery_key.trim().is_empty() {
             return adapter.send_outbound(outbound).await;
         }
+        let planned_outbound = serde_json::to_value(&outbound)
+            .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+        let delivery_items = split_outbound_items(outbound)?;
+        let planned_items = delivery_items
+            .iter()
+            .map(
+                |(item_identity, artifact_id, kind, item_outbound)| -> Result<_, GatewayError> {
+                    Ok(DeliveryPlanItem {
+                        item_key: delivery_item_key(delivery_key, item_identity),
+                        artifact_id: artifact_id.clone(),
+                        kind: kind.clone(),
+                        planned_outbound: serde_json::to_value(item_outbound)
+                            .map_err(|error| GatewayError::infrastructure(error.to_string()))?,
+                        materialization_required: delivery_item_requires_materialization(
+                            adapter.name(),
+                            item_outbound,
+                        ),
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        self.store
+            .persist_delivery_plan(
+                delivery_key,
+                request_fingerprint,
+                planned_outbound,
+                planned_items,
+            )
+            .map_err(|error| {
+                if error.to_string().contains("conflict") {
+                    GatewayError::new(
+                        StatusCode::CONFLICT,
+                        "IDEMPOTENCY_CONFLICT",
+                        "delivery key was reused with a different effective plan",
+                    )
+                } else {
+                    GatewayError::infrastructure(error.to_string())
+                }
+            })?;
         let mut last_response = json!({});
-        for (artifact_id, kind, mut item_outbound) in split_outbound_items(outbound) {
-            let item_key = format!("{delivery_key}:{artifact_id}");
+        for (item_identity, artifact_id, kind, item_outbound) in delivery_items {
+            let item_key = delivery_item_key(delivery_key, &item_identity);
+            let mut item_outbound = self
+                .materialize_delivery_item(&adapter, delivery_key, &item_key, item_outbound)
+                .await?;
             let cache_path = item_outbound
                 .attachments
                 .first()
@@ -1131,7 +1141,9 @@ impl GatewayService {
                     lease_seconds: adapter.delivery_claim_lease_seconds(),
                 })
                 .map_err(|error| {
-                    if error.to_string().contains("fingerprint conflict") {
+                    if error.to_string().contains("fingerprint conflict")
+                        || error.to_string().contains("identity conflict")
+                    {
                         GatewayError::new(
                             StatusCode::CONFLICT,
                             "IDEMPOTENCY_CONFLICT",
@@ -1378,6 +1390,146 @@ impl GatewayService {
         Ok(last_response)
     }
 
+    async fn materialize_delivery_item(
+        &self,
+        adapter: &Arc<dyn PlatformAdapter>,
+        delivery_key: &str,
+        item_key: &str,
+        planned_outbound: OutboundMessage,
+    ) -> Result<OutboundMessage, GatewayError> {
+        if !delivery_item_requires_materialization(adapter.name(), &planned_outbound) {
+            return Ok(planned_outbound);
+        }
+        let claim = self
+            .store
+            .claim_delivery_materialization(
+                delivery_key,
+                item_key,
+                &self.delivery_instance_id,
+                adapter.delivery_claim_lease_seconds(),
+            )
+            .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+        match claim.get("claim").and_then(Value::as_str) {
+            Some("materialized") => {
+                return serde_json::from_value(
+                    claim
+                        .pointer("/item/materialized_outbound")
+                        .cloned()
+                        .ok_or_else(|| {
+                            GatewayError::infrastructure(
+                                "materialized delivery item is missing its outbound payload",
+                            )
+                        })?,
+                )
+                .map_err(|error| GatewayError::infrastructure(error.to_string()));
+            }
+            Some("not_required") => return Ok(planned_outbound),
+            Some("terminal_failed") => {
+                return Err(GatewayError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "DELIVERY_MATERIALIZATION_TERMINAL_FAILED",
+                    claim
+                        .pointer("/item/materialization/last_error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("delivery materialization previously failed terminally"),
+                ));
+            }
+            Some("busy") => {
+                return Err(GatewayError::infrastructure(
+                    "delivery item is already being materialized",
+                ));
+            }
+            Some("claimed") => {}
+            _ => {
+                return Err(GatewayError::infrastructure(
+                    "delivery materialization ledger returned an invalid claim",
+                ));
+            }
+        }
+        let claim_token = claim
+            .get("claim_token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                GatewayError::infrastructure(
+                    "delivery materialization claim is missing a fencing token",
+                )
+            })?;
+        let Some(task_client) = &self.task_client else {
+            let message = "HarborBeacon media proxy is not configured";
+            self.store
+                .finish_delivery_materialization(DeliveryMaterializationCompletion {
+                    delivery_key,
+                    item_key,
+                    claim_token,
+                    status: "failed",
+                    materialized_outbound: None,
+                    cache_path: None,
+                    retryable: true,
+                    last_error: Some(message),
+                })
+                .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+            return Err(GatewayError::infrastructure(message));
+        };
+        let materialized = task_client
+            .materialize_attachments_in(
+                planned_outbound.attachments.clone(),
+                &self.attachment_cache_root,
+                &delivery_idempotency_cache_segment(delivery_key),
+            )
+            .await;
+        let mut cache_guard = AttachmentCacheGuard::new(
+            self.attachment_cache_root.clone(),
+            materialized.cache_files.clone(),
+            materialized.cache_dir.clone(),
+        );
+        if materialized.failed_count > 0 || materialized.attachments.len() != 1 {
+            let message = "media attachment materialization failed";
+            self.store
+                .finish_delivery_materialization(DeliveryMaterializationCompletion {
+                    delivery_key,
+                    item_key,
+                    claim_token,
+                    status: "failed",
+                    materialized_outbound: None,
+                    cache_path: None,
+                    retryable: true,
+                    last_error: Some(message),
+                })
+                .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+            return Err(GatewayError::infrastructure(message));
+        }
+        let mut materialized_outbound = planned_outbound;
+        materialized_outbound.attachments = materialized.attachments;
+        let cache_path = materialized_outbound
+            .attachments
+            .first()
+            .and_then(|attachment| attachment.get("path"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                GatewayError::infrastructure(
+                    "materialized delivery item is missing its trusted cache path",
+                )
+            })?;
+        let serialized_outbound = serde_json::to_value(&materialized_outbound)
+            .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+        self.store
+            .finish_delivery_materialization(DeliveryMaterializationCompletion {
+                delivery_key,
+                item_key,
+                claim_token,
+                status: "materialized",
+                materialized_outbound: Some(serialized_outbound),
+                cache_path: Some(&cache_path),
+                retryable: true,
+                last_error: None,
+            })
+            .map_err(|error| GatewayError::infrastructure(error.to_string()))?;
+        cache_guard.disarm_path(&cache_path);
+        Ok(materialized_outbound)
+    }
+
     pub fn status(&self) -> Value {
         let mut adapters = serde_json::Map::new();
         for (name, adapter) in &self.adapters {
@@ -1486,17 +1638,56 @@ impl GatewayService {
     }
 }
 
-fn split_outbound_items(outbound: OutboundMessage) -> Vec<(String, String, OutboundMessage)> {
+fn delivery_item_key(delivery_key: &str, item_identity: &str) -> String {
+    format!(
+        "delivery:v1:{}:{delivery_key}:{item_identity}",
+        delivery_key.len()
+    )
+}
+
+fn attachment_item_identity(artifact_id: &str) -> String {
+    format!("item:v1:artifact:{}:{artifact_id}", artifact_id.len())
+}
+
+fn delivery_item_requires_materialization(adapter_name: &str, outbound: &OutboundMessage) -> bool {
+    adapter_name == "weixin"
+        && outbound.attachments.len() == 1
+        && outbound.attachments[0]
+            .get("path")
+            .and_then(Value::as_str)
+            .is_none_or(|path| path.trim().is_empty())
+        && outbound.attachments[0]
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.trim().is_empty())
+}
+
+fn split_outbound_items(
+    outbound: OutboundMessage,
+) -> Result<Vec<(String, String, String, OutboundMessage)>, GatewayError> {
     let mut items = Vec::new();
+    let mut artifact_ids = HashSet::new();
     if !outbound.text.trim().is_empty() {
         let mut text_outbound = outbound.clone();
         text_outbound.attachments.clear();
-        items.push(("__text".to_string(), "text".to_string(), text_outbound));
+        items.push((
+            "item:v1:text".to_string(),
+            "__text".to_string(),
+            "text".to_string(),
+            text_outbound,
+        ));
     }
     for attachment in &outbound.attachments {
         let Some(artifact_id) = delivery_artifact_id(attachment) else {
             continue;
         };
+        if !artifact_ids.insert(artifact_id.clone()) {
+            return Err(GatewayError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "DUPLICATE_DELIVERY_ARTIFACT",
+                format!("duplicate artifact_id in delivery plan: {artifact_id}"),
+            ));
+        }
         let kind = attachment
             .get("kind")
             .or_else(|| attachment.get("type"))
@@ -1507,12 +1698,22 @@ fn split_outbound_items(outbound: OutboundMessage) -> Vec<(String, String, Outbo
         let mut attachment_outbound = outbound.clone();
         attachment_outbound.text.clear();
         attachment_outbound.attachments = vec![attachment.clone()];
-        items.push((artifact_id, kind, attachment_outbound));
+        items.push((
+            attachment_item_identity(&artifact_id),
+            artifact_id,
+            kind,
+            attachment_outbound,
+        ));
     }
     if items.is_empty() {
-        items.push(("__text".to_string(), "text".to_string(), outbound));
+        items.push((
+            "item:v1:text".to_string(),
+            "__text".to_string(),
+            "text".to_string(),
+            outbound,
+        ));
     }
-    items
+    Ok(items)
 }
 
 fn native_video_file_fallback(outbound: &OutboundMessage) -> Option<OutboundMessage> {
@@ -2933,8 +3134,9 @@ mod tests {
             &std::fs::read_to_string(dir.path().join("_delivery_items.json")).unwrap(),
         )
         .unwrap();
+        let text_item_key = delivery_item_key("idem-items", "item:v1:text");
         assert_eq!(
-            item_ledger["idem-items"]["items"]["idem-items:__text"]["provider_message_id"],
+            item_ledger["idem-items"]["items"][&text_item_key]["provider_message_id"],
             "provider-__text"
         );
         drop(gateway);
@@ -2943,6 +3145,72 @@ mod tests {
         let replay = gateway.handle_notification_delivery(payload).await.unwrap();
         assert_eq!(replay, recovered);
         assert_eq!(calls.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn delivery_item_identity_distinguishes_caption_from_reserved_artifact_id() {
+        let outbound = OutboundMessage {
+            platform: "weixin".to_string(),
+            chat_id: "chat-1".to_string(),
+            text: "cat clip".to_string(),
+            attachments: vec![json!({
+                "artifact_id": "__text",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "path": "gate-owned-video.mp4"
+            })],
+            timestamp: crate::models::utc_now_iso(),
+            metadata: serde_json::Map::new(),
+        };
+
+        let items = split_outbound_items(outbound).expect("valid delivery plan");
+
+        assert_eq!(items.len(), 2);
+        assert_ne!(items[0].0, items[1].0);
+        assert_eq!(items[0].1, "__text");
+        assert_eq!(items[1].1, "__text");
+        assert_eq!(items[0].2, "text");
+        assert_eq!(items[1].2, "video");
+    }
+
+    #[test]
+    fn delivery_item_identity_is_unambiguous_for_separator_like_artifact_ids() {
+        let outbound = OutboundMessage {
+            platform: "weixin".to_string(),
+            chat_id: "chat-1".to_string(),
+            text: String::new(),
+            attachments: vec![
+                json!({"artifact_id": "a:b", "kind": "video"}),
+                json!({"artifact_id": "a", "kind": "b:video"}),
+            ],
+            timestamp: crate::models::utc_now_iso(),
+            metadata: serde_json::Map::new(),
+        };
+
+        let items = split_outbound_items(outbound).expect("valid delivery plan");
+
+        assert_eq!(items.len(), 2);
+        assert_ne!(items[0].0, items[1].0);
+    }
+
+    #[test]
+    fn duplicate_artifact_ids_are_rejected_before_delivery() {
+        let outbound = OutboundMessage {
+            platform: "weixin".to_string(),
+            chat_id: "chat-1".to_string(),
+            text: "cat clips".to_string(),
+            attachments: vec![
+                json!({"artifact_id": "duplicate", "kind": "video"}),
+                json!({"artifact_id": "duplicate", "kind": "file"}),
+            ],
+            timestamp: crate::models::utc_now_iso(),
+            metadata: serde_json::Map::new(),
+        };
+
+        let error =
+            split_outbound_items(outbound).expect_err("duplicate artifact IDs must fail closed");
+
+        assert_eq!(error.code, "DUPLICATE_DELIVERY_ARTIFACT");
     }
 
     #[tokio::test]
@@ -2997,7 +3265,9 @@ mod tests {
             &std::fs::read_to_string(dir.path().join("_delivery_items.json")).unwrap(),
         )
         .unwrap();
-        let item = &ledger["idem-fallback"]["items"]["idem-fallback:artifact-video"];
+        let item_key =
+            delivery_item_key("idem-fallback", &attachment_item_identity("artifact-video"));
+        let item = &ledger["idem-fallback"]["items"][&item_key];
         assert_eq!(item["status"], "succeeded");
         assert_eq!(item["fallback_used"], true);
         assert_eq!(item["provider_message_id"], "provider-file-1");
@@ -3088,8 +3358,11 @@ mod tests {
             &fs::read_to_string(dir.path().join("_delivery_items.json")).unwrap(),
         )
         .unwrap();
-        let failed =
-            &failed_ledger["idem-staged-fallback"]["items"]["idem-staged-fallback:artifact-video"];
+        let item_key = delivery_item_key(
+            "idem-staged-fallback",
+            &attachment_item_identity("artifact-video"),
+        );
+        let failed = &failed_ledger["idem-staged-fallback"]["items"][&item_key];
         assert_eq!(
             failed["stages"]["native"]["provider_media_id"],
             "video-media"
@@ -3121,7 +3394,7 @@ mod tests {
             &fs::read_to_string(dir.path().join("_delivery_items.json")).unwrap(),
         )
         .unwrap();
-        let item = &ledger["idem-staged-fallback"]["items"]["idem-staged-fallback:artifact-video"];
+        let item = &ledger["idem-staged-fallback"]["items"][&item_key];
         assert_eq!(item["status"], "succeeded");
         assert_eq!(item["provider_client_id"], "file-client");
         assert_eq!(item["provider_message_id"], "file-message");
@@ -3255,23 +3528,21 @@ mod tests {
         )
         .unwrap();
         let first_items = &first_ledger["idem-upload"]["items"];
+        let item_1_key =
+            delivery_item_key("idem-upload", &attachment_item_identity("artifact-file-1"));
+        let item_2_key =
+            delivery_item_key("idem-upload", &attachment_item_identity("artifact-file-2"));
+        assert_eq!(first_items[&item_1_key]["status"], "succeeded");
         assert_eq!(
-            first_items["idem-upload:artifact-file-1"]["status"],
-            "succeeded"
-        );
-        assert_eq!(
-            first_items["idem-upload:artifact-file-1"]["provider_message_id"],
+            first_items[&item_1_key]["provider_message_id"],
             "provider-message-1"
         );
+        assert_eq!(first_items[&item_2_key]["status"], "failed");
         assert_eq!(
-            first_items["idem-upload:artifact-file-2"]["status"],
-            "failed"
-        );
-        assert_eq!(
-            first_items["idem-upload:artifact-file-2"]["provider_media_id"],
+            first_items[&item_2_key]["provider_media_id"],
             "provider-media-2"
         );
-        assert!(first_items["idem-upload:artifact-file-2"]["provider_message_id"].is_null());
+        assert!(first_items[&item_2_key]["provider_message_id"].is_null());
         drop(gateway);
 
         let gateway = GatewayService::from_config(&config).unwrap();
@@ -3287,20 +3558,14 @@ mod tests {
         )
         .unwrap();
         let items = &ledger["idem-upload"]["items"];
+        assert_eq!(items[&item_1_key]["provider_media_id"], "provider-media-1");
         assert_eq!(
-            items["idem-upload:artifact-file-1"]["provider_media_id"],
-            "provider-media-1"
-        );
-        assert_eq!(
-            items["idem-upload:artifact-file-1"]["provider_message_id"],
+            items[&item_1_key]["provider_message_id"],
             "provider-message-1"
         );
+        assert_eq!(items[&item_2_key]["provider_media_id"], "provider-media-2");
         assert_eq!(
-            items["idem-upload:artifact-file-2"]["provider_media_id"],
-            "provider-media-2"
-        );
-        assert_eq!(
-            items["idem-upload:artifact-file-2"]["provider_message_id"],
+            items[&item_2_key]["provider_message_id"],
             "provider-message-3"
         );
     }
@@ -3889,6 +4154,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notification_materialization_failure_keeps_durable_retryable_item_after_text_send() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/cameras/recordings/artifacts/artifact-materialize-retry",
+                axum::routing::get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_base_url = base_url;
+        config.harborbeacon_token = "service-token".into();
+        let sent_attachments = Arc::new(StdMutex::new(Vec::new()));
+        let mut gateway = GatewayService::from_config(&config).unwrap();
+        gateway.adapters.insert(
+            "weixin".into(),
+            Arc::new(CaptureAttachmentAdapter {
+                sent_attachments: sent_attachments.clone(),
+            }),
+        );
+        gateway
+            .store
+            .register_route(
+                "gw_materialize_retry",
+                json!({
+                    "platform": "weixin",
+                    "adapter_name": "weixin",
+                    "chat_id": "wx-materialize-retry",
+                    "status": "active"
+                }),
+            )
+            .unwrap();
+
+        let response = gateway
+            .handle_notification_delivery(json!({
+                "notification": {"notification_id": "notification-materialize-retry", "trace_id": "trace-materialize-retry"},
+                "destination": {"route_key": "gw_materialize_retry"},
+                "reply": {"kind": "tool_result", "text": "cat clip"},
+                "artifacts": [{
+                    "artifact_id": "artifact-materialize-retry",
+                    "kind": "video",
+                    "mime_type": "video/mp4",
+                    "url": "/api/cameras/recordings/artifacts/artifact-materialize-retry"
+                }],
+                "delivery_hints": [{
+                    "kind": "native_video",
+                    "artifact_id": "artifact-materialize-retry",
+                    "fallback": "file"
+                }],
+                "delivery": {"mode": "send", "idempotency_key": "idem-materialize-retry", "reply_to_message_id": null, "update_message_id": null}
+            }))
+            .await
+            .expect("materialization failure must be represented as retryable delivery state");
+        server.abort();
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["retryable"], true);
+        let sent_attachments = sent_attachments.lock().unwrap();
+        assert_eq!(sent_attachments.len(), 1);
+        assert!(sent_attachments[0].is_empty());
+        let ledger: Value = serde_json::from_str(
+            &fs::read_to_string(config.data_dir.join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        let items = ledger["idem-materialize-retry"]["items"]
+            .as_object()
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        let video = items
+            .values()
+            .find(|item| item["artifact_id"] == "artifact-materialize-retry")
+            .unwrap();
+        assert_eq!(video["status"], "failed");
+        assert_eq!(video["retryable"], true);
+        assert_eq!(video["materialization"]["status"], "failed");
+        assert_eq!(
+            video["planned_outbound"]["attachments"][0]["url"],
+            "/api/cameras/recordings/artifacts/artifact-materialize-retry"
+        );
+        assert_eq!(
+            video["planned_outbound"]["attachments"][0]["mime_type"],
+            "video/mp4"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_recovery_after_restart_does_not_resend_text_and_sends_video_once() {
+        use axum::response::IntoResponse as _;
+
+        let materialize_attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let attempts = materialize_attempts.clone();
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/cameras/recordings/artifacts/artifact-restart-retry",
+                axum::routing::get(move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        } else {
+                            (
+                                [
+                                    (axum::http::header::CONTENT_TYPE, "video/mp4"),
+                                    (axum::http::header::CONTENT_LENGTH, "4"),
+                                ],
+                                "clip",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_base_url = base_url;
+        config.harborbeacon_token = "service-token".into();
+        let sent_attachments = Arc::new(StdMutex::new(Vec::new()));
+        let build_gateway = || {
+            let mut gateway = GatewayService::from_config(&config).unwrap();
+            gateway.adapters.insert(
+                "weixin".into(),
+                Arc::new(CaptureAttachmentAdapter {
+                    sent_attachments: sent_attachments.clone(),
+                }),
+            );
+            gateway
+        };
+        let gateway = build_gateway();
+        gateway
+            .store
+            .register_route(
+                "gw_restart_retry",
+                json!({
+                    "platform": "weixin",
+                    "adapter_name": "weixin",
+                    "chat_id": "wx-restart-retry",
+                    "status": "active"
+                }),
+            )
+            .unwrap();
+        let payload = json!({
+            "notification": {"notification_id": "notification-restart-retry", "trace_id": "trace-restart-retry"},
+            "destination": {"route_key": "gw_restart_retry"},
+            "reply": {"kind": "tool_result", "text": "cat clip"},
+            "artifacts": [{
+                "artifact_id": "artifact-restart-retry",
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "url": "/api/cameras/recordings/artifacts/artifact-restart-retry"
+            }],
+            "delivery_hints": [{
+                "kind": "native_video",
+                "artifact_id": "artifact-restart-retry",
+                "fallback": "file"
+            }],
+            "delivery": {"mode": "send", "idempotency_key": "idem-restart-retry", "reply_to_message_id": null, "update_message_id": null}
+        });
+
+        let first = gateway.handle_notification_delivery(payload).await.unwrap();
+        assert_eq!(first["ok"], false);
+        drop(gateway);
+
+        let gateway = build_gateway();
+        assert_eq!(gateway.retry_pending_deliveries().await.unwrap(), 1);
+        assert_eq!(gateway.retry_pending_deliveries().await.unwrap(), 0);
+        server.abort();
+
+        assert_eq!(materialize_attempts.load(Ordering::SeqCst), 2);
+        let sent = sent_attachments.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].is_empty(), "first provider call must be text");
+        assert_eq!(sent[1].len(), 1, "recovery must send one video item");
+        assert_eq!(sent[1][0]["artifact_id"], "artifact-restart-retry");
+        let ledger: Value = serde_json::from_str(
+            &fs::read_to_string(config.data_dir.join("_delivery_items.json")).unwrap(),
+        )
+        .unwrap();
+        let video = ledger["idem-restart-retry"]["items"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|item| item["artifact_id"] == "artifact-restart-retry")
+            .unwrap();
+        assert_eq!(video["status"], "succeeded");
+        assert_eq!(video["materialization"]["status"], "materialized");
+    }
+
+    #[tokio::test]
     async fn materialized_turn_cache_is_cleaned_on_metadata_early_return() {
         assert_materialized_turn_cache_cleanup("metadata").await;
     }
@@ -3988,7 +4451,7 @@ mod tests {
                         } else {
                             "conflicting-fingerprint"
                         },
-                        item_key: "notification-guard-key:__text",
+                        item_key: &delivery_item_key("notification-guard-key", "item:v1:text"),
                         artifact_id: "__text",
                         kind: "text",
                         owner: "other-gateway",
@@ -4480,8 +4943,11 @@ mod tests {
             &fs::read_to_string(config.data_dir.join("_delivery_items.json")).unwrap(),
         )
         .unwrap();
-        let item = &ledger["delivery-terminal-success"]["items"]
-            ["delivery-terminal-success:artifact-terminal-success"];
+        let item_key = delivery_item_key(
+            "delivery-terminal-success",
+            &attachment_item_identity("artifact-terminal-success"),
+        );
+        let item = &ledger["delivery-terminal-success"]["items"][&item_key];
         assert!(item["cache_path"].is_null());
         assert!(!cache_file.exists());
         assert!(!batch_dir.exists());
@@ -4535,8 +5001,11 @@ mod tests {
             &fs::read_to_string(config.data_dir.join("_delivery_items.json")).unwrap(),
         )
         .unwrap();
-        let item = &mut ledger["delivery-terminal-failure"]["items"]
-            ["delivery-terminal-failure:artifact-terminal-failure"];
+        let item_key = delivery_item_key(
+            "delivery-terminal-failure",
+            &attachment_item_identity("artifact-terminal-failure"),
+        );
+        let item = &mut ledger["delivery-terminal-failure"]["items"][&item_key];
         assert_eq!(item["status"], "failed");
         assert_eq!(item["retryable"], false);
         assert!(item["cache_path"].is_null());

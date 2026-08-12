@@ -4,11 +4,14 @@ use crate::error::GatewayError;
 use crate::models::{utc_now_iso, InboundMessage, OutboundMessage};
 use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyInit};
 use async_trait::async_trait;
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use axum::http::StatusCode;
 use base64::Engine as _;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -97,6 +100,13 @@ pub struct WeixinAdapter {
     config: WeixinConfig,
     http: Client,
     state: Mutex<WeixinState>,
+    inbox_lock: Mutex<()>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WeixinPollBatch {
+    pub updates: Vec<Value>,
+    pub next_cursor: String,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +143,7 @@ impl WeixinAdapter {
             config,
             http: Client::new(),
             state: Mutex::new(WeixinState { account, transport }),
+            inbox_lock: Mutex::new(()),
         }
     }
 
@@ -265,7 +276,7 @@ impl WeixinAdapter {
         Ok(())
     }
 
-    pub async fn poll_updates(&self) -> Result<Vec<Value>, GatewayError> {
+    pub async fn poll_updates(&self) -> Result<WeixinPollBatch, GatewayError> {
         self.refresh_account_from_disk();
         let account = self.account();
         if !account.configured() {
@@ -274,7 +285,10 @@ impl WeixinAdapter {
                 "connected": false,
                 "last_poll_outcome": "waiting_for_credentials",
             }));
-            return Ok(vec![]);
+            return Ok(WeixinPollBatch {
+                updates: vec![],
+                next_cursor: String::new(),
+            });
         }
         self.update_transport(json_map!({
             "status": "polling",
@@ -318,7 +332,10 @@ impl WeixinAdapter {
                         "last_getupdates_message_ids": Vec::<Value>::new(),
                         "last_getupdates_private_message_ids": Vec::<Value>::new(),
                     }));
-                    return Ok(vec![]);
+                    return Ok(WeixinPollBatch {
+                        updates: vec![],
+                        next_cursor: sync_buf,
+                    });
                 }
                 self.update_transport(json_map!({
                     "status": poll_status,
@@ -341,7 +358,6 @@ impl WeixinAdapter {
             .and_then(Value::as_str)
             .unwrap_or(&sync_buf)
             .to_string();
-        save_sync_buf(&self.config.state_dir, &account.account_id, &next_sync)?;
         let messages: Vec<Value> = response
             .get("msgs")
             .and_then(Value::as_array)
@@ -393,7 +409,188 @@ impl WeixinAdapter {
             updates.insert("last_private_text_message_at".into(), json!(now));
         }
         self.update_transport(updates);
-        Ok(messages)
+        Ok(WeixinPollBatch {
+            updates: messages,
+            next_cursor: next_sync,
+        })
+    }
+
+    pub fn persist_inbound_batch(&self, updates: &[Value]) -> Result<(), GatewayError> {
+        let account = self.account();
+        if account.account_id.trim().is_empty() {
+            return Err(self.weixin_error("Weixin account is not configured"));
+        }
+        let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        let mut inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
+        let items = inbox
+            .entry("items")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| self.weixin_error("Weixin inbox items are invalid"))?;
+        for payload in updates.iter().filter(|payload| payload.is_object()) {
+            let inbox_id = stable_weixin_inbox_id(&account.account_id, payload)?;
+            let payload_fingerprint = weixin_payload_fingerprint(payload)?;
+            if let Some(existing) = items.get(&inbox_id) {
+                if existing.get("payload_fingerprint").and_then(Value::as_str)
+                    != Some(payload_fingerprint.as_str())
+                {
+                    return Err(GatewayError::new(
+                        StatusCode::CONFLICT,
+                        "WEIXIN_INBOX_IDENTITY_CONFLICT",
+                        "Weixin provider message identity was reused with a different payload",
+                    ));
+                }
+                continue;
+            }
+            items.insert(
+                inbox_id.clone(),
+                json!({
+                    "inbox_id": inbox_id,
+                    "provider_message_id": extract_weixin_message_id(payload),
+                    "payload_fingerprint": payload_fingerprint,
+                    "payload": payload,
+                    "status": "pending",
+                    "retryable": true,
+                    "attempts": 0,
+                    "owner": null,
+                    "claim_token": null,
+                    "claim_expires_at": null,
+                    "last_error": null,
+                    "created_at": utc_now_iso(),
+                    "updated_at": utc_now_iso(),
+                }),
+            );
+        }
+        inbox.insert("version".into(), json!(1));
+        inbox.insert("updated_at".into(), json!(utc_now_iso()));
+        save_inbox(&self.config.state_dir, &account.account_id, &inbox)
+    }
+
+    pub fn commit_poll_cursor(&self, next_cursor: &str) -> Result<(), GatewayError> {
+        let account = self.account();
+        if account.account_id.trim().is_empty() {
+            return Err(self.weixin_error("Weixin account is not configured"));
+        }
+        save_sync_buf(&self.config.state_dir, &account.account_id, next_cursor)
+    }
+
+    pub fn claim_inbound(
+        &self,
+        owner: &str,
+        lease_seconds: u64,
+    ) -> Result<Option<Value>, GatewayError> {
+        let account = self.account();
+        if account.account_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        let mut inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
+        let items = inbox
+            .entry("items")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| self.weixin_error("Weixin inbox items are invalid"))?;
+        let candidate = items.iter().find_map(|(inbox_id, item)| {
+            let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+            let retryable = item.get("retryable").and_then(Value::as_bool) != Some(false);
+            let claimable = matches!(status, "pending" | "failed") && retryable
+                || status == "processing" && !weixin_inbox_claim_is_unexpired(item);
+            claimable.then(|| inbox_id.clone())
+        });
+        let Some(inbox_id) = candidate else {
+            return Ok(None);
+        };
+        let item = items
+            .get_mut(&inbox_id)
+            .ok_or_else(|| self.weixin_error("Weixin inbox item disappeared during claim"))?;
+        let attempts = item
+            .get("attempts")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let claim_token = Uuid::new_v4().simple().to_string();
+        item["status"] = json!("processing");
+        item["attempts"] = json!(attempts);
+        item["owner"] = json!(owner);
+        item["claim_token"] = json!(claim_token);
+        item["claim_expires_at"] = json!(Utc::now()
+            .checked_add_signed(ChronoDuration::seconds(
+                i64::try_from(lease_seconds.max(1)).unwrap_or(i64::MAX),
+            ))
+            .unwrap_or_else(|| Utc::now() + ChronoDuration::days(365_000))
+            .to_rfc3339());
+        item["updated_at"] = json!(utc_now_iso());
+        let claimed = item.clone();
+        inbox.insert("updated_at".into(), json!(utc_now_iso()));
+        save_inbox(&self.config.state_dir, &account.account_id, &inbox)?;
+        Ok(Some(json!({
+            "inbox_id": inbox_id,
+            "claim_token": claim_token,
+            "payload": claimed.get("payload").cloned().unwrap_or(Value::Null),
+            "item": claimed,
+        })))
+    }
+
+    pub fn finish_inbound(
+        &self,
+        inbox_id: &str,
+        claim_token: &str,
+        succeeded: bool,
+        retryable: bool,
+        last_error: Option<&str>,
+    ) -> Result<(), GatewayError> {
+        let account = self.account();
+        let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        let mut inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
+        let item = inbox
+            .get_mut("items")
+            .and_then(Value::as_object_mut)
+            .and_then(|items| items.get_mut(inbox_id))
+            .ok_or_else(|| self.weixin_error("Weixin inbox claim is missing"))?;
+        if item.get("status").and_then(Value::as_str) != Some("processing")
+            || item.get("claim_token").and_then(Value::as_str) != Some(claim_token)
+        {
+            return Err(self.weixin_error("stale Weixin inbox claim"));
+        }
+        item["status"] = json!(if succeeded {
+            "succeeded"
+        } else if retryable {
+            "failed"
+        } else {
+            "terminal_failed"
+        });
+        item["retryable"] = json!(!succeeded && retryable);
+        item["last_error"] = last_error.map_or(Value::Null, |error| json!(error));
+        item["owner"] = Value::Null;
+        item["claim_token"] = Value::Null;
+        item["claim_expires_at"] = Value::Null;
+        item["updated_at"] = json!(utc_now_iso());
+        inbox.insert("updated_at".into(), json!(utc_now_iso()));
+        save_inbox(&self.config.state_dir, &account.account_id, &inbox)
+    }
+
+    pub fn retryable_inbox_count(&self) -> Result<usize, GatewayError> {
+        self.inbox_count(|item| {
+            matches!(
+                item.get("status").and_then(Value::as_str),
+                Some("pending" | "processing" | "failed")
+            ) && item.get("retryable").and_then(Value::as_bool) != Some(false)
+        })
+    }
+
+    pub fn inbox_status_count(&self, expected: &str) -> Result<usize, GatewayError> {
+        self.inbox_count(|item| item.get("status").and_then(Value::as_str) == Some(expected))
+    }
+
+    fn inbox_count(&self, predicate: impl Fn(&Value) -> bool) -> Result<usize, GatewayError> {
+        let account = self.account();
+        let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        let inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
+        Ok(inbox
+            .get("items")
+            .and_then(Value::as_object)
+            .map(|items| items.values().filter(|item| predicate(item)).count())
+            .unwrap_or(0))
     }
 
     pub fn is_duplicate_update(&self, payload: &Value) -> bool {
@@ -1581,6 +1778,10 @@ fn processed_file(state_dir: &Path, account_id: &str) -> PathBuf {
     account_dir(state_dir).join(format!("{}.processed_messages.json", safe_slug(account_id)))
 }
 
+fn inbox_file(state_dir: &Path, account_id: &str) -> PathBuf {
+    account_dir(state_dir).join(format!("{}.inbox.json", safe_slug(account_id)))
+}
+
 fn transport_state_file(state_dir: &Path, account_id: &str) -> PathBuf {
     account_dir(state_dir).join(format!("{}.runtime.json", safe_slug(account_id)))
 }
@@ -1684,6 +1885,7 @@ fn clear_weixin_account_state(state_dir: &Path, account_id: &str) -> Vec<String>
         sync_file(state_dir, account_id),
         context_file(state_dir, account_id),
         processed_file(state_dir, account_id),
+        inbox_file(state_dir, account_id),
         transport_state_file(state_dir, account_id),
     ] {
         if fs::remove_file(&path).is_ok() {
@@ -1708,12 +1910,89 @@ fn load_sync_buf(state_dir: &Path, account_id: &str) -> String {
         .unwrap_or_default()
 }
 
+fn load_inbox(
+    state_dir: &Path,
+    account_id: &str,
+) -> Result<serde_json::Map<String, Value>, GatewayError> {
+    let path = inbox_file(state_dir, account_id);
+    if !path.exists() {
+        return Ok(json_map!({
+            "version": 1,
+            "items": json!({}),
+            "updated_at": utc_now_iso(),
+        }));
+    }
+    let raw = fs::read_to_string(&path)?;
+    let value: Value = serde_json::from_str(&raw).map_err(|error| {
+        GatewayError::infrastructure(format!(
+            "Weixin inbox {} contains invalid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    value.as_object().cloned().ok_or_else(|| {
+        GatewayError::infrastructure(format!(
+            "Weixin inbox {} must be a JSON object",
+            path.display()
+        ))
+    })
+}
+
+fn save_inbox(
+    state_dir: &Path,
+    account_id: &str,
+    inbox: &serde_json::Map<String, Value>,
+) -> Result<(), GatewayError> {
+    let path = inbox_file(state_dir, account_id);
+    fs::create_dir_all(account_dir(state_dir))?;
+    let bytes = serde_json::to_vec_pretty(&Value::Object(inbox.clone()))?;
+    AtomicFile::new(&path, AllowOverwrite)
+        .write(|file| -> std::io::Result<()> {
+            use std::io::Write as _;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })
+        .map_err(std::io::Error::from)?;
+    Ok(())
+}
+
+fn stable_weixin_inbox_id(account_id: &str, payload: &Value) -> Result<String, GatewayError> {
+    let provider_message_id = extract_weixin_message_id(payload);
+    let stable_source = if provider_message_id.is_empty() {
+        weixin_payload_fingerprint(payload)?
+    } else {
+        provider_message_id
+    };
+    let mut hasher = Sha256::new();
+    for part in [account_id.as_bytes(), stable_source.as_bytes()] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    Ok(format!("wxinbox_{:x}", hasher.finalize()))
+}
+
+fn weixin_payload_fingerprint(payload: &Value) -> Result<String, GatewayError> {
+    let bytes = serde_json::to_vec(payload)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn weixin_inbox_claim_is_unexpired(item: &Value) -> bool {
+    item.get("claim_expires_at")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|expires_at| expires_at.with_timezone(&Utc) > Utc::now())
+}
+
 fn save_sync_buf(state_dir: &Path, account_id: &str, sync_buf: &str) -> Result<(), GatewayError> {
     fs::create_dir_all(account_dir(state_dir))?;
-    fs::write(
-        sync_file(state_dir, account_id),
-        serde_json::to_string_pretty(&json!({"get_updates_buf": sync_buf}))?,
-    )?;
+    let path = sync_file(state_dir, account_id);
+    let bytes = serde_json::to_vec_pretty(&json!({"get_updates_buf": sync_buf}))?;
+    AtomicFile::new(&path, AllowOverwrite)
+        .write(|file| -> std::io::Result<()> {
+            use std::io::Write as _;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })
+        .map_err(std::io::Error::from)?;
     Ok(())
 }
 
@@ -2284,6 +2563,82 @@ mod tests {
         assert_eq!(status["configured"], true);
         assert_eq!(status["connected"], true);
         assert_eq!(status["status"], "polling_idle");
+    }
+
+    #[test]
+    fn durable_inbox_commit_precedes_cursor_and_provider_replay_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-inbox".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config.clone());
+        let update = json!({
+            "msg_id": "provider-message-1",
+            "from_user_id": "wx-user",
+            "item_list": [{"type": 1, "text_item": {"text": "cat clips"}}]
+        });
+
+        adapter
+            .persist_inbound_batch(&[update.clone()])
+            .expect("inbox commit must succeed");
+
+        assert_eq!(load_sync_buf(dir.path(), "bot-inbox"), "");
+        assert_eq!(adapter.retryable_inbox_count().unwrap(), 1);
+        adapter
+            .persist_inbound_batch(&[update])
+            .expect("provider replay must upsert the same inbox item");
+        assert_eq!(adapter.retryable_inbox_count().unwrap(), 1);
+        adapter.commit_poll_cursor("cursor-2").unwrap();
+        assert_eq!(load_sync_buf(dir.path(), "bot-inbox"), "cursor-2");
+    }
+
+    #[test]
+    fn durable_inbox_recovers_after_restart_and_keeps_success_tombstone() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-restart".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config.clone());
+        adapter
+            .persist_inbound_batch(&[json!({
+                "msg_id": "provider-message-restart",
+                "from_user_id": "wx-user",
+                "item_list": [{"type": 1, "text_item": {"text": "cat clips"}}]
+            })])
+            .unwrap();
+        drop(adapter);
+
+        let restarted = WeixinAdapter::new(config);
+        let claim = restarted
+            .claim_inbound("runtime-1", 300)
+            .unwrap()
+            .expect("pending inbox item must survive restart");
+        restarted
+            .finish_inbound(
+                claim["inbox_id"].as_str().unwrap(),
+                claim["claim_token"].as_str().unwrap(),
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(restarted.retryable_inbox_count().unwrap(), 0);
+        assert_eq!(restarted.inbox_status_count("succeeded").unwrap(), 1);
     }
 
     #[test]

@@ -32,6 +32,25 @@ pub struct DeliveryItemClaimRequest<'a> {
     pub lease_seconds: u64,
 }
 
+pub struct DeliveryPlanItem {
+    pub item_key: String,
+    pub artifact_id: String,
+    pub kind: String,
+    pub planned_outbound: Value,
+    pub materialization_required: bool,
+}
+
+pub struct DeliveryMaterializationCompletion<'a> {
+    pub delivery_key: &'a str,
+    pub item_key: &'a str,
+    pub claim_token: &'a str,
+    pub status: &'a str,
+    pub materialized_outbound: Option<Value>,
+    pub cache_path: Option<&'a Path>,
+    pub retryable: bool,
+    pub last_error: Option<&'a str>,
+}
+
 pub struct DeliveryItemCompletion<'a> {
     pub delivery_key: &'a str,
     pub item_key: &'a str,
@@ -275,6 +294,7 @@ impl FileSessionStore {
             let item = items.entry(item_key.to_string()).or_insert_with(|| {
                 json!({
                     "item_key": item_key,
+                    "request_fingerprint": request_fingerprint,
                     "artifact_id": artifact_id,
                     "kind": kind,
                     "status": "pending",
@@ -296,6 +316,22 @@ impl FileSessionStore {
                     "updated_at": utc_now_iso(),
                 })
             });
+            let existing_artifact_id = item.get("artifact_id").and_then(Value::as_str);
+            let existing_kind = item.get("kind").and_then(Value::as_str);
+            if existing_artifact_id != Some(artifact_id) || existing_kind != Some(kind) {
+                anyhow::bail!("delivery item identity conflict");
+            }
+            match item.get("request_fingerprint").and_then(Value::as_str) {
+                Some(existing) if existing != request_fingerprint => {
+                    anyhow::bail!("delivery item request fingerprint conflict");
+                }
+                None => {
+                    item.as_object_mut()
+                        .context("delivery item ledger entry is invalid")?
+                        .insert("request_fingerprint".into(), json!(request_fingerprint));
+                }
+                Some(_) => {}
+            }
             let previous_cache_path = item.get("cache_path").cloned().unwrap_or(Value::Null);
             let status = item.get("status").and_then(Value::as_str).unwrap_or("");
             if status == "succeeded" {
@@ -340,6 +376,256 @@ impl FileSessionStore {
                 "item": claimed,
                 "previous_cache_path": previous_cache_path,
             }))
+        })
+    }
+
+    pub fn persist_delivery_plan(
+        &self,
+        delivery_key: &str,
+        request_fingerprint: &str,
+        planned_outbound: Value,
+        planned_items: Vec<DeliveryPlanItem>,
+    ) -> Result<()> {
+        let _guard = self.lock.lock().expect("session store lock poisoned");
+        self.with_delivery_items_lock(|| {
+            let mut records = self.load_shared_map_unlocked("_delivery_items.json")?;
+            let record = records.entry(delivery_key.to_string()).or_insert_with(|| {
+                json!({
+                    "request_fingerprint": request_fingerprint,
+                    "planned_outbound": planned_outbound,
+                    "items": {},
+                    "updated_at": utc_now_iso(),
+                })
+            });
+            if record.get("request_fingerprint").and_then(Value::as_str)
+                != Some(request_fingerprint)
+            {
+                anyhow::bail!("delivery item request fingerprint conflict");
+            }
+            if record.get("planned_outbound").is_none() {
+                record["planned_outbound"] = planned_outbound;
+            }
+            let items = record
+                .get_mut("items")
+                .and_then(Value::as_object_mut)
+                .context("delivery item ledger is invalid")?;
+            for planned in planned_items {
+                let materialization_status = if planned.materialization_required {
+                    "pending"
+                } else {
+                    "not_required"
+                };
+                let item = items.entry(planned.item_key.clone()).or_insert_with(|| {
+                    json!({
+                        "item_key": planned.item_key,
+                        "request_fingerprint": request_fingerprint,
+                        "artifact_id": planned.artifact_id,
+                        "kind": planned.kind,
+                        "planned_outbound": planned.planned_outbound,
+                        "materialization": {
+                            "status": materialization_status,
+                            "attempts": 0,
+                            "retryable": planned.materialization_required,
+                            "last_error": null,
+                            "owner": null,
+                            "claim_token": null,
+                            "claim_expires_at": null,
+                            "updated_at": utc_now_iso(),
+                        },
+                        "status": "pending",
+                        "attempts": 0,
+                        "provider_media_id": null,
+                        "provider_media_state": null,
+                        "provider_client_id": null,
+                        "provider_message_id": null,
+                        "stages": {
+                            "native": delivery_stage_value(),
+                            "fallback": delivery_stage_value(),
+                        },
+                        "retryable": true,
+                        "last_error": null,
+                        "owner": null,
+                        "claim_token": null,
+                        "claim_expires_at": null,
+                        "cache_path": null,
+                        "updated_at": utc_now_iso(),
+                    })
+                });
+                if item.get("artifact_id").and_then(Value::as_str)
+                    != Some(planned.artifact_id.as_str())
+                    || item.get("kind").and_then(Value::as_str) != Some(planned.kind.as_str())
+                    || item.get("request_fingerprint").and_then(Value::as_str)
+                        != Some(request_fingerprint)
+                {
+                    anyhow::bail!("delivery item identity conflict");
+                }
+                if item.get("planned_outbound").is_none() {
+                    item["planned_outbound"] = planned.planned_outbound;
+                }
+                if item.get("materialization").is_none() {
+                    item["materialization"] = json!({
+                        "status": materialization_status,
+                        "attempts": 0,
+                        "retryable": planned.materialization_required,
+                        "last_error": null,
+                        "owner": null,
+                        "claim_token": null,
+                        "claim_expires_at": null,
+                        "updated_at": utc_now_iso(),
+                    });
+                }
+            }
+            record["updated_at"] = json!(utc_now_iso());
+            self.write_shared_map_unlocked("_delivery_items.json", &records)
+        })
+    }
+
+    pub fn claim_delivery_materialization(
+        &self,
+        delivery_key: &str,
+        item_key: &str,
+        owner: &str,
+        lease_seconds: u64,
+    ) -> Result<Value> {
+        let _guard = self.lock.lock().expect("session store lock poisoned");
+        self.with_delivery_items_lock(|| {
+            let mut records = self.load_shared_map_unlocked("_delivery_items.json")?;
+            let item = records
+                .get_mut(delivery_key)
+                .and_then(|record| record.get_mut("items"))
+                .and_then(Value::as_object_mut)
+                .and_then(|items| items.get_mut(item_key))
+                .context("delivery materialization item is missing")?;
+            let materialization = item
+                .get_mut("materialization")
+                .and_then(Value::as_object_mut)
+                .context("delivery materialization state is invalid")?;
+            let status = materialization
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if matches!(status, "materialized" | "not_required") {
+                return Ok(json!({"claim": status, "item": item.clone()}));
+            }
+            if status == "failed"
+                && materialization.get("retryable").and_then(Value::as_bool) == Some(false)
+            {
+                return Ok(json!({"claim": "terminal_failed", "item": item.clone()}));
+            }
+            if status == "materializing" && nested_claim_is_unexpired(materialization)? {
+                return Ok(json!({"claim": "busy", "item": item.clone()}));
+            }
+            let attempts = materialization
+                .get("attempts")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1);
+            let claim_token = Uuid::new_v4().simple().to_string();
+            materialization.insert("status".into(), json!("materializing"));
+            materialization.insert("attempts".into(), json!(attempts));
+            materialization.insert("owner".into(), json!(owner));
+            materialization.insert("claim_token".into(), json!(claim_token));
+            materialization.insert(
+                "claim_expires_at".into(),
+                json!(delivery_claim_expires_at(lease_seconds)),
+            );
+            materialization.insert("updated_at".into(), json!(utc_now_iso()));
+            let claimed_item = item.clone();
+            self.write_shared_map_unlocked("_delivery_items.json", &records)?;
+            Ok(json!({
+                "claim": "claimed",
+                "claim_token": claim_token,
+                "item": claimed_item,
+            }))
+        })
+    }
+
+    pub fn finish_delivery_materialization(
+        &self,
+        completion: DeliveryMaterializationCompletion<'_>,
+    ) -> Result<()> {
+        let DeliveryMaterializationCompletion {
+            delivery_key,
+            item_key,
+            claim_token,
+            status,
+            materialized_outbound,
+            cache_path,
+            retryable,
+            last_error,
+        } = completion;
+        if !matches!(status, "materialized" | "failed") {
+            anyhow::bail!("invalid delivery materialization completion status");
+        }
+        let _guard = self.lock.lock().expect("session store lock poisoned");
+        self.with_delivery_items_lock(|| {
+            let mut records = self.load_shared_map_unlocked("_delivery_items.json")?;
+            let item = records
+                .get_mut(delivery_key)
+                .and_then(|record| record.get_mut("items"))
+                .and_then(Value::as_object_mut)
+                .and_then(|items| items.get_mut(item_key))
+                .context("delivery materialization item is missing")?;
+            let materialization = item
+                .get_mut("materialization")
+                .and_then(Value::as_object_mut)
+                .context("delivery materialization state is invalid")?;
+            require_active_nested_claim(materialization, claim_token, "materializing")?;
+            materialization.insert("status".into(), json!(status));
+            materialization.insert("retryable".into(), json!(retryable));
+            materialization.insert(
+                "last_error".into(),
+                last_error.map_or(Value::Null, |value| json!(value)),
+            );
+            materialization.insert("owner".into(), Value::Null);
+            materialization.insert("claim_token".into(), Value::Null);
+            materialization.insert("claim_expires_at".into(), Value::Null);
+            materialization.insert("updated_at".into(), json!(utc_now_iso()));
+            if let Some(materialized_outbound) = materialized_outbound {
+                item["materialized_outbound"] = materialized_outbound;
+            }
+            item["cache_path"] = cache_path.map_or(Value::Null, |path| {
+                json!(path.to_string_lossy().into_owned())
+            });
+            item["status"] = json!(if status == "materialized" {
+                "pending"
+            } else {
+                "failed"
+            });
+            item["retryable"] = json!(retryable);
+            item["last_error"] = last_error.map_or(Value::Null, |value| json!(value));
+            item["updated_at"] = json!(utc_now_iso());
+            self.write_shared_map_unlocked("_delivery_items.json", &records)
+        })
+    }
+
+    pub fn retryable_delivery_plans(&self) -> Result<Vec<Value>> {
+        let _guard = self.lock.lock().expect("session store lock poisoned");
+        self.with_delivery_items_lock(|| {
+            let records = self.load_shared_map_unlocked("_delivery_items.json")?;
+            Ok(records
+                .into_iter()
+                .filter_map(|(delivery_key, record)| {
+                    let retryable = record
+                        .get("items")
+                        .and_then(Value::as_object)
+                        .is_some_and(|items| {
+                            items.values().any(|item| {
+                                matches!(
+                                    item.get("status").and_then(Value::as_str),
+                                    Some("pending" | "sending" | "failed")
+                                ) && item.get("retryable").and_then(Value::as_bool) != Some(false)
+                            })
+                        });
+                    (retryable && record.get("planned_outbound").is_some()).then(|| {
+                        json!({
+                            "delivery_key": delivery_key,
+                            "request_fingerprint": record.get("request_fingerprint").cloned().unwrap_or(Value::Null),
+                            "planned_outbound": record.get("planned_outbound").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                })
+                .collect())
         })
     }
 
@@ -759,6 +1045,41 @@ fn delivery_claim_is_unexpired(item: &Value) -> Result<bool> {
     Ok(expires_at > Utc::now())
 }
 
+fn nested_claim_is_unexpired(claim: &serde_json::Map<String, Value>) -> Result<bool> {
+    let updated_at = claim
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .context("nested delivery claim updated_at is missing")?;
+    let updated_at = DateTime::parse_from_rfc3339(updated_at)
+        .context("nested delivery claim updated_at is malformed")?
+        .with_timezone(&Utc);
+    let expires_at = match claim.get("claim_expires_at") {
+        Some(Value::String(value)) => DateTime::parse_from_rfc3339(value)
+            .context("nested delivery claim claim_expires_at is malformed")?
+            .with_timezone(&Utc),
+        Some(_) => anyhow::bail!("nested delivery claim claim_expires_at is malformed"),
+        None => updated_at + ChronoDuration::seconds(LEGACY_DELIVERY_CLAIM_LEASE_SECONDS),
+    };
+    Ok(expires_at > Utc::now())
+}
+
+fn require_active_nested_claim(
+    claim: &serde_json::Map<String, Value>,
+    claim_token: &str,
+    active_status: &str,
+) -> Result<()> {
+    let active = claim.get("status").and_then(Value::as_str) == Some(active_status)
+        && claim
+            .get("claim_token")
+            .and_then(Value::as_str)
+            .is_some_and(|stored| !stored.is_empty() && stored == claim_token)
+        && nested_claim_is_unexpired(claim)?;
+    if !active {
+        anyhow::bail!("stale nested delivery claim");
+    }
+    Ok(())
+}
+
 fn require_active_delivery_claim(item: &Value, claim_token: &str) -> Result<()> {
     let lease_is_unexpired = delivery_claim_is_unexpired(item)?;
     let active = item.get("status").and_then(Value::as_str) == Some("sending")
@@ -874,6 +1195,39 @@ mod tests {
             cache_path: None,
             lease_seconds: 300,
         })
+    }
+
+    #[test]
+    fn delivery_item_claim_rejects_existing_item_identity_changes() {
+        let dir = tempdir().unwrap();
+        let store = FileSessionStore::new(dir.path()).unwrap();
+        let claim = |artifact_id: &str, kind: &str, fingerprint: &str| {
+            store.claim_delivery_item(DeliveryItemClaimRequest {
+                delivery_key: "delivery-identity",
+                request_fingerprint: fingerprint,
+                item_key: "delivery-identity:item:v1:8:artifact",
+                artifact_id,
+                kind,
+                owner: "test-process",
+                cache_path: None,
+                lease_seconds: 300,
+            })
+        };
+
+        claim("artifact", "video", "fingerprint").unwrap();
+
+        assert!(claim("other-artifact", "video", "fingerprint")
+            .unwrap_err()
+            .to_string()
+            .contains("identity conflict"));
+        assert!(claim("artifact", "file", "fingerprint")
+            .unwrap_err()
+            .to_string()
+            .contains("identity conflict"));
+        assert!(claim("artifact", "video", "different-fingerprint")
+            .unwrap_err()
+            .to_string()
+            .contains("fingerprint conflict"));
     }
 
     #[test]
