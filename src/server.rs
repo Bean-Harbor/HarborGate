@@ -883,17 +883,11 @@ async fn authenticate_proxy_principal(
     }
     let camera_id = cat_detection_observation_camera_id(target_path)
         .ok_or_else(|| harboros_auth_gateway_error(HarborOsAuthFailure::InvalidToken))?;
-    let token = device_session_cookie(headers)
-        .ok_or_else(|| device_session_gateway_error(DeviceSessionError::InvalidSession))?;
-    let principal = state
-        .device_sessions
-        .authenticate(token, &camera_id)
-        .map_err(device_session_gateway_error)?;
     Ok(HarborOsPrincipal {
-        source: "harbornavi-device".to_string(),
-        principal_id: principal.principal_id,
+        source: "harbornavi-lan".to_string(),
+        principal_id: "harbornavi-lan:anonymous".to_string(),
         roles: vec!["CAMERA_VIEW".to_string()],
-        camera_scope: Some(principal.camera_id),
+        camera_scope: Some(camera_id),
     })
 }
 

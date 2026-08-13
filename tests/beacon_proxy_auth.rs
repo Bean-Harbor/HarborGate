@@ -260,7 +260,7 @@ async fn every_proxy_alias_requires_authentication_for_conversation_json() {
 }
 
 #[tokio::test]
-async fn detection_job_control_and_results_require_authentication() {
+async fn observation_is_open_while_detection_job_control_requires_authentication() {
     let (beacon_url, captured) = mock_beacon().await;
     let authenticator = FakeAuthenticator::successful();
     let (state, _temp_dir) = test_state(
@@ -270,52 +270,71 @@ async fn detection_job_control_and_results_require_authentication() {
     );
     let app = router(state);
 
-    for (method, path) in [
+    for (method, path, expected_status) in [
         (
             Method::GET,
             "/api/beacon/cameras/camera-252/cat-detection/observation?stream_profile=sub",
+            StatusCode::OK,
         ),
         (
             Method::GET,
             "/api/harbor-assistant/cameras/camera-252/cat-detection/observation?stream_profile=sub",
+            StatusCode::OK,
         ),
         (
             Method::GET,
             "/api/harbor-gate/api/beacon/cameras/camera-252/cat-detection/observation?stream_profile=sub",
+            StatusCode::OK,
         ),
-        (Method::GET, "/api/beacon/vision/detection-jobs"),
+        (
+            Method::GET,
+            "/api/beacon/vision/detection-jobs",
+            StatusCode::UNAUTHORIZED,
+        ),
         (
             Method::PATCH,
             "/api/beacon/vision/detection-jobs/job-1/results/latest",
+            StatusCode::UNAUTHORIZED,
         ),
-        (Method::GET, "/api/harbor-assistant/vision/detection-jobs"),
+        (
+            Method::GET,
+            "/api/harbor-assistant/vision/detection-jobs",
+            StatusCode::UNAUTHORIZED,
+        ),
         (
             Method::PATCH,
             "/api/harbor-assistant/vision/detection-jobs/job-1/results/latest",
+            StatusCode::UNAUTHORIZED,
         ),
         (
             Method::GET,
             "/api/harbor-gate/api/beacon/vision/detection-jobs",
+            StatusCode::UNAUTHORIZED,
         ),
         (
             Method::PATCH,
             "/api/harbor-gate/api/beacon/vision/detection-jobs/job-1/results/latest",
+            StatusCode::UNAUTHORIZED,
         ),
         (
             Method::POST,
             "/api/harbor-gate/api/beacon/vision/detection-jobs",
+            StatusCode::UNAUTHORIZED,
         ),
         (
             Method::GET,
             "/api/harbor-gate/api/beacon/vision/detection-jobs/job-1",
+            StatusCode::UNAUTHORIZED,
         ),
         (
             Method::POST,
             "/api/harbor-gate/api/beacon/vision/detection-jobs/job-1/renew",
+            StatusCode::UNAUTHORIZED,
         ),
         (
             Method::DELETE,
             "/api/harbor-gate/api/beacon/vision/detection-jobs/job-1",
+            StatusCode::UNAUTHORIZED,
         ),
     ] {
         let response = app
@@ -329,10 +348,10 @@ async fn detection_job_control_and_results_require_authentication() {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(response.status(), expected_status, "{path}");
     }
 
-    assert!(captured.lock().await.is_empty());
+    assert_eq!(captured.lock().await.len(), 3);
     assert!(authenticator.tokens().await.is_empty());
 }
 
@@ -438,7 +457,66 @@ async fn authenticated_observation_replaces_spoofed_principal_and_discards_one_t
 }
 
 #[tokio::test]
-async fn paired_device_session_is_one_time_camera_scoped_and_observation_only() {
+async fn anonymous_observation_uses_camera_scoped_lan_principal_and_keeps_mutations_protected() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+    let observation =
+        Request::get("/api/beacon/cameras/camera-252/cat-detection/observation?stream_profile=sub")
+            .header("authorization", "Bearer browser-controlled")
+            .header("x-harbor-principal-source", "client")
+            .header("x-harbor-principal-id", "client:spoof")
+            .header("x-harbor-principal-roles", "FULL_ADMIN")
+            .header("x-harbor-camera-scope", "camera-999")
+            .body(Body::empty())
+            .unwrap();
+
+    assert_eq!(
+        app.clone().oneshot(observation).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("x-harbor-principal-source")
+            .unwrap(),
+        "harbornavi-lan"
+    );
+    assert_eq!(
+        requests[0].headers.get("x-harbor-principal-id").unwrap(),
+        "harbornavi-lan:anonymous"
+    );
+    assert_eq!(
+        requests[0].headers.get("x-harbor-principal-roles").unwrap(),
+        "CAMERA_VIEW"
+    );
+    assert_eq!(
+        requests[0].headers.get("x-harbor-camera-scope").unwrap(),
+        "camera-252"
+    );
+    drop(requests);
+
+    let mutation = Request::post("/api/beacon/vision/detection-jobs")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(mutation).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(captured.lock().await.len(), 1);
+    assert!(authenticator.tokens().await.is_empty());
+}
+
+#[tokio::test]
+async fn device_session_endpoints_no_longer_gate_camera_observation() {
     let (beacon_url, captured) = mock_beacon().await;
     let authenticator = FakeAuthenticator::successful();
     let (state, _temp_dir) = test_state(
@@ -532,7 +610,7 @@ async fn paired_device_session_is_one_time_camera_scoped_and_observation_only() 
             .headers
             .get("x-harbor-principal-source")
             .unwrap(),
-        "harbornavi-device"
+        "harbornavi-lan"
     );
     assert_eq!(
         requests[0].headers.get("x-harbor-principal-roles").unwrap(),
@@ -542,13 +620,10 @@ async fn paired_device_session_is_one_time_camera_scoped_and_observation_only() 
         requests[0].headers.get("x-harbor-camera-scope").unwrap(),
         "camera-252"
     );
-    assert!(requests[0]
-        .headers
-        .get("x-harbor-principal-id")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .starts_with("harbornavi-device:"));
+    assert_eq!(
+        requests[0].headers.get("x-harbor-principal-id").unwrap(),
+        "harbornavi-lan:anonymous"
+    );
     drop(requests);
 
     let wrong_camera =
@@ -558,7 +633,7 @@ async fn paired_device_session_is_one_time_camera_scoped_and_observation_only() 
             .unwrap();
     assert_eq!(
         app.clone().oneshot(wrong_camera).await.unwrap().status(),
-        StatusCode::FORBIDDEN
+        StatusCode::OK
     );
 
     let detection_jobs = Request::get("/api/beacon/vision/detection-jobs")
@@ -569,7 +644,7 @@ async fn paired_device_session_is_one_time_camera_scoped_and_observation_only() 
         app.oneshot(detection_jobs).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
-    assert_eq!(captured.lock().await.len(), 1);
+    assert_eq!(captured.lock().await.len(), 2);
     assert!(authenticator.tokens().await.is_empty());
 }
 
