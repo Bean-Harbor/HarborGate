@@ -116,7 +116,12 @@ def make_bundle(path: Path, version: str = "0.1.0-test", arch: str = "riscv64") 
     return prefix
 
 
-def run_verifier(verifier, bundle: Path, version: str = "0.1.0-test") -> None:
+def run_verifier(
+    verifier,
+    bundle: Path,
+    version: str = "0.1.0-test",
+    require_release_eligible: bool = False,
+) -> None:
     old_argv = sys.argv
     try:
         sys.argv = [
@@ -127,6 +132,8 @@ def run_verifier(verifier, bundle: Path, version: str = "0.1.0-test") -> None:
             "--version",
             version,
         ]
+        if require_release_eligible:
+            sys.argv.append("--require-release-eligible")
         verifier.main()
     finally:
         sys.argv = old_argv
@@ -172,3 +179,10 @@ def test_bundle_verifier_rejects_unsafe_checksum_member(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="unsafe checksum manifest member"):
         run_verifier(verifier, tmp_path)
+
+
+def test_formal_release_rejects_unresolved_license_review(tmp_path: Path) -> None:
+    verifier = load_script("verify_release_bundle.py")
+    make_bundle(tmp_path)
+    with pytest.raises(ValueError, match="license review blocks formal release"):
+        run_verifier(verifier, tmp_path, require_release_eligible=True)

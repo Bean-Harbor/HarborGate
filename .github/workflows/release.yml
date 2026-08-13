@@ -60,7 +60,8 @@ jobs:
           bash scripts/build_harborgate_k3_deb.sh
           (cd dist/harborgate-debs && sha256sum --check ./*.sha256)
           python3 scripts/verify_release_bundle.py dist/harborgate-debs \
-            --arch amd64 --version "$DEBIAN_VERSION"
+            --arch amd64 --version "$DEBIAN_VERSION" \
+            --require-release-eligible
           bash scripts/test_deb_lifecycle.sh dist/harborgate-debs/*.deb
 
       - name: Create release from the verified tag

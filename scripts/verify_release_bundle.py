@@ -41,6 +41,7 @@ def main() -> None:
     parser.add_argument("bundle", type=Path)
     parser.add_argument("--arch", required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--require-release-eligible", action="store_true")
     args = parser.parse_args()
 
     prefix = f"harboros-im-gate_{args.version}_{args.arch}"
@@ -94,6 +95,8 @@ def main() -> None:
         raise ValueError("license review must report an unresolved dependency count")
     if review.get("release_eligible") != (unresolved == 0):
         raise ValueError("license review eligibility contradicts unresolved dependencies")
+    if args.require_release_eligible and not review.get("release_eligible"):
+        raise ValueError("license review blocks formal release")
     for dependency in review.get("dependencies", []):
         if dependency.get("declared_license") != "NOASSERTION":
             raise ValueError("dependency license was inferred without repository evidence")
