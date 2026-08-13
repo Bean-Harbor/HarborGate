@@ -4,74 +4,66 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release"
+        description: Existing source tag version without the v prefix (for example 1.0.0)
         required: true
-        default: "1.0.0"
+
+permissions:
+  contents: write
+
+env:
+  BUILD_CONTAINER_DIGEST: sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+  DEBIAN_SNAPSHOT: 20260801T000000Z
+  DEBIAN_VERSION: ${{ inputs.tag }}
 
 jobs:
-  build-deb:
+  build-audited-deb:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    timeout-minutes: 45
-
+    timeout-minutes: 60
+    container:
+      image: rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
     steps:
-      - name: Checkout HarborGate
-        uses: actions/checkout@v6
+      - name: Checkout the exact release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          ref: refs/tags/v${{ inputs.tag }}
 
-      - name: Install Rust toolchain
+      - name: Verify tag and source commit
         run: |
+          test "$(git rev-list -n 1 "refs/tags/v${DEBIAN_VERSION}")" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          dpkg --validate-version "$DEBIAN_VERSION"
+
+      - name: Install snapshot-pinned packaging tools
+        env:
+          HARBORGATE_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+        run: |
+          bash scripts/configure_debian_snapshot.sh
+          apt-get update
+          apt-get install --yes --no-install-recommends dpkg-dev init-system-helpers iproute2 python3 xz-utils
           rustup target add x86_64-unknown-linux-gnu
 
-      - name: Cache cargo builds
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build release binary
-        run: cargo build --release --bin harboros-im-gate --target x86_64-unknown-linux-gnu
-
-      - name: Create deb package
+      - name: Build, compare, and exercise the audited package
+        env:
+          DEB_ARCH: amd64
+          RUST_TARGET: x86_64-unknown-linux-gnu
+          HARBORGATE_BUILD_CONTAINER_DIGEST: ${{ env.BUILD_CONTAINER_DIGEST }}
+          HARBORGATE_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
         run: |
-          VERSION="${{ inputs.tag }}"
-          PKG_NAME="harboros-im-gate_${VERSION}_linux_amd64"
-          PKG_DIR="./deb-package/${PKG_NAME}"
+          export SOURCE_COMMIT="$(git rev-parse HEAD)"
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          bash scripts/verify_k3_reproducible.sh
+          bash scripts/build_harborgate_k3_deb.sh
+          (cd dist/harborgate-debs && sha256sum --check ./*.sha256)
+          bash scripts/test_deb_lifecycle.sh dist/harborgate-debs/*.deb
 
-          mkdir -p ${PKG_DIR}/DEBIAN
-          mkdir -p ${PKG_DIR}/usr/bin
-          mkdir -p ${PKG_DIR}/etc/systemd/system
-
-          cp ./target/x86_64-unknown-linux-gnu/release/harboros-im-gate ${PKG_DIR}/usr/bin/harboros-im-gate
-          chmod +x ${PKG_DIR}/usr/bin/harboros-im-gate
-
-          cp ./debian/harboros-im-gate.service ${PKG_DIR}/etc/systemd/system/
-
-          cp ./debian/control ${PKG_DIR}/DEBIAN/control
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" ${PKG_DIR}/DEBIAN/control
-
-          cp ./debian/postinst ${PKG_DIR}/DEBIAN/postinst
-          chmod +x ${PKG_DIR}/DEBIAN/postinst
-
-          cp ./debian/prerm ${PKG_DIR}/DEBIAN/prerm
-          chmod +x ${PKG_DIR}/DEBIAN/prerm
-
-          dpkg-deb --build ${PKG_DIR}
-          mkdir -p ./artifacts/
-          mv ./deb-package/${PKG_NAME}.deb ./artifacts/
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Create release from the verified tag
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: v${{ inputs.tag }}
           name: v${{ inputs.tag }}
           generate_release_notes: true
-          files: |
-            ./artifacts/*
+          files: dist/harborgate-debs/*
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

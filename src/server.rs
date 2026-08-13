@@ -38,6 +38,7 @@ pub struct AppState {
 }
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
+    config.validate_k3_runtime()?;
     let gateway = Arc::new(GatewayService::from_config(&config)?);
     let feishu_websocket_started = Arc::new(AtomicBool::new(false));
     maybe_start_configured_feishu_runtime(
@@ -666,7 +667,11 @@ fn require_service_contract(config: &AppConfig, headers: &HeaderMap) -> Result<(
 
 fn require_service_auth(config: &AppConfig, headers: &HeaderMap) -> Result<(), GatewayError> {
     if config.service_token.trim().is_empty() {
-        return Ok(());
+        return Err(GatewayError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SERVICE_AUTH_UNAVAILABLE",
+            "Service authentication is not configured",
+        ));
     }
     let authorization = headers
         .get("Authorization")
@@ -900,8 +905,8 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     use super::{
-        beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_contract,
-        requires_harboros_principal,
+        beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_auth,
+        require_service_contract, requires_harboros_principal,
     };
     use crate::config::AppConfig;
 
@@ -1030,5 +1035,17 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(error.code, "CONTRACT_VERSION_MISMATCH");
+    }
+
+    #[test]
+    fn service_auth_fails_closed_when_the_shared_token_is_empty() {
+        let mut config = AppConfig::from_env();
+        config.service_token.clear();
+
+        let error = require_service_auth(&config, &HeaderMap::new())
+            .expect_err("an empty shared token must never disable authentication");
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "SERVICE_AUTH_UNAVAILABLE");
     }
 }

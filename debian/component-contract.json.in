@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "package": "harboros-im-gate",
+  "source_commit": "SOURCE_COMMIT_PLACEHOLDER",
+  "contracts": [
+    {
+      "id": "harboros.k3.gate-v2-transport",
+      "version": 1,
+      "capabilities": [
+        "beacon-gate-contract-2.0",
+        "harboros-auth-token-validation",
+        "external-riscv64-runtime-evidence-required",
+        "loopback-only",
+        "platform-credential-ownership",
+        "service-bearer-redaction"
+      ]
+    }
+  ]
+}

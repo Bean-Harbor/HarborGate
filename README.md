@@ -52,6 +52,41 @@ Portable Linux release builds are produced on the builder with:
 just build-linux
 ```
 
+The HarborNavi K3 package is built in the pinned container declared by
+`.github/workflows/k3-evt-package.yml`. A qualification build uses an exact
+Debian version and the source commit timestamp; it does not publish to a public
+release or APT channel:
+
+```bash
+export DEBIAN_VERSION=0.1.0+harbornavi.k3.evt1.riscv64
+export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+export SOURCE_COMMIT="$(git rev-parse HEAD)"
+export HARBORGATE_BUILD_CONTAINER_DIGEST=sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+export HARBORGATE_DEBIAN_SNAPSHOT=20260801T000000Z
+./scripts/verify_k3_reproducible.sh
+```
+
+The K3 service remains loopback-only and stores sessions and transport state
+under `/data/harborgate`. HarborOS System provisions the shared service bearer;
+the Gate package never generates or exports that cross-component secret. The
+package depends on the compatible HarborOS System line and loads only the
+required `/data/harboros/secrets/beacon-gate.env`; no `/etc/default` file may
+override the K3 listener, data roots, contract, or bearer values. Startup fails
+closed unless the listener is loopback `127.0.0.1:8787`, the contract is `2.0`,
+all component state is under `/data/harborgate`, and both distinct 32-byte
+bearers are present.
+
+The repository CI proves an amd64 package install and loopback health smoke. It
+cross-builds the riscv64 package but does not claim that QEMU or real K3 runtime
+acceptance occurred. Each package therefore carries
+`k3-runtime-evidence-required.json`; HarborOS qualification/candidate assembly
+must fail closed until signed Ubuntu 26.04 riscv64 dependency-closure, install,
+systemd ordering, binary-execution, and loopback-health evidence exists. The
+HarborOS central release resolver derives `Depends`, `Pre-Depends`, and
+`Provides` closure from the real `.deb`; this repository's Debian snapshot and
+tool versions are build-material provenance, not a substitute for that Ubuntu
+closure.
+
 ## Current Adapters
 
 - `feishu`: websocket receive, webhook callback compatibility, text send,
@@ -161,7 +196,7 @@ FEISHU_MAIL_SENDER_MAILBOX=me
 FEISHU_MAIL_DEFAULT_FROM_NAME=HarborOps
 FEISHU_MAIL_USER_ACCESS_TOKEN=<short-lived-user-token>
 FEISHU_MAIL_USER_REFRESH_TOKEN=<rotating-user-refresh-token>
-FEISHU_MAIL_TOKEN_STATE_PATH=/var/lib/harborgate/feishu-mail-token.json
+FEISHU_MAIL_TOKEN_STATE_PATH=/data/harborgate/feishu-mail-token.json
 ```
 
 `FEISHU_MAIL_USER_ACCESS_TOKEN` is useful for one-off smoke delivery. For a

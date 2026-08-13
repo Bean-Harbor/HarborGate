@@ -1,0 +1,95 @@
+name: k3-evt-package
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/k3-evt-package.yml
+      - Cargo.lock
+      - Cargo.toml
+      - LICENSE
+      - debian/**
+      - scripts/**
+      - src/**
+  workflow_dispatch:
+    inputs:
+      debian_version:
+        description: Exact Debian version for the qualification package
+        required: true
+        default: 0.1.0+harbornavi.k3.evt1.riscv64
+
+permissions:
+  contents: read
+
+env:
+  BUILD_CONTAINER_DIGEST: sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+  DEBIAN_SNAPSHOT: 20260801T000000Z
+  DEBIAN_VERSION: ${{ inputs.debian_version || '0.1.0+harbornavi.k3.evt1.riscv64' }}
+
+jobs:
+  riscv64-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install fixed packaging toolchain
+        env:
+          HARBORGATE_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+        run: |
+          bash scripts/configure_debian_snapshot.sh
+          apt-get update
+          apt-get install --yes --no-install-recommends dpkg-dev gcc-riscv64-linux-gnu python3 xz-utils
+          rustup target add riscv64gc-unknown-linux-gnu
+      - name: Verify reproducible riscv64 package
+        env:
+          DEB_ARCH: riscv64
+          RUST_TARGET: riscv64gc-unknown-linux-gnu
+          HARBORGATE_BUILD_CONTAINER_DIGEST: ${{ env.BUILD_CONTAINER_DIGEST }}
+          HARBORGATE_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          bash scripts/verify_k3_reproducible.sh
+          bash scripts/build_harborgate_k3_deb.sh
+          dpkg-deb --info dist/harborgate-debs/*.deb
+          dpkg-deb --contents dist/harborgate-debs/*.deb
+          (cd dist/harborgate-debs && sha256sum --check ./*.sha256)
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: harboros-im-gate-riscv64
+          path: dist/harborgate-debs/*
+
+  amd64-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DEBIAN_VERSION: 0.1.0+harbornavi.k3.evt1.amd64
+    container:
+      image: rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install fixed packaging toolchain
+        env:
+          HARBORGATE_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+        run: |
+          bash scripts/configure_debian_snapshot.sh
+          apt-get update
+          apt-get install --yes --no-install-recommends dpkg-dev init-system-helpers iproute2 python3 xz-utils
+          rustup target add x86_64-unknown-linux-gnu
+      - name: Exercise package lifecycle
+        env:
+          DEB_ARCH: amd64
+          RUST_TARGET: x86_64-unknown-linux-gnu
+          HARBORGATE_BUILD_CONTAINER_DIGEST: ${{ env.BUILD_CONTAINER_DIGEST }}
+          HARBORGATE_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          bash scripts/build_harborgate_k3_deb.sh
+          (cd dist/harborgate-debs && sha256sum --check ./*.sha256)
+          bash scripts/test_deb_lifecycle.sh dist/harborgate-debs/*.deb

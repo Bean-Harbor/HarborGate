@@ -1,16 +1,30 @@
 [Unit]
 Description=HarborOS IM Gateway Service
-After=network.target
+After=network-online.target harboros-bootstrap.service
+Wants=network-online.target
+Requires=harboros-bootstrap.service
+RequiresMountsFor=/data
 
 [Service]
 Type=simple
+UMask=0077
+Environment=IM_AGENT_HOST=127.0.0.1
+Environment=IM_AGENT_PORT=8787
+Environment=IM_AGENT_CONTRACT_VERSION=2.0
+Environment=IM_AGENT_DATA_DIR=/data/harborgate/sessions
+Environment=IM_AGENT_STATE_DIR=/data/harborgate
+Environment=WEIXIN_STATE_DIR=/data/harborgate/weixin
+Environment=FEISHU_MAIL_TOKEN_STATE_PATH=/data/harborgate/feishu-mail-token.json
 Environment=HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
-EnvironmentFile=-/etc/default/harboros-beacon-gate
-EnvironmentFile=-/etc/default/harboros-im-gate
+EnvironmentFile=/data/harboros/secrets/beacon-gate.env
 ExecStart=/usr/bin/harboros-im-gate
-Restart=always
+Restart=on-failure
 RestartSec=5s
-StateDirectory=harboros-im-gate
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/data/harborgate
 
 [Install]
 WantedBy=multi-user.target
