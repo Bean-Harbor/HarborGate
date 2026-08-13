@@ -104,6 +104,8 @@ sed -e "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
 
 python3 scripts/generate_supply_chain.py \
   --cargo-lock "$repo_root/Cargo.lock" \
+  --cargo-toml "$repo_root/Cargo.toml" \
+  --license "$repo_root/LICENSE" \
   --binary "$pkg_dir/usr/bin/harboros-im-gate" \
   --version "$DEBIAN_VERSION" \
   --target "$target" \
@@ -121,21 +123,41 @@ SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" dpkg-deb \
   --root-owner-group --build --uniform-compression -Zxz -z9 \
   "$pkg_dir" "$artifact"
 install -m 0644 \
-  "$pkg_dir/usr/share/doc/harboros-im-gate/build-provenance.json" \
-  "$out_dir/${material_prefix}.provenance.json"
-install -m 0644 \
   "$pkg_dir/usr/share/doc/harboros-im-gate/sbom.spdx.json" \
   "$out_dir/${material_prefix}.sbom.spdx.json"
 install -m 0644 \
   "$pkg_dir/usr/share/doc/harboros-im-gate/sbom.cdx.json" \
   "$out_dir/${material_prefix}.sbom.cdx.json"
 install -m 0644 \
+  "$pkg_dir/usr/share/doc/harboros-im-gate/license-review.json" \
+  "$out_dir/${material_prefix}.license-review.json"
+install -m 0644 \
   "$pkg_dir/usr/share/harboros/component-contracts/harboros-im-gate.json" \
   "$out_dir/${material_prefix}.component-contract.json"
 install -m 0644 \
   "$pkg_dir/usr/share/doc/harboros-im-gate/k3-runtime-evidence-required.json" \
   "$out_dir/${material_prefix}.k3-runtime-evidence-required.json"
+python3 scripts/generate_package_provenance.py \
+  --artifact "$artifact" \
+  --cargo-lock "$repo_root/Cargo.lock" \
+  --cargo-toml "$repo_root/Cargo.toml" \
+  --license "$repo_root/LICENSE" \
+  --version "$DEBIAN_VERSION" \
+  --target "$target" \
+  --arch "$deb_arch" \
+  --source-commit "$source_commit" \
+  --source-date-epoch "$SOURCE_DATE_EPOCH" \
+  --container-digest "$HARBORGATE_BUILD_CONTAINER_DIGEST" \
+  --debian-snapshot "$HARBORGATE_DEBIAN_SNAPSHOT" \
+  --output "$out_dir/${material_prefix}.provenance.json"
 touch --date="@${SOURCE_DATE_EPOCH}" "$out_dir/${material_prefix}."*.json
+python3 scripts/generate_artifact_set.py \
+  --bundle "$out_dir" \
+  --prefix "$material_prefix" \
+  --version "$DEBIAN_VERSION" \
+  --arch "$deb_arch" \
+  --output "$out_dir/${material_prefix}.artifact-set.json"
+touch --date="@${SOURCE_DATE_EPOCH}" "$out_dir/${material_prefix}.artifact-set.json"
 (
   cd "$out_dir"
   sha256sum "$(basename "$artifact")" > "$(basename "$artifact").sha256"
@@ -143,9 +165,13 @@ touch --date="@${SOURCE_DATE_EPOCH}" "$out_dir/${material_prefix}."*.json
     "${material_prefix}.provenance.json" \
     "${material_prefix}.sbom.spdx.json" \
     "${material_prefix}.sbom.cdx.json" \
+    "${material_prefix}.license-review.json" \
     "${material_prefix}.component-contract.json" \
     "${material_prefix}.k3-runtime-evidence-required.json" \
+    "${material_prefix}.artifact-set.json" \
     > "$(basename "$artifact").materials.sha256"
+  python3 "$repo_root/scripts/verify_release_bundle.py" \
+    . --arch "$deb_arch" --version "$DEBIAN_VERSION"
 )
 
 printf '%s\n' "$artifact"

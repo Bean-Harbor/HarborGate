@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate deterministic SBOM and provenance documents for HarborGate."""
+"""Generate deterministic SBOM and fail-closed license review documents."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import datetime as dt
 import hashlib
 import json
 import re
-import subprocess
 import tomllib
 import uuid
 from pathlib import Path
@@ -40,14 +39,91 @@ def cargo_components(lock_path: Path) -> list[dict[str, str]]:
     ]
 
 
-def command_version(*command: str) -> str:
-    completed = subprocess.run(command, check=True, capture_output=True, text=True)
-    return (completed.stdout or completed.stderr).strip()
+def license_review(
+    cargo_toml_path: Path,
+    cargo_lock_path: Path,
+    license_path: Path,
+    package_name: str,
+    package_version: str,
+    arch: str,
+    created: str,
+) -> dict[str, object]:
+    cargo_toml = tomllib.loads(cargo_toml_path.read_text(encoding="utf-8"))
+    declared_license = cargo_toml.get("package", {}).get("license")
+    if not isinstance(declared_license, str) or not declared_license.strip():
+        raise ValueError("Cargo.toml package.license is required")
+
+    license_text = license_path.read_text(encoding="utf-8")
+    copyright_notices = [
+        line.strip()
+        for line in license_text.splitlines()
+        if line.strip().lower().startswith("copyright ")
+    ]
+    if not copyright_notices:
+        raise ValueError("LICENSE must contain an explicit copyright notice")
+
+    locked_packages = tomllib.loads(cargo_lock_path.read_text(encoding="utf-8")).get(
+        "package", []
+    )
+    dependencies = []
+    for package in locked_packages:
+        if package.get("name") == cargo_toml["package"].get("name") and not package.get(
+            "source"
+        ):
+            continue
+        dependencies.append(
+            {
+                "name": package["name"],
+                "version": package["version"],
+                "source": package.get("source", "NOASSERTION"),
+                "checksum": package.get("checksum", "NOASSERTION"),
+                "declared_license": "NOASSERTION",
+                "copyright": "NOASSERTION",
+                "review_basis": "not-present-in-repository-cargo-or-license-materials",
+            }
+        )
+
+    unresolved = len(dependencies)
+    return {
+        "schema_version": 1,
+        "package": package_name,
+        "version": package_version,
+        "architecture": arch,
+        "reviewed_at": created,
+        "review_status": "reviewed_against_repository_materials",
+        "policy": "fail-closed",
+        "release_eligible": unresolved == 0,
+        "root_component": {
+            "declared_license": declared_license,
+            "copyright_notices": copyright_notices,
+        },
+        "reviewed_sources": [
+            {"path": "Cargo.toml", "sha256": sha256(cargo_toml_path)},
+            {"path": "Cargo.lock", "sha256": sha256(cargo_lock_path)},
+            {"path": "LICENSE", "sha256": sha256(license_path)},
+        ],
+        "dependency_summary": {
+            "total": unresolved,
+            "resolved": 0,
+            "unresolved": unresolved,
+        },
+        "dependencies": dependencies,
+        "blocking_reasons": (
+            [
+                "Cargo.lock does not contain dependency license/copyright evidence; "
+                "no license was inferred from package names or external knowledge."
+            ]
+            if unresolved
+            else []
+        ),
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cargo-lock", type=Path, required=True)
+    parser.add_argument("--cargo-toml", type=Path, required=True)
+    parser.add_argument("--license", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--target", required=True)
@@ -170,65 +246,21 @@ def main() -> None:
             for component in components
         ],
     }
-    provenance = {
-        "_type": "https://in-toto.io/Statement/v1",
-        "subject": [
-            {"name": "harboros-im-gate", "digest": {"sha256": root["checksum"]}}
-        ],
-        "predicateType": "https://slsa.dev/provenance/v1",
-        "predicate": {
-            "buildDefinition": {
-                "buildType": "https://harboros.ai/build-types/rust-deb/v1",
-                "externalParameters": {
-                    "target": args.target,
-                    "arch": args.arch,
-                    "version": args.version,
-                    "source_date_epoch": args.source_date_epoch,
-                    "debian_snapshot": args.debian_snapshot,
-                },
-                "resolvedDependencies": [
-                    {
-                        "uri": (
-                            "git+https://github.com/Bean-Harbor/HarborGate@"
-                            f"{args.source_commit}"
-                        ),
-                        "digest": {"gitCommit": args.source_commit},
-                    },
-                    {
-                        "uri": "Cargo.lock",
-                        "digest": {"sha256": sha256(args.cargo_lock)},
-                    },
-                    {
-                        "uri": (
-                            "https://snapshot.debian.org/archive/debian/"
-                            f"{args.debian_snapshot}/"
-                        )
-                    },
-                ],
-            },
-            "runDetails": {
-                "builder": {"id": args.container_digest},
-                "metadata": {
-                    "invocationId": (
-                        f"harboros-im-gate-{args.source_commit}-{args.arch}"
-                    ),
-                    "startedOn": created,
-                    "toolchain": {
-                        "cargo": command_version("cargo", "--version"),
-                        "dpkg_deb": command_version("dpkg-deb", "--version").splitlines()[0],
-                        "python": command_version("python3", "--version"),
-                        "rustc": command_version("rustc", "--version", "--verbose"),
-                    },
-                },
-            },
-        },
-    }
+    review = license_review(
+        args.cargo_toml,
+        args.cargo_lock,
+        args.license,
+        root["name"],
+        root["version"],
+        args.arch,
+        created,
+    )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for name, payload in (
         ("sbom.spdx.json", spdx),
         ("sbom.cdx.json", cyclonedx),
-        ("build-provenance.json", provenance),
+        ("license-review.json", review),
     ):
         (args.output_dir / name).write_text(
             json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
