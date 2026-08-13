@@ -28,6 +28,9 @@ jobs:
           fetch-depth: 0
           ref: refs/tags/v${{ inputs.tag }}
 
+      - name: Trust the checked-out container workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Verify tag and source commit
         run: |
           test "$(git rev-list -n 1 "refs/tags/v${DEBIAN_VERSION}")" = "$(git rev-parse HEAD)"

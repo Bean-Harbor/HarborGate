@@ -35,6 +35,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Trust the checked-out container workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install fixed packaging toolchain
         env:
           HARBORGATE_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
@@ -73,6 +75,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Trust the checked-out container workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install fixed packaging toolchain
         env:
           HARBORGATE_DEBIAN_SNAPSHOT: ${{ env.DEBIAN_SNAPSHOT }}
