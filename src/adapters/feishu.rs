@@ -952,8 +952,7 @@ fn native_image_attachment_from_value(
 
 fn safe_multipart_filename(file_name: &str) -> String {
     let cleaned = file_name
-        .replace('\\', "_")
-        .replace('/', "_")
+        .replace(['\\', '/'], "_")
         .replace('"', "")
         .trim()
         .to_string();

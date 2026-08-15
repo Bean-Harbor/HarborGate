@@ -13,8 +13,10 @@ const HARBOROS_AUTH_WEBSOCKET_URL: &str = "ws://127.0.0.1:6000/api/current";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarborOsPrincipal {
+    pub source: String,
     pub principal_id: String,
     pub roles: Vec<String>,
+    pub camera_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,8 +158,10 @@ fn principal_from_login_response(
         return Err(HarborOsAuthFailure::FullAdminRequired);
     }
     Ok(HarborOsPrincipal {
+        source: "harboros".to_string(),
         principal_id: format!("harboros:uid:{}", user_info.pw_uid),
         roles,
+        camera_scope: None,
     })
 }
 

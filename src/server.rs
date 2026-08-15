@@ -1,15 +1,19 @@
 use crate::config::AppConfig;
+use crate::device_session::{DeviceSessionError, DeviceSessionStore, ExchangedDeviceSession};
 use crate::error::GatewayError;
 use crate::gateway::GatewayService;
 use crate::harboros_auth::{
     HarborOsAuthFailure, HarborOsAuthenticator, HarborOsPrincipal, MiddlewareHarborOsAuthenticator,
 };
-use crate::runtime::{maybe_start_feishu_websocket_runtime, maybe_start_weixin_poll_runtime};
+use crate::runtime::{
+    maybe_start_feishu_websocket_runtime, maybe_start_weixin_poll_runtime,
+    start_delivery_recovery_runtime,
+};
 use crate::setup::SetupPortalService;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{
-    header::{AUTHORIZATION, CONTENT_TYPE},
+    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
     HeaderMap, HeaderValue, Method, StatusCode,
 };
 use axum::response::{Html, IntoResponse, Redirect};
@@ -26,7 +30,8 @@ use tracing::info;
 
 const HARBOR_GATE_PUBLIC_PREFIX: &str = "/api/harbor-gate";
 const HARBOROS_AUTH_TOKEN_HEADER: &str = "X-HarborOS-Auth-Token";
-const HARBOR_PRINCIPAL_SOURCE: &str = "harboros";
+const DEVICE_SESSION_COOKIE: &str = "harbornavi_device_session";
+const DEVICE_SESSION_TTL_SECONDS: u64 = 12 * 60 * 60;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -35,6 +40,7 @@ pub struct AppState {
     pub setup: Arc<SetupPortalService>,
     pub feishu_websocket_started: Arc<AtomicBool>,
     pub harboros_authenticator: Arc<dyn HarborOsAuthenticator>,
+    pub device_sessions: Arc<DeviceSessionStore>,
 }
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
@@ -47,12 +53,16 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
         feishu_websocket_started.clone(),
     );
     maybe_start_weixin_poll_runtime(gateway.clone(), config.enable_weixin_runtime);
+    start_delivery_recovery_runtime(gateway.clone());
     let state = AppState {
         config: config.clone(),
         setup: Arc::new(SetupPortalService::new(config.clone(), gateway.clone())),
         gateway,
         feishu_websocket_started,
         harboros_authenticator: Arc::new(MiddlewareHarborOsAuthenticator::default()),
+        device_sessions: Arc::new(DeviceSessionStore::new(
+            config.device_session_state_dir.clone(),
+        )),
     };
     let app = router(state);
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
@@ -78,6 +88,18 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/harbor-gate/api/gateway/status", get(gateway_status))
         .route("/api/harbor-gate/api/gateway/turns", post(gateway_turn))
+        .route(
+            "/api/harbor-gate/api/device-session",
+            get(device_session_status),
+        )
+        .route(
+            "/api/harbor-gate/api/device-session/exchange",
+            post(device_session_exchange),
+        )
+        .route(
+            "/api/harbor-gate/api/device-session/logout",
+            post(device_session_logout),
+        )
         .route("/api/harbor-assistant", any(harbor_assistant_proxy_root))
         .route("/api/harbor-assistant/{*path}", any(harbor_assistant_proxy))
         .route("/api/beacon", any(beacon_proxy_root))
@@ -268,6 +290,89 @@ async fn beacon_proxy(
     .await
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct DeviceSessionExchangeRequest {
+    pairing_code: String,
+}
+
+async fn device_session_exchange(
+    State(state): State<AppState>,
+    Json(payload): Json<DeviceSessionExchangeRequest>,
+) -> axum::response::Response {
+    let response = state
+        .device_sessions
+        .exchange(&payload.pairing_code, DEVICE_SESSION_TTL_SECONDS)
+        .map(device_session_response)
+        .unwrap_or_else(|error| device_session_gateway_error(error).into_response());
+    no_store_response(response)
+}
+
+async fn device_session_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let response = match device_session_cookie(&headers) {
+        Some(token) => match state.device_sessions.current(token) {
+            Ok(principal) => Json(json!({
+                "authenticated": true,
+                "camera_id": principal.camera_id,
+                "expires_at_epoch_seconds": principal.expires_at_epoch_seconds,
+            }))
+            .into_response(),
+            Err(error) => device_session_gateway_error(error).into_response(),
+        },
+        None => device_session_gateway_error(DeviceSessionError::InvalidSession).into_response(),
+    };
+    no_store_response(response)
+}
+
+async fn device_session_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(token) = device_session_cookie(&headers) {
+        match state.device_sessions.revoke(token) {
+            Ok(()) | Err(DeviceSessionError::InvalidSession) => {}
+            Err(error) => {
+                return no_store_response(device_session_gateway_error(error).into_response())
+            }
+        }
+    }
+    let mut response = Json(json!({"authenticated": false})).into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_static(
+            "harbornavi_device_session=; Path=/api/harbor-gate/; HttpOnly; SameSite=Strict; Max-Age=0",
+        ),
+    );
+    no_store_response(response)
+}
+
+fn no_store_response(mut response: axum::response::Response) -> axum::response::Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn device_session_response(exchanged: ExchangedDeviceSession) -> axum::response::Response {
+    let mut response = Json(json!({
+        "authenticated": true,
+        "camera_id": exchanged.principal.camera_id,
+        "expires_at_epoch_seconds": exchanged.principal.expires_at_epoch_seconds,
+    }))
+    .into_response();
+    let cookie = format!(
+        "{DEVICE_SESSION_COOKIE}={}; Path=/api/harbor-gate/; HttpOnly; SameSite=Strict; Max-Age={DEVICE_SESSION_TTL_SECONDS}",
+        exchanged.token
+    );
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("device session cookie"),
+    );
+    response
+}
+
 async fn prefixed_beacon_proxy_root(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -371,7 +476,7 @@ async fn proxy_beacon_request(
         ));
     }
     let principal = if requires_harboros_principal(&method, &target_path) {
-        Some(authenticate_harboros_request(&state, &headers).await?)
+        Some(authenticate_proxy_principal(&state, &method, &target_path, &headers).await?)
     } else {
         None
     };
@@ -728,6 +833,13 @@ fn is_identity_query_key(key: &str) -> bool {
 
 fn requires_harboros_principal(method: &Method, target_path: &str) -> bool {
     let path = target_path.split('?').next().unwrap_or(target_path);
+    const DETECTION_JOBS: &str = "/api/vision/detection-jobs";
+    if method == Method::GET && is_cat_detection_observation_proxy_path(path) {
+        return true;
+    }
+    if path == DETECTION_JOBS || path.starts_with(&format!("{DETECTION_JOBS}/")) {
+        return true;
+    }
     match (method, path) {
         (&Method::POST, "/api/knowledge/search")
         | (&Method::GET, "/api/knowledge/conversations")
@@ -739,6 +851,44 @@ fn requires_harboros_principal(method: &Method, target_path: &str) -> bool {
             }),
         _ => false,
     }
+}
+
+fn is_cat_detection_observation_proxy_path(path: &str) -> bool {
+    path.strip_prefix("/api/cameras/")
+        .and_then(|suffix| suffix.strip_suffix("/cat-detection/observation"))
+        .is_some_and(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
+}
+
+fn cat_detection_observation_camera_id(target_path: &str) -> Option<String> {
+    let path = target_path.split('?').next().unwrap_or(target_path);
+    path.strip_prefix("/api/cameras/")
+        .and_then(|suffix| suffix.strip_suffix("/cat-detection/observation"))
+        .filter(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
+        .map(str::to_string)
+}
+
+async fn authenticate_proxy_principal(
+    state: &AppState,
+    method: &Method,
+    target_path: &str,
+    headers: &HeaderMap,
+) -> Result<HarborOsPrincipal, GatewayError> {
+    if headers.contains_key(HARBOROS_AUTH_TOKEN_HEADER) {
+        return authenticate_harboros_request(state, headers).await;
+    }
+    if method != Method::GET {
+        return Err(harboros_auth_gateway_error(
+            HarborOsAuthFailure::InvalidToken,
+        ));
+    }
+    let camera_id = cat_detection_observation_camera_id(target_path)
+        .ok_or_else(|| harboros_auth_gateway_error(HarborOsAuthFailure::InvalidToken))?;
+    Ok(HarborOsPrincipal {
+        source: "harbornavi-lan".to_string(),
+        principal_id: "harbornavi-lan:anonymous".to_string(),
+        roles: vec!["CAMERA_VIEW".to_string()],
+        camera_scope: Some(camera_id),
+    })
 }
 
 async fn authenticate_harboros_request(
@@ -788,6 +938,45 @@ fn harboros_auth_gateway_error(failure: HarborOsAuthFailure) -> GatewayError {
     }
 }
 
+fn device_session_gateway_error(error: DeviceSessionError) -> GatewayError {
+    match error {
+        DeviceSessionError::InvalidPairing => GatewayError::new(
+            StatusCode::UNAUTHORIZED,
+            "DEVICE_PAIRING_FAILED",
+            "Pairing code is invalid or expired",
+        ),
+        DeviceSessionError::InvalidSession => GatewayError::new(
+            StatusCode::UNAUTHORIZED,
+            "DEVICE_SESSION_REQUIRED",
+            "A valid HarborNavi device session is required",
+        ),
+        DeviceSessionError::CameraDenied => GatewayError::new(
+            StatusCode::FORBIDDEN,
+            "DEVICE_CAMERA_ACCESS_DENIED",
+            "Device session is not authorized for this camera",
+        ),
+        DeviceSessionError::Unavailable(_) => GatewayError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DEVICE_SESSION_UNAVAILABLE",
+            "HarborNavi device session service is unavailable",
+        ),
+    }
+}
+
+fn device_session_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| {
+            (name.trim() == DEVICE_SESSION_COOKIE)
+                .then_some(value.trim())
+                .filter(|value| !value.is_empty() && value.len() <= 256)
+        })
+}
+
 fn beacon_upstream_headers(
     headers: &HeaderMap,
     harborbeacon_web_api_token: &str,
@@ -822,7 +1011,7 @@ fn beacon_upstream_headers(
         insert_trusted_header(
             &mut upstream,
             "X-Harbor-Principal-Source",
-            HARBOR_PRINCIPAL_SOURCE,
+            &principal.source,
         )?;
         insert_trusted_header(
             &mut upstream,
@@ -835,6 +1024,9 @@ fn beacon_upstream_headers(
             &principal.roles.join(","),
         )?;
         insert_trusted_header(&mut upstream, "X-Harbor-Workspace-Id", workspace_id.trim())?;
+        if let Some(camera_scope) = principal.camera_scope.as_deref() {
+            insert_trusted_header(&mut upstream, "X-Harbor-Camera-Scope", camera_scope)?;
+        }
     }
     Ok(upstream)
 }
@@ -975,10 +1167,14 @@ mod tests {
     }
 
     #[test]
-    fn harboros_authentication_is_limited_to_the_rag_json_contract() {
+    fn harboros_authentication_covers_rag_and_detection_job_contracts() {
         assert!(requires_harboros_principal(
             &axum::http::Method::POST,
             "/api/knowledge/search"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/cameras/camera-252/cat-detection/observation?stream_profile=sub"
         ));
         assert!(requires_harboros_principal(
             &axum::http::Method::GET,
@@ -995,6 +1191,30 @@ mod tests {
         assert!(requires_harboros_principal(
             &axum::http::Method::PATCH,
             "/api/knowledge/conversation-settings"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::POST,
+            "/api/vision/detection-jobs"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/vision/detection-jobs"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/vision/detection-jobs/job-1"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::POST,
+            "/api/vision/detection-jobs/job-1/renew"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::DELETE,
+            "/api/vision/detection-jobs/job-1"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::PATCH,
+            "/api/vision/detection-jobs/job-1/results/latest"
         ));
         assert!(!requires_harboros_principal(
             &axum::http::Method::GET,
