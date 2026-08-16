@@ -68,6 +68,9 @@ build_root="$(mktemp -d "${work_parent%/}/harborgate-deb.XXXXXX")"
 trap 'rm -rf -- "$build_root"' EXIT
 pkg_dir="${build_root}/root"
 cargo_target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
+artifact="${out_dir}/harboros-im-gate_${DEBIAN_VERSION}_${deb_arch}.deb"
+material_prefix="harboros-im-gate_${DEBIAN_VERSION}_${deb_arch}"
+third_party_material="${out_dir}/${material_prefix}.third-party-licenses.json"
 
 export CARGO_INCREMENTAL=0
 export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${repo_root}=."
@@ -104,10 +107,18 @@ sed -e "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
 sed -e "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
   debian/first-party-rights-approval.json.in \
   > "$pkg_dir/usr/share/doc/harboros-im-gate/first-party-rights-approval.json"
+python3 scripts/generate_third_party_licenses.py \
+  --cargo-lock "$repo_root/Cargo.lock" \
+  --cargo-toml "$repo_root/Cargo.toml" \
+  --target "$target" \
+  --arch "$deb_arch" \
+  --version "$DEBIAN_VERSION" \
+  --source-date-epoch "$SOURCE_DATE_EPOCH" \
+  --output "$third_party_material"
+install -m 0644 "$third_party_material" \
+  "$pkg_dir/usr/share/doc/harboros-im-gate/third-party-licenses.json"
 
 find "$pkg_dir" -print0 | xargs -0 touch --no-dereference --date="@${SOURCE_DATE_EPOCH}"
-artifact="${out_dir}/harboros-im-gate_${DEBIAN_VERSION}_${deb_arch}.deb"
-material_prefix="harboros-im-gate_${DEBIAN_VERSION}_${deb_arch}"
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" dpkg-deb \
   --root-owner-group --build --uniform-compression -Zxz -z9 \
   "$pkg_dir" "$artifact"
@@ -133,6 +144,7 @@ python3 scripts/generate_supply_chain.py \
   --license "$repo_root/LICENSE" \
   --artifact "$artifact" \
   --rights-approval "$out_dir/${material_prefix}.first-party-rights-approval.json" \
+  --third-party-licenses "$third_party_material" \
   --version "$DEBIAN_VERSION" \
   --target "$target" \
   --arch "$deb_arch" \

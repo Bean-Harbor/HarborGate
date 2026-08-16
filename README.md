@@ -90,11 +90,18 @@ closure.
 The bundle also records Harbor Innovations' first-party distribution approval
 inside the deb and in a byte-identical sidecar. That approval covers Gate's
 first-party source and brand materials for HarborNavi qualification only; it
-does not infer licenses for locked Cargo dependencies. Until those third-party
-materials are reviewed, `license-review.json` and the canonical
-`<deb>.release-materials.json` remain `blocked`/`release_eligible=false`. The
-full `<deb>.materials.sha256` manifest covers the final deb, descriptor, SBOMs,
-provenance, rights evidence, component contract, and every other sidecar.
+does not infer licenses for locked Cargo dependencies. The separate
+`third-party-licenses.json` evidence enumerates the target-specific normal/build
+closure from `cargo metadata`, verifies every downloaded `.crate` against its
+`Cargo.lock` checksum, and embeds the package-local license text and hashes.
+Development-only dependencies are excluded from the shipped target closure. A
+missing declaration, archive, or package-local license text keeps
+`license-review.json` and `<deb>.release-materials.json` fail-closed; a complete
+closure makes that package-material decision `approved`/`release_eligible=true`.
+This does not replace HarborOS's signed APT dependency-closure gate. The full
+`<deb>.materials.sha256` manifest covers the final deb, descriptor, SBOMs,
+provenance, rights evidence, component contract, third-party license evidence,
+and every other sidecar.
 
 ## Current Adapters
 

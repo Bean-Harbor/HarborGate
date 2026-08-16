@@ -79,6 +79,9 @@ def generate_materials(args: argparse.Namespace) -> dict[str, Path]:
         "root-license": args.output_dir / f"{prefix}.LICENSE",
         "sbom-cyclonedx": args.output_dir / f"{prefix}.sbom.cdx.json",
         "sbom-spdx": args.output_dir / f"{prefix}.sbom.spdx.json",
+        "third-party-licenses": (
+            args.output_dir / f"{prefix}.third-party-licenses.json"
+        ),
     }
     identities = {kind: identity(kind, path) for kind, path in paths.items()}
 
@@ -157,6 +160,7 @@ def generate_materials(args: argparse.Namespace) -> dict[str, Path]:
                 "provenance",
                 "sbom-spdx",
                 "sbom-cyclonedx",
+                "third-party-licenses",
             )
         ],
         "decision": decision,
@@ -176,6 +180,12 @@ def generate_materials(args: argparse.Namespace) -> dict[str, Path]:
             {
                 **identities["root-license"],
                 "installed_path": "/usr/share/doc/harboros-im-gate/copyright",
+            },
+            {
+                **identities["third-party-licenses"],
+                "installed_path": (
+                    "/usr/share/doc/harboros-im-gate/third-party-licenses.json"
+                ),
             },
         ],
         "materials": [identities[kind] for kind in sorted(identities)],

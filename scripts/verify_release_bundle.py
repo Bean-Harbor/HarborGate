@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import re
@@ -102,6 +103,7 @@ def verify_sboms(
     version: str,
     artifact_digest: str,
     decision: dict[str, Any],
+    third_party_dependencies: list[dict[str, Any]],
 ) -> None:
     spdx = load_canonical_json(bundle / f"{prefix}.sbom.spdx.json", "SPDX SBOM")
     packages = spdx.get("packages")
@@ -142,6 +144,28 @@ def verify_sboms(
         or describes != [expected_relationship]
     ):
         raise ValueError("SPDX package identities or DESCRIBES relationship are invalid")
+    expected_dependencies = {
+        (item["name"], item["version"]): item for item in third_party_dependencies
+    }
+    actual_dependencies = {
+        (item.get("name"), item.get("versionInfo")): item
+        for item in packages
+        if isinstance(item, dict) and item is not root
+    }
+    if len(expected_dependencies) != len(third_party_dependencies) or (
+        set(actual_dependencies) != set(expected_dependencies)
+    ):
+        raise ValueError("SPDX target dependency closure differs from license evidence")
+    for identity, expected in expected_dependencies.items():
+        actual = actual_dependencies[identity]
+        concluded = expected["concluded_license"]
+        if (
+            {"algorithm": "SHA256", "checksumValue": expected["checksum"]}
+            not in actual.get("checksums", [])
+            or actual.get("licenseConcluded") != concluded
+            or actual.get("licenseDeclared") != concluded
+        ):
+            raise ValueError(f"SPDX dependency decision differs: {identity}")
 
     cdx = load_canonical_json(bundle / f"{prefix}.sbom.cdx.json", "CycloneDX SBOM")
     component = cdx.get("metadata", {}).get("component", {})
@@ -165,6 +189,177 @@ def verify_sboms(
         }.items()
     ):
         raise ValueError("CycloneDX SBOM does not bind the final deb decision")
+    cdx_dependencies = cdx.get("components")
+    if not isinstance(cdx_dependencies, list):
+        raise ValueError("CycloneDX target dependency closure is absent")
+    actual_cdx = {
+        (item.get("name"), item.get("version")): item
+        for item in cdx_dependencies
+        if isinstance(item, dict)
+    }
+    if len(actual_cdx) != len(cdx_dependencies) or set(actual_cdx) != set(
+        expected_dependencies
+    ):
+        raise ValueError("CycloneDX target dependency closure differs from license evidence")
+    for identity, expected in expected_dependencies.items():
+        actual = actual_cdx[identity]
+        concluded = expected["concluded_license"]
+        expected_licenses = [] if concluded == "NOASSERTION" else [{"expression": concluded}]
+        if (
+            {"alg": "SHA-256", "content": expected["checksum"]}
+            not in actual.get("hashes", [])
+            or actual.get("licenses", []) != expected_licenses
+        ):
+            raise ValueError(f"CycloneDX dependency decision differs: {identity}")
+
+
+def verify_third_party_licenses(
+    path: Path, version: str, arch: str
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    evidence = load_canonical_json(path, "third-party license evidence")
+    expected_targets = {
+        "amd64": "x86_64-unknown-linux-gnu",
+        "riscv64": "riscv64gc-unknown-linux-gnu",
+    }
+    summary = evidence.get("dependency_summary")
+    scope = evidence.get("scope")
+    cargo_lock = evidence.get("cargo_lock")
+    dependencies = evidence.get("dependencies")
+    blockers = evidence.get("blocking_reasons")
+    if (
+        evidence.get("schema_version") != 1
+        or evidence.get("package") != PACKAGE_NAME
+        or evidence.get("version") != version
+        or evidence.get("architecture") != arch
+        or evidence.get("policy") != "cargo-locked-target-closure-license-evidence-v1"
+        or evidence.get("cargo_license_reference")
+        != (
+            "https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-"
+            "license-file-fields"
+        )
+        or not isinstance(cargo_lock, dict)
+        or cargo_lock.get("filename") != "Cargo.lock"
+        or not isinstance(cargo_lock.get("sha256"), str)
+        or not SHA256_RE.fullmatch(cargo_lock["sha256"])
+        or not isinstance(scope, dict)
+        or scope.get("target") != expected_targets.get(arch)
+        or scope.get("dependency_kinds") != ["build", "normal"]
+        or scope.get("dev_dependencies_included") is not False
+        or not isinstance(summary, dict)
+        or not isinstance(dependencies, list)
+        or not dependencies
+        or not isinstance(blockers, list)
+        or any(not isinstance(item, str) or not item for item in blockers)
+    ):
+        raise ValueError("third-party license evidence identity or scope is invalid")
+
+    seen = set()
+    resolved = 0
+    for dependency in dependencies:
+        if not isinstance(dependency, dict):
+            raise ValueError("third-party dependency evidence is invalid")
+        identity = (
+            dependency.get("name"),
+            dependency.get("version"),
+            dependency.get("source"),
+        )
+        checksum = dependency.get("checksum")
+        archive = dependency.get("archive")
+        materials = dependency.get("license_materials")
+        status = dependency.get("resolution_status")
+        if (
+            any(not isinstance(item, str) or not item for item in identity)
+            or identity in seen
+            or not isinstance(checksum, str)
+            or not SHA256_RE.fullmatch(checksum)
+            or not isinstance(archive, dict)
+            or not isinstance(materials, list)
+            or status not in {"resolved", "blocked"}
+        ):
+            raise ValueError("third-party dependency identity/checksum is invalid")
+        seen.add(identity)
+        if status == "resolved":
+            if (
+                archive.get("sha256") != checksum
+                or archive.get("verification_status")
+                != "verified-against-cargo-lock"
+                or not isinstance(archive.get("filename"), str)
+                or not archive["filename"].endswith(".crate")
+                or dependency.get("concluded_license") in {None, "", "NOASSERTION"}
+                or not isinstance(dependency.get("declared_license"), str)
+                or not dependency["declared_license"]
+                or not materials
+                or dependency.get("blocking_reasons")
+            ):
+                raise ValueError("resolved dependency lacks a license decision")
+            resolved += 1
+        else:
+            archive_is_verified = (
+                archive.get("sha256") == checksum
+                and archive.get("verification_status")
+                == "verified-against-cargo-lock"
+                and isinstance(archive.get("filename"), str)
+                and archive["filename"].endswith(".crate")
+            )
+            archive_is_unavailable = (
+                archive.get("expected_sha256") == checksum
+                and archive.get("verification_status")
+                == "unavailable-or-checksum-mismatch"
+                and isinstance(archive.get("expected_filename"), str)
+                and archive["expected_filename"].endswith(".crate")
+            )
+            if (
+                not (archive_is_verified or archive_is_unavailable)
+                or dependency.get("concluded_license") != "NOASSERTION"
+                or not dependency.get("blocking_reasons")
+            ):
+                raise ValueError("blocked dependency lacks an explicit blocker")
+        material_paths = set()
+        for material in materials:
+            if not isinstance(material, dict):
+                raise ValueError("third-party license material is invalid")
+            material_path = material.get("path")
+            encoding = material.get("encoding")
+            content = material.get("content")
+            digest = material.get("sha256")
+            if (
+                not isinstance(material_path, str)
+                or not material_path
+                or "\\" in material_path
+                or material_path.startswith("/")
+                or ".." in Path(material_path).parts
+                or material_path in material_paths
+                or encoding not in {"utf-8", "base64"}
+                or not isinstance(content, str)
+                or not isinstance(digest, str)
+                or not SHA256_RE.fullmatch(digest)
+            ):
+                raise ValueError("third-party license material identity is invalid")
+            material_paths.add(material_path)
+            try:
+                payload = (
+                    content.encode("utf-8")
+                    if encoding == "utf-8"
+                    else base64.b64decode(content, validate=True)
+                )
+            except (UnicodeError, ValueError) as exc:
+                raise ValueError("third-party license material encoding is invalid") from exc
+            if hashlib.sha256(payload).hexdigest() != digest:
+                raise ValueError("third-party license material content digest differs")
+
+    expected_summary = {
+        "resolved": resolved,
+        "total": len(dependencies),
+        "unresolved": len(dependencies) - resolved,
+    }
+    eligible = resolved == len(dependencies)
+    if (
+        summary != expected_summary
+        or evidence.get("release_eligible") is not eligible
+        or (not blockers) is not eligible
+    ):
+        raise ValueError("third-party license evidence decision is inconsistent")
+    return evidence, dependencies
 
 
 def verify_bundle(args: argparse.Namespace) -> None:
@@ -185,6 +380,7 @@ def verify_bundle(args: argparse.Namespace) -> None:
         f"{prefix}.provenance.json",
         f"{prefix}.sbom.cdx.json",
         f"{prefix}.sbom.spdx.json",
+        f"{prefix}.third-party-licenses.json",
     }
     expected_names = material_names | {descriptor_name, manifest_name}
     actual_names = {path.name for path in bundle.iterdir() if path.is_file()}
@@ -238,7 +434,7 @@ def verify_bundle(args: argparse.Namespace) -> None:
     binding_entries = identities(descriptor.get("bindings"), "release bindings")
     required_bindings = {
         "component-contract", "license-review", "provenance", "sbom-cyclonedx",
-        "sbom-spdx",
+        "sbom-spdx", "third-party-licenses",
     }
     if {item["kind"] for item in binding_entries} != required_bindings:
         raise ValueError("release bindings are incomplete")
@@ -267,10 +463,11 @@ def verify_bundle(args: argparse.Namespace) -> None:
         ):
             raise ValueError("installed evidence path is unsafe")
         installed_kinds.add(item["kind"])
-    if not {"component-contract", "first-party-rights", "root-license"}.issubset(
-        installed_kinds
-    ):
-        raise ValueError("installed evidence omits first-party approval or package identity")
+    if not {
+        "component-contract", "first-party-rights", "root-license",
+        "third-party-licenses",
+    }.issubset(installed_kinds):
+        raise ValueError("installed evidence omits package rights or license identity")
 
     expected_manifest = {
         descriptor_name: sha256(bundle / descriptor_name),
@@ -324,12 +521,47 @@ def verify_bundle(args: argparse.Namespace) -> None:
         raise ValueError("license review must report an unresolved dependency count")
     if eligible is not (unresolved == 0):
         raise ValueError("license review eligibility contradicts unresolved dependencies")
-    for dependency in review.get("dependencies", []):
-        if (
-            dependency.get("declared_license") != "NOASSERTION"
-            or dependency.get("copyright") != "NOASSERTION"
+    third_party_path = bundle / f"{prefix}.third-party-licenses.json"
+    third_party, third_party_dependencies = verify_third_party_licenses(
+        third_party_path, args.version, args.arch
+    )
+    if (
+        third_party.get("dependency_summary") != summary
+        or third_party.get("blocking_reasons") != blockers
+        or third_party.get("release_eligible") is not eligible
+    ):
+        raise ValueError("license review differs from third-party license evidence")
+    evidence_by_identity = {
+        (item["name"], item["version"], item["source"]): item
+        for item in third_party_dependencies
+    }
+    review_dependencies = review.get("dependencies")
+    if not isinstance(review_dependencies, list) or len(review_dependencies) != len(
+        evidence_by_identity
+    ):
+        raise ValueError("license review dependency closure is incomplete")
+    for dependency in review_dependencies:
+        if not isinstance(dependency, dict):
+            raise ValueError("license review dependency record is invalid")
+        identity = (
+            dependency.get("name"), dependency.get("version"), dependency.get("source")
+        )
+        evidence_dependency = evidence_by_identity.get(identity)
+        if evidence_dependency is None or (
+            dependency.get("checksum") != evidence_dependency.get("checksum")
+            or dependency.get("declared_license")
+            != evidence_dependency.get("declared_license")
+            or dependency.get("concluded_license")
+            != evidence_dependency.get("concluded_license")
+            or dependency.get("status")
+            != evidence_dependency.get("resolution_status")
+            or dependency.get("license_material_sha256")
+            != [
+                item["sha256"]
+                for item in evidence_dependency.get("license_materials", [])
+            ]
         ):
-            raise ValueError("dependency rights were inferred without repository evidence")
+            raise ValueError("license review dependency differs from package evidence")
     if args.require_release_eligible and not eligible:
         raise ValueError("license review blocks formal release")
 
@@ -372,7 +604,14 @@ def verify_bundle(args: argparse.Namespace) -> None:
     ):
         raise ValueError("provenance does not bind the descriptor source")
 
-    verify_sboms(bundle, prefix, args.version, artifact_digest, decision)
+    verify_sboms(
+        bundle,
+        prefix,
+        args.version,
+        artifact_digest,
+        decision,
+        third_party_dependencies,
+    )
 
     artifact_set = load_canonical_json(
         bundle / f"{prefix}.artifact-set.json", "artifact set"

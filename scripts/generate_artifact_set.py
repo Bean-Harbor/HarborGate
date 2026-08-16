@@ -33,6 +33,7 @@ def main() -> None:
         f"{args.prefix}.provenance.json",
         f"{args.prefix}.sbom.cdx.json",
         f"{args.prefix}.sbom.spdx.json",
+        f"{args.prefix}.third-party-licenses.json",
     ]
     payload = {
         "schema_version": 1,
