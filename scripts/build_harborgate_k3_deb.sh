@@ -158,6 +158,7 @@ python3 scripts/generate_package_provenance.py \
   --artifact "$artifact" \
   --cargo-lock "$repo_root/Cargo.lock" \
   --cargo-toml "$repo_root/Cargo.toml" \
+  --third-party-licenses "$third_party_material" \
   --license "$repo_root/LICENSE" \
   --rights-approval "$out_dir/${material_prefix}.first-party-rights-approval.json" \
   --version "$DEBIAN_VERSION" \

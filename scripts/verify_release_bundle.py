@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 PACKAGE_NAME = "harboros-im-gate"
@@ -31,6 +32,64 @@ def canonical_bytes(value: Any) -> bytes:
     return (json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
     )
+
+
+def canonical_json_sha256(value: object) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def cargo_dependency_records(
+    dependencies: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    records = []
+    identities = set()
+    purls = set()
+    for dependency in dependencies:
+        identity = (
+            dependency.get("name"),
+            dependency.get("version"),
+            dependency.get("source"),
+        )
+        checksum = dependency.get("checksum")
+        if (
+            not all(isinstance(item, str) and item for item in identity)
+            or identity in identities
+            or not isinstance(checksum, str)
+            or not SHA256_RE.fullmatch(checksum)
+        ):
+            raise ValueError("target Cargo dependency identity is invalid")
+        name, version, source = identity
+        purl = f"pkg:cargo/{quote(name, safe='.-~')}@{quote(version, safe='.-~')}"
+        if purl in purls:
+            raise ValueError(f"target Cargo dependency repeats a purl: {purl}")
+        identities.add(identity)
+        purls.add(purl)
+        records.append(
+            {
+                "checksum": checksum,
+                "name": name,
+                "purl": purl,
+                "source": source,
+                "version": version,
+            }
+        )
+    return sorted(records, key=lambda item: (item["name"], item["version"], item["source"]))
+
+
+def require_resolved_dependency(
+    dependencies: Any, *, uri: str, digest: dict[str, str], label: str
+) -> None:
+    expected = {"digest": digest, "uri": uri}
+    matches = [
+        item
+        for item in dependencies
+        if isinstance(item, dict) and item.get("uri") == uri
+    ] if isinstance(dependencies, list) else []
+    if matches != [expected]:
+        raise ValueError(f"{label} is absent, repeated, or malformed")
 
 
 def load_canonical_json(path: Path, label: str) -> dict[str, Any]:
@@ -278,13 +337,13 @@ def verify_third_party_licenses(
         ):
             raise ValueError("third-party dependency identity/checksum is invalid")
         seen.add(identity)
+        expected_archive_filename = f"{identity[0]}-{identity[1]}.crate"
         if status == "resolved":
             if (
                 archive.get("sha256") != checksum
                 or archive.get("verification_status")
                 != "verified-against-cargo-lock"
-                or not isinstance(archive.get("filename"), str)
-                or not archive["filename"].endswith(".crate")
+                or archive.get("filename") != expected_archive_filename
                 or dependency.get("concluded_license") in {None, "", "NOASSERTION"}
                 or not isinstance(dependency.get("declared_license"), str)
                 or not dependency["declared_license"]
@@ -298,15 +357,13 @@ def verify_third_party_licenses(
                 archive.get("sha256") == checksum
                 and archive.get("verification_status")
                 == "verified-against-cargo-lock"
-                and isinstance(archive.get("filename"), str)
-                and archive["filename"].endswith(".crate")
+                and archive.get("filename") == expected_archive_filename
             )
             archive_is_unavailable = (
                 archive.get("expected_sha256") == checksum
                 and archive.get("verification_status")
                 == "unavailable-or-checksum-mismatch"
-                and isinstance(archive.get("expected_filename"), str)
-                and archive["expected_filename"].endswith(".crate")
+                and archive.get("expected_filename") == expected_archive_filename
             )
             if (
                 not (archive_is_verified or archive_is_unavailable)
@@ -522,13 +579,13 @@ def verify_bundle(args: argparse.Namespace) -> None:
     if eligible is not (unresolved == 0):
         raise ValueError("license review eligibility contradicts unresolved dependencies")
     third_party_path = bundle / f"{prefix}.third-party-licenses.json"
-    third_party, third_party_dependencies = verify_third_party_licenses(
+    third_party_evidence, third_party_dependencies = verify_third_party_licenses(
         third_party_path, args.version, args.arch
     )
     if (
-        third_party.get("dependency_summary") != summary
-        or third_party.get("blocking_reasons") != blockers
-        or third_party.get("release_eligible") is not eligible
+        third_party_evidence.get("dependency_summary") != summary
+        or third_party_evidence.get("blocking_reasons") != blockers
+        or third_party_evidence.get("release_eligible") is not eligible
     ):
         raise ValueError("license review differs from third-party license evidence")
     evidence_by_identity = {
@@ -603,6 +660,22 @@ def verify_bundle(args: argparse.Namespace) -> None:
         for item in dependencies
     ):
         raise ValueError("provenance does not bind the descriptor source")
+    require_resolved_dependency(
+        dependencies,
+        uri="Cargo.lock",
+        digest={"sha256": third_party_evidence["cargo_lock"]["sha256"]},
+        label="provenance Cargo.lock dependency",
+    )
+    require_resolved_dependency(
+        dependencies,
+        uri="cargo-metadata:resolved-packages",
+        digest={
+            "sha256": canonical_json_sha256(
+                cargo_dependency_records(third_party_dependencies)
+            )
+        },
+        label="provenance target Cargo metadata dependency",
+    )
 
     verify_sboms(
         bundle,

@@ -7,6 +7,7 @@ import json
 import sys
 import tarfile
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -54,6 +55,30 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def cargo_dependency_records(dependencies: list[dict]) -> list[dict[str, str]]:
+    records = [
+        {
+            "checksum": item["checksum"],
+            "name": item["name"],
+            "purl": (
+                f"pkg:cargo/{quote(item['name'], safe='.-~')}@"
+                f"{quote(item['version'], safe='.-~')}"
+            ),
+            "source": item["source"],
+            "version": item["version"],
+        }
+        for item in dependencies
+    ]
+    return sorted(records, key=lambda item: (item["name"], item["version"], item["source"]))
+
+
+def canonical_json_sha256(value: object) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def write_json(path: Path, value: dict) -> None:
     path.write_bytes(
         (
@@ -91,6 +116,7 @@ def third_party_payload(
     arch: str = ARCH,
     resolved: bool = True,
     cargo_lock_sha256: str = "d" * 64,
+    dependency_count: int = 1,
 ) -> dict:
     license_content = "MIT License fixture\nCopyright (c) Dependency Authors\n"
     material = {
@@ -100,34 +126,43 @@ def third_party_payload(
         "path": "LICENSE",
         "sha256": hashlib.sha256(license_content.encode("utf-8")).hexdigest(),
     }
-    dependency = {
-        "archive": {
-            "filename": "dependency-1.0.0.crate",
-            "sha256": "c" * 64,
-            "verification_status": "verified-against-cargo-lock",
-        },
-        "cargo_package_id": (
-            "registry+https://github.com/rust-lang/crates.io-index#dependency@1.0.0"
-        ),
-        "checksum": "c" * 64,
-        "concluded_license": "MIT" if resolved else "NOASSERTION",
-        "declared_license": "MIT",
-        "dependency_kinds": ["normal"],
-        "features": [],
-        "license_materials": [material] if resolved else [],
-        "name": "dependency",
-        "resolution_status": "resolved" if resolved else "blocked",
-        "review_basis": (
-            "Cargo.lock checksum-verified crate archive, crate manifest declaration, "
-            "and embedded package-local license materials"
-            if resolved
-            else "fail-closed-unresolved-package-license-evidence"
-        ),
-        "source": "registry+https://github.com/rust-lang/crates.io-index",
-        "version": "1.0.0",
-    }
-    if not resolved:
-        dependency["blocking_reasons"] = ["package-local license text is absent"]
+    if dependency_count < 1 or dependency_count > 2:
+        raise ValueError("fixture dependency_count must be one or two")
+    dependencies = []
+    for index in range(dependency_count):
+        name = "dependency" if index == 0 else "dependency-two"
+        package_version = "1.0.0" if index == 0 else "2.0.0"
+        checksum = ("c" if index == 0 else "e") * 64
+        dependency = {
+            "archive": {
+                "filename": f"{name}-{package_version}.crate",
+                "sha256": checksum,
+                "verification_status": "verified-against-cargo-lock",
+            },
+            "cargo_package_id": (
+                "registry+https://github.com/rust-lang/crates.io-index"
+                f"#{name}@{package_version}"
+            ),
+            "checksum": checksum,
+            "concluded_license": "MIT" if resolved else "NOASSERTION",
+            "declared_license": "MIT",
+            "dependency_kinds": ["normal"],
+            "features": [],
+            "license_materials": [material] if resolved else [],
+            "name": name,
+            "resolution_status": "resolved" if resolved else "blocked",
+            "review_basis": (
+                "Cargo.lock checksum-verified crate archive, crate manifest declaration, "
+                "and embedded package-local license materials"
+                if resolved
+                else "fail-closed-unresolved-package-license-evidence"
+            ),
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "version": package_version,
+        }
+        if not resolved:
+            dependency["blocking_reasons"] = ["package-local license text is absent"]
+        dependencies.append(dependency)
     return {
         "architecture": arch,
         "blocking_reasons": [] if resolved else [DEPENDENCY_BLOCKER],
@@ -136,11 +171,11 @@ def third_party_payload(
             "license-file-fields"
         ),
         "cargo_lock": {"filename": "Cargo.lock", "sha256": cargo_lock_sha256},
-        "dependencies": [dependency],
+        "dependencies": dependencies,
         "dependency_summary": {
-            "resolved": 1 if resolved else 0,
-            "total": 1,
-            "unresolved": 0 if resolved else 1,
+            "resolved": dependency_count if resolved else 0,
+            "total": dependency_count,
+            "unresolved": 0 if resolved else dependency_count,
         },
         "generated_at": "2026-08-13T00:00:00Z",
         "package": PACKAGE,
@@ -294,6 +329,59 @@ def test_target_closure_excludes_dev_only_edges(tmp_path: Path) -> None:
     ]
 
 
+def test_package_provenance_digest_uses_exact_target_non_dev_lock_records(
+    tmp_path: Path,
+) -> None:
+    generator = load_script("generate_package_provenance.py")
+    manifest = tmp_path / "Cargo.toml"
+    manifest.write_text('[package]\nname="root"\nversion="1.0.0"\n', encoding="utf-8")
+    source = "registry+https://github.com/rust-lang/crates.io-index"
+    normal_id = f"{source}#normal@1.0.0"
+    dev_id = f"{source}#dev@2.0.0"
+    root_id = "path+file:///root#root@1.0.0"
+    metadata = {
+        "packages": [
+            {"id": root_id, "manifest_path": str(manifest), "source": None},
+            {"id": normal_id, "name": "normal", "source": source, "version": "1.0.0"},
+            {"id": dev_id, "name": "dev", "source": source, "version": "2.0.0"},
+        ],
+        "resolve": {
+            "root": root_id,
+            "nodes": [
+                {
+                    "id": root_id,
+                    "deps": [
+                        {"pkg": normal_id, "dep_kinds": [{"kind": None}]},
+                        {"pkg": dev_id, "dep_kinds": [{"kind": "dev"}]},
+                    ],
+                },
+                {"id": normal_id, "deps": [], "features": []},
+                {"id": dev_id, "deps": [], "features": []},
+            ],
+        },
+    }
+    cargo_lock = tmp_path / "Cargo.lock"
+    cargo_lock.write_text(
+        'version = 4\n\n'
+        '[[package]]\nname = "normal"\nversion = "1.0.0"\n'
+        f'source = "{source}"\nchecksum = "{"1" * 64}"\n\n'
+        '[[package]]\nname = "dev"\nversion = "2.0.0"\n'
+        f'source = "{source}"\nchecksum = "{"2" * 64}"\n',
+        encoding="utf-8",
+    )
+    records = generator.target_dependency_records(metadata, manifest, cargo_lock)
+    assert records == [
+        {
+            "checksum": "1" * 64,
+            "name": "normal",
+            "purl": "pkg:cargo/normal@1.0.0",
+            "source": source,
+            "version": "1.0.0",
+        }
+    ]
+    assert generator.canonical_json_sha256(records) == canonical_json_sha256(records)
+
+
 def test_supply_chain_sboms_bind_the_final_deb_and_have_unique_spdx_ids(
     tmp_path: Path,
 ) -> None:
@@ -372,6 +460,7 @@ def make_bundle(
     arch: str = ARCH,
     commit: str = COMMIT,
     resolved: bool = True,
+    dependency_count: int = 1,
 ) -> str:
     prefix = f"{PACKAGE}_{version}_{arch}"
     deb = path / f"{prefix}.deb"
@@ -396,32 +485,37 @@ def make_bundle(
         path / f"{prefix}.k3-runtime-evidence-required.json",
         {"package": PACKAGE, "schema_version": 1, "source_commit": commit},
     )
-    third_party = third_party_payload(version=version, arch=arch, resolved=resolved)
+    third_party = third_party_payload(
+        version=version,
+        arch=arch,
+        resolved=resolved,
+        dependency_count=dependency_count,
+    )
     third_party_name = f"{prefix}.third-party-licenses.json"
     write_json(path / third_party_name, third_party)
-    evidence_dependency = third_party["dependencies"][0]
+    evidence_dependencies = third_party["dependencies"]
     blockers = third_party["blocking_reasons"]
-    concluded = evidence_dependency["concluded_license"]
     review = {
         "architecture": arch,
         "blocking_reasons": blockers,
         "dependencies": [
             {
                 "checksum": evidence_dependency["checksum"],
-                "concluded_license": concluded,
+                "concluded_license": evidence_dependency["concluded_license"],
                 "copyright": f"See {third_party_name} package-local materials.",
                 "declared_license": "MIT",
                 "license_material_sha256": [
                     item["sha256"] for item in evidence_dependency["license_materials"]
                 ],
-                "name": "dependency",
+                "name": evidence_dependency["name"],
                 "review_basis": (
                     "checksum-verified-crate-archive-and-package-local-license-materials"
                 ),
                 "source": evidence_dependency["source"],
                 "status": evidence_dependency["resolution_status"],
-                "version": "1.0.0",
+                "version": evidence_dependency["version"],
             }
+            for evidence_dependency in evidence_dependencies
         ],
         "dependency_summary": third_party["dependency_summary"],
         "first_party_rights": {"status": "approved"},
@@ -448,7 +542,19 @@ def make_bundle(
                         {
                             "digest": {"gitCommit": commit},
                             "uri": f"git+{SOURCE_REPO}@{commit}",
-                        }
+                        },
+                        {
+                            "digest": {"sha256": third_party["cargo_lock"]["sha256"]},
+                            "uri": "Cargo.lock",
+                        },
+                        {
+                            "digest": {
+                                "sha256": canonical_json_sha256(
+                                    cargo_dependency_records(evidence_dependencies)
+                                )
+                            },
+                            "uri": "cargo-metadata:resolved-packages",
+                        },
                     ]
                 }
             },
@@ -472,20 +578,23 @@ def make_bundle(
                     "licenseDeclared": "MIT",
                     "name": PACKAGE,
                     "versionInfo": version,
-                },
+                }
+            ]
+            + [
                 {
-                    "SPDXID": "SPDXRef-dependency",
+                    "SPDXID": f"SPDXRef-{evidence_dependency['name']}",
                     "checksums": [
                         {
                             "algorithm": "SHA256",
                             "checksumValue": evidence_dependency["checksum"],
                         }
                     ],
-                    "licenseConcluded": concluded,
-                    "licenseDeclared": concluded,
-                    "name": "dependency",
-                    "versionInfo": "1.0.0",
-                },
+                    "licenseConcluded": evidence_dependency["concluded_license"],
+                    "licenseDeclared": evidence_dependency["concluded_license"],
+                    "name": evidence_dependency["name"],
+                    "versionInfo": evidence_dependency["version"],
+                }
+                for evidence_dependency in evidence_dependencies
             ],
             "relationships": [
                 {
@@ -524,14 +633,23 @@ def make_bundle(
                         }
                     ],
                     **(
-                        {"licenses": [{"expression": concluded}]}
-                        if concluded != "NOASSERTION"
+                        {
+                            "licenses": [
+                                {
+                                    "expression": evidence_dependency[
+                                        "concluded_license"
+                                    ]
+                                }
+                            ]
+                        }
+                        if evidence_dependency["concluded_license"] != "NOASSERTION"
                         else {}
                     ),
-                    "name": "dependency",
+                    "name": evidence_dependency["name"],
                     "type": "library",
-                    "version": "1.0.0",
+                    "version": evidence_dependency["version"],
                 }
+                for evidence_dependency in evidence_dependencies
             ],
             "specVersion": "1.6",
             "version": 1,
@@ -676,10 +794,157 @@ def run_verifier(
         sys.argv = old_argv
 
 
+def refresh_bundle_indexes(path: Path, prefix: str) -> None:
+    artifact_set_path = path / f"{prefix}.artifact-set.json"
+    artifact_set = json.loads(artifact_set_path.read_text(encoding="utf-8"))
+    for item in artifact_set["artifacts"]:
+        item["sha256"] = sha256(path / item["name"])
+    write_json(artifact_set_path, artifact_set)
+
+    deb = path / f"{prefix}.deb"
+    descriptor_path = path / f"{deb.name}.release-materials.json"
+    descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    identities = {}
+    for item in descriptor["materials"]:
+        item["sha256"] = sha256(path / item["filename"])
+        identities[item["kind"]] = item
+    descriptor["bindings"] = [
+        dict(identities[item["kind"]]) for item in descriptor["bindings"]
+    ]
+    descriptor["installed_evidence"] = [
+        {
+            **identities[item["kind"]],
+            "installed_path": item["installed_path"],
+        }
+        for item in descriptor["installed_evidence"]
+    ]
+    write_json(descriptor_path, descriptor)
+    manifest_entries = {
+        descriptor_path.name: sha256(descriptor_path),
+        **{item["filename"]: item["sha256"] for item in descriptor["materials"]},
+    }
+    (path / f"{deb.name}.materials.sha256").write_bytes(
+        "".join(
+            f"{digest}  {name}\n" for name, digest in sorted(manifest_entries.items())
+        ).encode("ascii")
+    )
+
+
 def test_bundle_verifier_accepts_exact_canonical_bundle(tmp_path: Path) -> None:
     verifier = load_script("verify_release_bundle.py")
     make_bundle(tmp_path)
     run_verifier(verifier, tmp_path)
+
+
+def test_bundle_verifier_rejects_synchronized_dependency_deletion_with_fixed_provenance(
+    tmp_path: Path,
+) -> None:
+    verifier = load_script("verify_release_bundle.py")
+    prefix = make_bundle(tmp_path, dependency_count=2)
+
+    third_party_path = tmp_path / f"{prefix}.third-party-licenses.json"
+    third_party = json.loads(third_party_path.read_text(encoding="utf-8"))
+    removed = third_party["dependencies"].pop()
+    third_party["dependency_summary"] = {"resolved": 1, "total": 1, "unresolved": 0}
+    write_json(third_party_path, third_party)
+
+    review_path = tmp_path / f"{prefix}.license-review.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    review["dependencies"] = [
+        item
+        for item in review["dependencies"]
+        if (item["name"], item["version"])
+        != (removed["name"], removed["version"])
+    ]
+    review["dependency_summary"] = third_party["dependency_summary"]
+    write_json(review_path, review)
+
+    spdx_path = tmp_path / f"{prefix}.sbom.spdx.json"
+    spdx = json.loads(spdx_path.read_text(encoding="utf-8"))
+    spdx["packages"] = [
+        item
+        for item in spdx["packages"]
+        if (item["name"], item["versionInfo"])
+        != (removed["name"], removed["version"])
+    ]
+    write_json(spdx_path, spdx)
+
+    cdx_path = tmp_path / f"{prefix}.sbom.cdx.json"
+    cdx = json.loads(cdx_path.read_text(encoding="utf-8"))
+    cdx["components"] = [
+        item
+        for item in cdx["components"]
+        if (item["name"], item["version"])
+        != (removed["name"], removed["version"])
+    ]
+    write_json(cdx_path, cdx)
+    refresh_bundle_indexes(tmp_path, prefix)
+
+    with pytest.raises(ValueError, match="target Cargo metadata dependency"):
+        run_verifier(verifier, tmp_path)
+
+
+def test_bundle_verifier_rejects_coordinated_dependency_relabel_with_fixed_provenance(
+    tmp_path: Path,
+) -> None:
+    verifier = load_script("verify_release_bundle.py")
+    prefix = make_bundle(tmp_path)
+    old_name = "dependency"
+    old_version = "1.0.0"
+    new_name = "renamed-dependency"
+    new_version = "9.9.9"
+
+    third_party_path = tmp_path / f"{prefix}.third-party-licenses.json"
+    third_party = json.loads(third_party_path.read_text(encoding="utf-8"))
+    dependency = third_party["dependencies"][0]
+    dependency["name"] = new_name
+    dependency["version"] = new_version
+    dependency["cargo_package_id"] = f"{dependency['source']}#{new_name}@{new_version}"
+    dependency["archive"]["filename"] = f"{new_name}-{new_version}.crate"
+    write_json(third_party_path, third_party)
+
+    review_path = tmp_path / f"{prefix}.license-review.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    review["dependencies"][0]["name"] = new_name
+    review["dependencies"][0]["version"] = new_version
+    write_json(review_path, review)
+
+    spdx_path = tmp_path / f"{prefix}.sbom.spdx.json"
+    spdx = json.loads(spdx_path.read_text(encoding="utf-8"))
+    spdx_dependency = next(
+        item
+        for item in spdx["packages"]
+        if (item["name"], item["versionInfo"]) == (old_name, old_version)
+    )
+    spdx_dependency["name"] = new_name
+    spdx_dependency["versionInfo"] = new_version
+    spdx_dependency["SPDXID"] = f"SPDXRef-{new_name}"
+    write_json(spdx_path, spdx)
+
+    cdx_path = tmp_path / f"{prefix}.sbom.cdx.json"
+    cdx = json.loads(cdx_path.read_text(encoding="utf-8"))
+    cdx["components"][0]["name"] = new_name
+    cdx["components"][0]["version"] = new_version
+    write_json(cdx_path, cdx)
+    refresh_bundle_indexes(tmp_path, prefix)
+
+    with pytest.raises(ValueError, match="target Cargo metadata dependency"):
+        run_verifier(verifier, tmp_path)
+
+
+def test_bundle_verifier_rejects_crate_filename_not_bound_to_dependency_identity(
+    tmp_path: Path,
+) -> None:
+    verifier = load_script("verify_release_bundle.py")
+    prefix = make_bundle(tmp_path)
+    third_party_path = tmp_path / f"{prefix}.third-party-licenses.json"
+    third_party = json.loads(third_party_path.read_text(encoding="utf-8"))
+    third_party["dependencies"][0]["archive"]["filename"] = "other-1.0.0.crate"
+    write_json(third_party_path, third_party)
+    refresh_bundle_indexes(tmp_path, prefix)
+
+    with pytest.raises(ValueError, match="resolved dependency lacks a license decision"):
+        run_verifier(verifier, tmp_path)
 
 
 def test_bundle_verifier_rejects_tampered_deb(tmp_path: Path) -> None:

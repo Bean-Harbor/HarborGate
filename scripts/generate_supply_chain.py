@@ -144,6 +144,7 @@ def cargo_components(
         if identity in identities:
             raise ValueError("third-party license evidence repeats a dependency")
         identities.add(identity)
+        expected_archive_filename = f"{name}-{version}.crate"
         if status == "resolved":
             if (
                 not isinstance(concluded, str)
@@ -152,6 +153,7 @@ def cargo_components(
                 or not materials
                 or dependency.get("blocking_reasons")
                 or archive.get("sha256") != checksum
+                or archive.get("filename") != expected_archive_filename
                 or archive.get("verification_status")
                 != "verified-against-cargo-lock"
             ):
@@ -168,8 +170,25 @@ def cargo_components(
                 ):
                     raise ValueError("third-party license material is invalid")
             resolved += 1
-        elif concluded != "NOASSERTION" or not dependency.get("blocking_reasons"):
-            raise ValueError("blocked third-party dependency lacks an explicit blocker")
+        else:
+            archive_verified = (
+                archive.get("sha256") == checksum
+                and archive.get("filename") == expected_archive_filename
+                and archive.get("verification_status")
+                == "verified-against-cargo-lock"
+            )
+            archive_unavailable = (
+                archive.get("expected_sha256") == checksum
+                and archive.get("expected_filename") == expected_archive_filename
+                and archive.get("verification_status")
+                == "unavailable-or-checksum-mismatch"
+            )
+            if (
+                not (archive_verified or archive_unavailable)
+                or concluded != "NOASSERTION"
+                or not dependency.get("blocking_reasons")
+            ):
+                raise ValueError("blocked third-party dependency lacks an explicit blocker")
         components.append(
             {
                 "checksum": checksum,
