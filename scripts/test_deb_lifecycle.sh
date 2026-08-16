@@ -35,6 +35,7 @@ test -f /usr/lib/systemd/system/harboros-im-gate.service
 test -x /usr/lib/harborgate/ensure-data-layout
 test -f /usr/share/harboros/component-contracts/harboros-im-gate.json
 test -f /usr/share/doc/harboros-im-gate/k3-runtime-evidence-required.json
+test -f /usr/share/doc/harboros-im-gate/first-party-rights-approval.json
 test "$(stat -c '%a' /data/harborgate)" = "700"
 grep -Fq 'Environment=IM_AGENT_HOST=127.0.0.1' \
   /usr/lib/systemd/system/harboros-im-gate.service
@@ -46,6 +47,7 @@ grep -Fq 'EnvironmentFile=/data/harboros/secrets/beacon-gate.env' \
   /usr/lib/systemd/system/harboros-im-gate.service
 python3 -m json.tool /usr/share/harboros/component-contracts/harboros-im-gate.json >/dev/null
 python3 -m json.tool /usr/share/doc/harboros-im-gate/k3-runtime-evidence-required.json >/dev/null
+python3 -m json.tool /usr/share/doc/harboros-im-gate/first-party-rights-approval.json >/dev/null
 bash ./scripts/test_runtime_smoke.sh
 
 # Reinstalling the exact release exercises the package upgrade path without

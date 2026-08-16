@@ -24,7 +24,10 @@ def main() -> None:
 
     names = [
         f"{args.prefix}.deb",
+        f"{args.prefix}.deb.sha256",
+        f"{args.prefix}.LICENSE",
         f"{args.prefix}.component-contract.json",
+        f"{args.prefix}.first-party-rights-approval.json",
         f"{args.prefix}.k3-runtime-evidence-required.json",
         f"{args.prefix}.license-review.json",
         f"{args.prefix}.provenance.json",
@@ -40,8 +43,10 @@ def main() -> None:
             {"name": name, "sha256": sha256(args.bundle / name)} for name in names
         ],
     }
-    args.output.write_text(
-        json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8"
+    args.output.write_bytes(
+        (
+            json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
     )
 
 

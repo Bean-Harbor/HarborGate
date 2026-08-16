@@ -87,6 +87,15 @@ HarborOS central release resolver derives `Depends`, `Pre-Depends`, and
 tool versions are build-material provenance, not a substitute for that Ubuntu
 closure.
 
+The bundle also records Harbor Innovations' first-party distribution approval
+inside the deb and in a byte-identical sidecar. That approval covers Gate's
+first-party source and brand materials for HarborNavi qualification only; it
+does not infer licenses for locked Cargo dependencies. Until those third-party
+materials are reviewed, `license-review.json` and the canonical
+`<deb>.release-materials.json` remain `blocked`/`release_eligible=false`. The
+full `<deb>.materials.sha256` manifest covers the final deb, descriptor, SBOMs,
+provenance, rights evidence, component contract, and every other sidecar.
+
 ## Current Adapters
 
 - `feishu`: websocket receive, webhook callback compatibility, text send,

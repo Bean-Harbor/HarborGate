@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--cargo-lock", type=Path, required=True)
     parser.add_argument("--cargo-toml", type=Path, required=True)
     parser.add_argument("--license", type=Path, required=True)
+    parser.add_argument("--rights-approval", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--arch", required=True)
@@ -73,6 +74,10 @@ def main() -> None:
                     {"uri": "Cargo.toml", "digest": {"sha256": sha256(args.cargo_toml)}},
                     {"uri": "LICENSE", "digest": {"sha256": sha256(args.license)}},
                     {
+                        "uri": args.rights_approval.name,
+                        "digest": {"sha256": sha256(args.rights_approval)},
+                    },
+                    {
                         "uri": (
                             "https://snapshot.debian.org/archive/debian/"
                             f"{args.debian_snapshot}/"
@@ -95,8 +100,10 @@ def main() -> None:
             },
         },
     }
-    args.output.write_text(
-        json.dumps(provenance, ensure_ascii=True, indent=2) + "\n", encoding="utf-8"
+    args.output.write_bytes(
+        (
+            json.dumps(provenance, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
     )
 
 
