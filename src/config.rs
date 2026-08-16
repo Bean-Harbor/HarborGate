@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub port: u16,
     pub data_dir: PathBuf,
     pub state_dir: PathBuf,
+    pub device_session_state_dir: PathBuf,
     pub public_origin: String,
     pub contract_version: String,
     pub service_token: String,
@@ -96,11 +97,18 @@ impl AppConfig {
             ),
             "/api/turns",
         );
+        let device_session_state_dir = env_or_else("HARBORGATE_DEVICE_SESSION_STATE_DIR", || {
+            PathBuf::from(&state_dir)
+                .join("device-sessions")
+                .to_string_lossy()
+                .to_string()
+        });
         Self {
             host: env_or("IM_AGENT_HOST", "127.0.0.1"),
             port: env_or("IM_AGENT_PORT", "8787").parse().unwrap_or(8787),
             data_dir: PathBuf::from(data_dir),
             state_dir: PathBuf::from(state_dir),
+            device_session_state_dir: PathBuf::from(device_session_state_dir),
             public_origin: env_trim("IM_AGENT_PUBLIC_ORIGIN"),
             contract_version: env_or("IM_AGENT_CONTRACT_VERSION", "2.0"),
             service_token: env_trim("IM_AGENT_SERVICE_TOKEN"),
@@ -142,6 +150,10 @@ impl AppConfig {
         anyhow::ensure!(
             self.state_dir == Path::new("/data/harborgate"),
             "IM_AGENT_STATE_DIR must be /data/harborgate"
+        );
+        anyhow::ensure!(
+            self.device_session_state_dir == Path::new("/data/harborgate/device-sessions"),
+            "HARBORGATE_DEVICE_SESSION_STATE_DIR must be /data/harborgate/device-sessions"
         );
         anyhow::ensure!(
             self.weixin.state_dir == Path::new("/data/harborgate/weixin"),
@@ -518,6 +530,7 @@ mod tests {
         config.contract_version = "2.0".into();
         config.data_dir = PathBuf::from("/data/harborgate/sessions");
         config.state_dir = PathBuf::from("/data/harborgate");
+        config.device_session_state_dir = PathBuf::from("/data/harborgate/device-sessions");
         config.weixin.state_dir = PathBuf::from("/data/harborgate/weixin");
         config.feishu_mail.user_token_state_path = "/data/harborgate/feishu-mail-token.json".into();
         config.harborbeacon_base_url = "http://127.0.0.1:4174".into();
@@ -542,6 +555,11 @@ mod tests {
 
         let mut config = valid_k3_config();
         config.state_dir = PathBuf::from("/data/harboros/harborgate");
+        assert!(config.validate_k3_runtime().is_err());
+
+        let mut config = valid_k3_config();
+        config.device_session_state_dir =
+            PathBuf::from("/var/lib/harboros-im-gate/device-sessions");
         assert!(config.validate_k3_runtime().is_err());
 
         let mut config = valid_k3_config();

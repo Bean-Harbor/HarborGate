@@ -19,6 +19,7 @@ export IM_AGENT_PORT=8787
 export IM_AGENT_CONTRACT_VERSION=2.0
 export IM_AGENT_DATA_DIR=/data/harborgate/sessions
 export IM_AGENT_STATE_DIR=/data/harborgate
+export HARBORGATE_DEVICE_SESSION_STATE_DIR=/data/harborgate/device-sessions
 export WEIXIN_STATE_DIR=/data/harborgate/weixin
 export FEISHU_MAIL_TOKEN_STATE_PATH=/data/harborgate/feishu-mail-token.json
 export HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174

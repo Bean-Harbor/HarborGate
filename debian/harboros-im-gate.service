@@ -16,6 +16,7 @@ Environment=IM_AGENT_STATE_DIR=/data/harborgate
 Environment=WEIXIN_STATE_DIR=/data/harborgate/weixin
 Environment=FEISHU_MAIL_TOKEN_STATE_PATH=/data/harborgate/feishu-mail-token.json
 Environment=HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
+Environment=HARBORGATE_DEVICE_SESSION_STATE_DIR=/data/harborgate/device-sessions
 EnvironmentFile=/data/harboros/secrets/beacon-gate.env
 ExecStart=/usr/bin/harboros-im-gate
 Restart=on-failure

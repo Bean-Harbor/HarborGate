@@ -21,6 +21,26 @@ COPYRIGHT = "Copyright (c) 2026 Harborinno Ltd."
 DEPENDENCY_BLOCKER = "dependency 1.0.0: package-local license text is absent"
 
 
+def test_k3_service_keeps_device_sessions_in_the_persistent_writable_data_root() -> None:
+    service = (ROOT / "debian" / "harboros-im-gate.service").read_text(
+        encoding="utf-8"
+    )
+    layout = (ROOT / "scripts" / "ensure-data-layout").read_text(encoding="utf-8")
+
+    assert (
+        "Environment=HARBORGATE_DEVICE_SESSION_STATE_DIR="
+        "/data/harborgate/device-sessions"
+    ) in service
+    assert "EnvironmentFile=/data/harboros/secrets/beacon-gate.env" in service
+    assert "ProtectSystem=strict" in service
+    assert "ReadWritePaths=/data/harborgate" in service
+    assert "/var/lib/harboros-im-gate/device-sessions" not in service
+    assert "/etc/default/harboros-beacon-gate" not in service
+    assert "/etc/default/harboros-im-gate" not in service
+    assert '"$root/device-sessions"' in layout
+    assert 'install -d -m 0700' in layout
+
+
 def load_script(name: str):
     path = ROOT / "scripts" / name
     spec = importlib.util.spec_from_file_location(path.stem, path)

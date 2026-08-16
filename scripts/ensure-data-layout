@@ -2,10 +2,10 @@
 set -eu
 
 root=/data/harborgate
-for path in "$root" "$root/sessions" "$root/weixin"; do
+for path in "$root" "$root/sessions" "$root/weixin" "$root/device-sessions"; do
   if [ -L "$path" ]; then
     echo "error: refusing symlinked HarborGate data path: $path" >&2
     exit 1
   fi
 done
-install -d -m 0700 "$root" "$root/sessions" "$root/weixin"
+install -d -m 0700 "$root" "$root/sessions" "$root/weixin" "$root/device-sessions"

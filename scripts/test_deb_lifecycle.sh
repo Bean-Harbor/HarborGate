@@ -38,13 +38,18 @@ test -f /usr/share/doc/harboros-im-gate/k3-runtime-evidence-required.json
 test -f /usr/share/doc/harboros-im-gate/first-party-rights-approval.json
 test -f /usr/share/doc/harboros-im-gate/third-party-licenses.json
 test "$(stat -c '%a' /data/harborgate)" = "700"
+test "$(stat -c '%a' /data/harborgate/device-sessions)" = "700"
 grep -Fq 'Environment=IM_AGENT_HOST=127.0.0.1' \
+  /usr/lib/systemd/system/harboros-im-gate.service
+grep -Fq 'Environment=HARBORGATE_DEVICE_SESSION_STATE_DIR=/data/harborgate/device-sessions' \
   /usr/lib/systemd/system/harboros-im-gate.service
 grep -Fq 'Requires=harboros-bootstrap.service' \
   /usr/lib/systemd/system/harboros-im-gate.service
 grep -Fq 'EnvironmentFile=/data/harboros/secrets/beacon-gate.env' \
   /usr/lib/systemd/system/harboros-im-gate.service
 ! grep -Fq '/etc/default/harboros-im-gate' \
+  /usr/lib/systemd/system/harboros-im-gate.service
+! grep -Fq '/etc/default/harboros-beacon-gate' \
   /usr/lib/systemd/system/harboros-im-gate.service
 python3 -m json.tool /usr/share/harboros/component-contracts/harboros-im-gate.json >/dev/null
 python3 -m json.tool /usr/share/doc/harboros-im-gate/k3-runtime-evidence-required.json >/dev/null

@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod config;
+pub mod device_session;
 pub mod error;
 pub mod gateway;
 pub mod harborbeacon;
