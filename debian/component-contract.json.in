@@ -6,6 +6,8 @@
         "harboros-auth-token-validation",
         "external-riscv64-runtime-evidence-required",
         "loopback-only",
+        "per-artifact-video-delivery",
+        "persistent-delivery-retry",
         "platform-credential-ownership",
         "service-bearer-redaction"
       ],

@@ -22,6 +22,34 @@ COPYRIGHT = "Copyright (c) 2026 Harborinno Ltd."
 DEPENDENCY_BLOCKER = "dependency 1.0.0: package-local license text is absent"
 
 
+def test_component_contract_records_existing_delivery_semantics() -> None:
+    contract = json.loads(
+        (ROOT / "debian" / "component-contract.json.in").read_text(encoding="utf-8")
+    )
+
+    assert contract == {
+        "contracts": [
+            {
+                "capabilities": [
+                    "beacon-gate-contract-2.0",
+                    "harboros-auth-token-validation",
+                    "external-riscv64-runtime-evidence-required",
+                    "loopback-only",
+                    "per-artifact-video-delivery",
+                    "persistent-delivery-retry",
+                    "platform-credential-ownership",
+                    "service-bearer-redaction",
+                ],
+                "id": "harboros.k3.gate-v2-transport",
+                "version": 1,
+            }
+        ],
+        "package": "harboros-im-gate",
+        "schema_version": 1,
+        "source_commit": "SOURCE_COMMIT_PLACEHOLDER",
+    }
+
+
 def test_k3_service_keeps_device_sessions_in_the_persistent_writable_data_root() -> None:
     service = (ROOT / "debian" / "harboros-im-gate.service").read_text(
         encoding="utf-8"
