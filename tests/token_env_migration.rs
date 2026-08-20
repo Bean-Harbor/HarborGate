@@ -193,10 +193,7 @@ fn legacy_upgrade_parses_quoted_and_unquoted_environment_values() {
 
         let output = run_writer("prepare", &auth_dir, &legacy_env, None);
 
-        assert_success_without_secret_output(
-            &output,
-            &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN],
-        );
+        assert_success_without_secret_output(&output, &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN]);
         assert_eq!(
             credential(&auth_dir, "gate-to-beacon.send"),
             G2B_LEGACY_TOKEN
@@ -225,11 +222,7 @@ fn invalid_known_legacy_assignment_fails_without_generating_credentials() {
         let output = run_writer("prepare", &auth_dir, &legacy_env, None);
 
         assert!(!output.status.success());
-        assert!(
-            CREDENTIALS
-                .iter()
-                .all(|name| !auth_dir.join(name).exists())
-        );
+        assert!(CREDENTIALS.iter().all(|name| !auth_dir.join(name).exists()));
         assert!(!auth_dir.join(".credential-transaction").exists());
     }
 }
@@ -255,11 +248,7 @@ fn recover_mode_never_initializes_or_rotates_credentials() {
 
     let uninitialized = run_writer("recover", &auth_dir, &legacy_env, None);
     assert!(!uninitialized.status.success());
-    assert!(
-        CREDENTIALS
-            .iter()
-            .all(|name| !auth_dir.join(name).exists())
-    );
+    assert!(CREDENTIALS.iter().all(|name| !auth_dir.join(name).exists()));
 
     assert_success_without_secret_output(&run_writer("prepare", &auth_dir, &legacy_env, None), &[]);
     let before = snapshot(&auth_dir);
@@ -355,7 +344,10 @@ fn journal_boundaries_recover_prepared_or_keep_committed_snapshot() {
 
         let interrupted = run_writer("switch", &auth_dir, &legacy_env, Some(failpoint));
 
-        assert!(!interrupted.status.success(), "failpoint succeeded: {failpoint}");
+        assert!(
+            !interrupted.status.success(),
+            "failpoint succeeded: {failpoint}"
+        );
         assert_no_secret_output(&interrupted, &[LEGACY_TOKEN]);
         let transaction = auth_dir.join(".credential-transaction");
         assert!(transaction.is_dir());
