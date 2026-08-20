@@ -1,0 +1,145 @@
+#!/bin/bash
+set -euo pipefail
+
+env_file="${HARBORBEACON_GATE_ENV_FILE:-/etc/default/harboros-beacon-gate}"
+env_dir="$(dirname "$env_file")"
+tmp_file=""
+backup_file=""
+replaced=0
+had_original=0
+
+cleanup() {
+  local status="$?"
+  trap - EXIT
+
+  if [ "$status" -ne 0 ]; then
+    [ -z "$tmp_file" ] || rm -f -- "$tmp_file"
+    if [ "$replaced" -eq 1 ] && [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
+      mv -f -- "$backup_file" "$env_file"
+      sync -f "$env_file" || true
+      sync -f "$env_dir" || true
+    elif [ "$replaced" -eq 1 ] && [ "$had_original" -eq 0 ]; then
+      rm -f -- "$env_file"
+      sync -f "$env_dir" || true
+    fi
+  elif [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
+    rm -f -- "$backup_file"
+    sync -f "$env_dir"
+  fi
+
+  exit "$status"
+}
+trap cleanup EXIT
+
+read_value() {
+  local key="$1"
+  local line
+  local value=""
+
+  [ -f "$env_file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "${key}="*) value="${line#*=}" ;;
+    esac
+  done < "$env_file"
+  printf '%s' "$value"
+}
+
+valid_token() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{32,}$ ]]
+}
+
+generate_token() {
+  local token=""
+  if command -v openssl >/dev/null 2>&1; then
+    token="$(openssl rand -hex 32 2>/dev/null || true)"
+  fi
+  if ! valid_token "$token"; then
+    token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
+  valid_token "$token"
+  printf '%s' "$token"
+}
+
+generate_unique_token() {
+  local first="$1"
+  local second="${2:-}"
+  local token
+
+  while true; do
+    token="$(generate_token)"
+    if [[ "$token" != "$first" && ( -z "$second" || "$token" != "$second" ) ]]; then
+      printf '%s' "$token"
+      return 0
+    fi
+  done
+}
+
+if [ -L "$env_file" ]; then
+  echo "refusing to replace a symlinked HarborBeacon Gate environment file" >&2
+  exit 1
+fi
+
+install -d -m 0755 "$env_dir"
+umask 077
+
+web_token="$(read_value HARBORBEACON_WEB_API_TOKEN)"
+task_token="$(read_value HARBOR_TASK_API_BEARER_TOKEN)"
+im_token="$(read_value IM_AGENT_SERVICE_TOKEN)"
+
+if ! valid_token "$web_token"; then
+  web_token="$(generate_token)"
+fi
+if ! valid_token "$task_token" || [ "$task_token" = "$web_token" ]; then
+  task_token="$(generate_unique_token "$web_token")"
+fi
+if ! valid_token "$im_token" || [ "$im_token" = "$web_token" ] || [ "$im_token" = "$task_token" ]; then
+  im_token="$(generate_unique_token "$web_token" "$task_token")"
+fi
+
+tmp_file="$(mktemp "${env_file}.tmp.XXXXXX")"
+if [ -f "$env_file" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      HARBOR_TASK_API_BEARER_TOKEN=*|HARBORBEACON_WEB_API_TOKEN=*|IM_AGENT_SERVICE_TOKEN=*) ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$env_file" > "$tmp_file"
+fi
+{
+  printf 'HARBOR_TASK_API_BEARER_TOKEN=%s\n' "$task_token"
+  printf 'HARBORBEACON_WEB_API_TOKEN=%s\n' "$web_token"
+  printf 'IM_AGENT_SERVICE_TOKEN=%s\n' "$im_token"
+} >> "$tmp_file"
+
+chmod 0600 "$tmp_file"
+if [ "$(id -u)" -eq 0 ]; then
+  chown root:root "$tmp_file"
+fi
+sync -f "$tmp_file"
+
+if [ "${HARBOR_TOKEN_ENV_FAILPOINT:-}" = "before_rename" ]; then
+  exit 70
+fi
+
+if [ -f "$env_file" ]; then
+  had_original=1
+  backup_file="$(mktemp "${env_file}.recovery.XXXXXX")"
+  cp -- "$env_file" "$backup_file"
+  chmod 0600 "$backup_file"
+  if [ "$(id -u)" -eq 0 ]; then
+    chown root:root "$backup_file"
+  fi
+  sync -f "$backup_file"
+fi
+
+mv -f -- "$tmp_file" "$env_file"
+tmp_file=""
+replaced=1
+
+if [ "${HARBOR_TOKEN_ENV_FAILPOINT:-}" = "after_rename" ]; then
+  exit 71
+fi
+
+sync -f "$env_dir"
+replaced=0

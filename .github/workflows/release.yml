@@ -43,12 +43,16 @@ jobs:
 
           mkdir -p ${PKG_DIR}/DEBIAN
           mkdir -p ${PKG_DIR}/usr/bin
+          mkdir -p ${PKG_DIR}/usr/lib/harboros-im-gate
           mkdir -p ${PKG_DIR}/etc/systemd/system
 
           cp ./target/x86_64-unknown-linux-gnu/release/harboros-im-gate ${PKG_DIR}/usr/bin/harboros-im-gate
           chmod +x ${PKG_DIR}/usr/bin/harboros-im-gate
 
           cp ./debian/harboros-im-gate.service ${PKG_DIR}/etc/systemd/system/
+
+          cp ./debian/ensure-harborbeacon-token-env ${PKG_DIR}/usr/lib/harboros-im-gate/
+          chmod 0755 ${PKG_DIR}/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env
 
           cp ./debian/control ${PKG_DIR}/DEBIAN/control
           sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" ${PKG_DIR}/DEBIAN/control
