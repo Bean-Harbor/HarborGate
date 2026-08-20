@@ -50,6 +50,7 @@ jobs:
           chmod +x ${PKG_DIR}/usr/bin/harboros-im-gate
 
           cp ./debian/harboros-im-gate.service ${PKG_DIR}/etc/systemd/system/
+          cp ./debian/harboros-service-auth-recovery.service ${PKG_DIR}/etc/systemd/system/
 
           cp ./debian/ensure-harborbeacon-token-env ${PKG_DIR}/usr/lib/harboros-im-gate/
           chmod 0755 ${PKG_DIR}/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env

@@ -3,7 +3,8 @@ Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: libc6
+Depends: libc6, util-linux
+Provides: harboros-service-auth-abi (= 1)
 Maintainer: Harborinno Ltd.
 Description: HarborNAS IM Gateway Service
   Background service that communicates with multi IM channel.

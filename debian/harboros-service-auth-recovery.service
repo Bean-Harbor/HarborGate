@@ -1,0 +1,8 @@
+[Unit]
+Description=Recover HarborOS directional service credentials
+After=local-fs.target
+Before=harboros-im-gate.service harboros-beacon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env recover

@@ -4,9 +4,9 @@ set -euo pipefail
 mode="${1:-prepare}"
 auth_dir="${HARBOR_SERVICE_AUTH_DIR:-/etc/harboros/service-auth}"
 legacy_env_file="${HARBOR_LEGACY_SHARED_ENV_FILE:-/etc/default/harboros-beacon-gate}"
-stage_dir=""
-backup_dir=""
-transaction_started=0
+lock_path="$auth_dir/.credential-writer.lock"
+transaction_dir="$auth_dir/.credential-transaction"
+transaction_active=0
 
 credential_names=(
   gate-to-beacon.send
@@ -21,31 +21,12 @@ sync_path() {
   sync -f "$1"
 }
 
-cleanup() {
-  local status="$?"
-  local name
-  trap - EXIT
-
-  if [ "$status" -ne 0 ] && [ "$transaction_started" -eq 1 ]; then
-    for name in "${credential_names[@]}"; do
-      if [ -f "$backup_dir/$name" ]; then
-        mv -f -- "$backup_dir/$name" "$auth_dir/$name"
-        sync_path "$auth_dir/$name" || true
-      else
-        rm -f -- "$auth_dir/$name"
-      fi
-    done
-    sync_path "$auth_dir" || true
-  fi
-
-  [ -z "$stage_dir" ] || rm -rf -- "$stage_dir"
-  [ -z "$backup_dir" ] || rm -rf -- "$backup_dir"
-  exit "$status"
-}
-trap cleanup EXIT
-
 valid_token() {
   [[ "$1" =~ ^[A-Za-z0-9_-]{32,}$ ]]
+}
+
+valid_optional_token() {
+  [ -z "$1" ] || valid_token "$1"
 }
 
 read_token_file() {
@@ -56,30 +37,122 @@ read_token_file() {
   printf '%s' "$value"
 }
 
+load_credentials() {
+  g2b_send="$(read_token_file "$auth_dir/gate-to-beacon.send")"
+  g2b_accept="$(read_token_file "$auth_dir/gate-to-beacon.accept-current")"
+  g2b_previous="$(read_token_file "$auth_dir/gate-to-beacon.accept-previous")"
+  b2g_send="$(read_token_file "$auth_dir/beacon-to-gate.send")"
+  b2g_accept="$(read_token_file "$auth_dir/beacon-to-gate.accept-current")"
+  b2g_previous="$(read_token_file "$auth_dir/beacon-to-gate.accept-previous")"
+}
+
+validate_complete_state() {
+  if ! valid_token "$g2b_send" || ! valid_token "$g2b_accept" \
+    || ! valid_optional_token "$g2b_previous" \
+    || ! valid_token "$b2g_send" || ! valid_token "$b2g_accept" \
+    || ! valid_optional_token "$b2g_previous" \
+    || [ "$g2b_accept" = "$b2g_accept" ] \
+    || { [ -n "$g2b_previous" ] && [ "$g2b_previous" = "$g2b_accept" ]; } \
+    || { [ -n "$b2g_previous" ] && [ "$b2g_previous" = "$b2g_accept" ]; }; then
+    echo "invalid service-auth credential state" >&2
+    return 1
+  fi
+
+  if [ "$g2b_send" != "$g2b_accept" ] && [ "$g2b_previous" != "$g2b_send" ]; then
+    echo "gate-to-beacon previous credential does not match its active sender" >&2
+    return 1
+  fi
+  if [ "$b2g_send" != "$b2g_accept" ] && [ "$b2g_previous" != "$b2g_send" ]; then
+    echo "beacon-to-gate previous credential does not match its active sender" >&2
+    return 1
+  fi
+
+  if [ "$g2b_accept" = "$b2g_send" ] || [ "$b2g_accept" = "$g2b_send" ] \
+    || { [ -n "$g2b_previous" ] && [ "$g2b_previous" = "$b2g_accept" ]; } \
+    || { [ -n "$b2g_previous" ] && [ "$b2g_previous" = "$g2b_accept" ]; }; then
+    echo "service-auth credential domains are not isolated" >&2
+    return 1
+  fi
+}
+
+validate_target() {
+  local path="$1"
+  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+    echo "refusing unsafe service-auth credential target" >&2
+    return 1
+  fi
+}
+
+trim_space() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+parse_env_token_value() {
+  local raw
+  local value
+  raw="$(trim_space "$1")"
+
+  if [[ "$raw" == \"* ]]; then
+    [ "${#raw}" -ge 2 ] && [[ "$raw" == *\" ]] || return 1
+    value="${raw:1:${#raw}-2}"
+  elif [[ "$raw" == \'* ]]; then
+    [ "${#raw}" -ge 2 ] && [[ "$raw" == *\' ]] || return 1
+    value="${raw:1:${#raw}-2}"
+  else
+    value="$raw"
+  fi
+
+  valid_token "$value" || return 1
+  printf '%s' "$value"
+}
+
+# Return 0 for a parsed assignment, 1 when the key is absent, and 68 for an
+# assignment that is present but unsafe or unsupported. The file is never sourced.
 read_env_value() {
   local key="$1"
   local line
+  local raw
+  local parsed
   local value=""
-  [ -f "$legacy_env_file" ] || return 0
+  local found=0
+
+  [ -f "$legacy_env_file" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      "${key}="*) value="${line#*=}" ;;
-    esac
+    if [[ "$line" =~ ^[[:space:]]*${key}[[:space:]]*=(.*)$ ]]; then
+      raw="${BASH_REMATCH[1]}"
+      if ! parsed="$(parse_env_token_value "$raw")"; then
+        echo "refusing invalid legacy service-auth assignment for $key" >&2
+        return 68
+      fi
+      value="$parsed"
+      found=1
+    elif [[ "$line" =~ ^[[:space:]]*${key}([[:space:]]|$) ]]; then
+      echo "refusing malformed legacy service-auth assignment for $key" >&2
+      return 68
+    fi
   done < "$legacy_env_file"
+
+  [ "$found" -eq 1 ] || return 1
   printf '%s' "$value"
 }
 
 first_valid_legacy() {
   local key
   local value
+  local status
   for key in "$@"; do
-    value="$(read_env_value "$key")"
-    if valid_token "$value"; then
+    if value="$(read_env_value "$key")"; then
       printf '%s' "$value"
       return 0
+    else
+      status="$?"
+      [ "$status" -eq 1 ] || return "$status"
     fi
   done
-  return 0
+  return 1
 }
 
 generate_token() {
@@ -105,62 +178,194 @@ generate_unique_token() {
   done
 }
 
-validate_target() {
-  local path="$1"
-  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
-    echo "refusing unsafe service-auth credential target" >&2
-    exit 1
-  fi
+trigger_failpoint() {
+  local name="$1"
+  local exit_code="$2"
+  case "${HARBOR_SERVICE_AUTH_FAILPOINT:-}" in
+    "$name") exit "$exit_code" ;;
+    "${name}_sigkill") kill -KILL "$$" ;;
+  esac
 }
+
+remove_transaction() {
+  rm -rf -- "$transaction_dir" || return 1
+  sync_path "$auth_dir"
+}
+
+read_transaction_state() {
+  local state=""
+  local line_count
+  [ -f "$transaction_dir/state" ] || return 1
+  line_count="$(wc -l < "$transaction_dir/state")"
+  [ "$line_count" -eq 1 ] || return 2
+  IFS= read -r state < "$transaction_dir/state" || true
+  printf '%s' "$state"
+}
+
+write_transaction_state() {
+  local state="$1"
+  printf '%s\n' "$state" > "$transaction_dir/state.new"
+  chmod 0600 "$transaction_dir/state.new"
+  sync_path "$transaction_dir/state.new"
+  mv -f -- "$transaction_dir/state.new" "$transaction_dir/state"
+  sync_path "$transaction_dir"
+}
+
+restore_old_snapshot() {
+  local name
+  local restore_path
+  local restore_count=0
+
+  for name in "${credential_names[@]}"; do
+    validate_target "$auth_dir/$name" || return 1
+    if [ -f "$transaction_dir/backup/$name" ] \
+      && [ ! -e "$transaction_dir/absent/$name" ]; then
+      :
+    elif [ -f "$transaction_dir/absent/$name" ] \
+      && [ ! -e "$transaction_dir/backup/$name" ]; then
+      :
+    else
+      echo "service-auth transaction backup is incomplete" >&2
+      return 1
+    fi
+  done
+
+  for name in "${credential_names[@]}"; do
+    if [ -f "$transaction_dir/backup/$name" ]; then
+      restore_path="$transaction_dir/restore.$name"
+      cp -- "$transaction_dir/backup/$name" "$restore_path" || return 1
+      chmod 0600 "$restore_path" || return 1
+      if [ "$(id -u)" -eq 0 ]; then
+        chown root:root "$restore_path" || return 1
+      fi
+      sync_path "$restore_path" || return 1
+      mv -f -- "$restore_path" "$auth_dir/$name" || return 1
+      sync_path "$auth_dir/$name" || return 1
+    else
+      rm -f -- "$auth_dir/$name" || return 1
+    fi
+    restore_count=$((restore_count + 1))
+    trigger_failpoint "after_restore_${restore_count}" $((90 + restore_count))
+  done
+  sync_path "$auth_dir"
+}
+
+recover_transaction() {
+  local state
+  local status
+
+  [ -e "$transaction_dir" ] || return 0
+  if [ -L "$transaction_dir" ] || [ ! -d "$transaction_dir" ]; then
+    echo "refusing unsafe service-auth transaction path" >&2
+    return 1
+  fi
+
+  if state="$(read_transaction_state)"; then
+    :
+  else
+    status="$?"
+    if [ "$status" -eq 1 ]; then
+      remove_transaction
+      return 0
+    fi
+    echo "invalid service-auth transaction state" >&2
+    return 1
+  fi
+
+  case "$state" in
+    prepared)
+      restore_old_snapshot || return 1
+      remove_transaction
+      ;;
+    committed)
+      load_credentials
+      validate_complete_state || return 1
+      remove_transaction
+      ;;
+    *)
+      echo "invalid service-auth transaction state" >&2
+      return 1
+      ;;
+  esac
+}
+
+cleanup() {
+  local status="$?"
+  trap - EXIT
+  set +e
+
+  if [ "$status" -ne 0 ] && [ "$transaction_active" -eq 1 ]; then
+    if ! recover_transaction; then
+      echo "service-auth transaction recovery remains pending" >&2
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
 
 commit_credentials() {
   local name
   local count=0
 
-  stage_dir="$(mktemp -d "$auth_dir/.stage.XXXXXX")"
-  backup_dir="$(mktemp -d "$auth_dir/.backup.XXXXXX")"
-  chmod 0700 "$stage_dir" "$backup_dir"
+  install -d -m 0700 "$transaction_dir"
+  install -d -m 0700 "$transaction_dir/stage"
+  install -d -m 0700 "$transaction_dir/backup"
+  install -d -m 0700 "$transaction_dir/absent"
 
-  printf '%s\n' "$g2b_send" > "$stage_dir/gate-to-beacon.send"
-  printf '%s\n' "$g2b_accept" > "$stage_dir/gate-to-beacon.accept-current"
-  printf '%s\n' "$g2b_previous" > "$stage_dir/gate-to-beacon.accept-previous"
-  printf '%s\n' "$b2g_send" > "$stage_dir/beacon-to-gate.send"
-  printf '%s\n' "$b2g_accept" > "$stage_dir/beacon-to-gate.accept-current"
-  printf '%s\n' "$b2g_previous" > "$stage_dir/beacon-to-gate.accept-previous"
+  printf '%s\n' "$g2b_send" > "$transaction_dir/stage/gate-to-beacon.send"
+  printf '%s\n' "$g2b_accept" > "$transaction_dir/stage/gate-to-beacon.accept-current"
+  printf '%s\n' "$g2b_previous" > "$transaction_dir/stage/gate-to-beacon.accept-previous"
+  printf '%s\n' "$b2g_send" > "$transaction_dir/stage/beacon-to-gate.send"
+  printf '%s\n' "$b2g_accept" > "$transaction_dir/stage/beacon-to-gate.accept-current"
+  printf '%s\n' "$b2g_previous" > "$transaction_dir/stage/beacon-to-gate.accept-previous"
 
   for name in "${credential_names[@]}"; do
-    chmod 0600 "$stage_dir/$name"
+    chmod 0600 "$transaction_dir/stage/$name"
     if [ "$(id -u)" -eq 0 ]; then
-      chown root:root "$stage_dir/$name"
+      chown root:root "$transaction_dir/stage/$name"
     fi
-    sync_path "$stage_dir/$name"
+    sync_path "$transaction_dir/stage/$name"
     if [ -f "$auth_dir/$name" ]; then
-      cp -- "$auth_dir/$name" "$backup_dir/$name"
-      chmod 0600 "$backup_dir/$name"
-      sync_path "$backup_dir/$name"
+      cp -- "$auth_dir/$name" "$transaction_dir/backup/$name"
+      chmod 0600 "$transaction_dir/backup/$name"
+      sync_path "$transaction_dir/backup/$name"
+    else
+      : > "$transaction_dir/absent/$name"
+      chmod 0600 "$transaction_dir/absent/$name"
+      sync_path "$transaction_dir/absent/$name"
     fi
   done
+  sync_path "$transaction_dir/stage"
+  sync_path "$transaction_dir/backup"
+  sync_path "$transaction_dir/absent"
+  sync_path "$transaction_dir"
 
-  transaction_started=1
+  trigger_failpoint before_prepared 80
+  write_transaction_state prepared
+  transaction_active=1
+  trigger_failpoint after_prepared 81
   for name in "${credential_names[@]}"; do
-    mv -f -- "$stage_dir/$name" "$auth_dir/$name"
+    mv -f -- "$transaction_dir/stage/$name" "$auth_dir/$name"
     count=$((count + 1))
-    if [ "${HARBOR_SERVICE_AUTH_FAILPOINT:-}" = "after_rename_${count}" ]; then
-      exit $((70 + count))
-    fi
+    trigger_failpoint "after_rename_${count}" $((70 + count))
   done
   sync_path "$auth_dir"
-  transaction_started=0
+  trigger_failpoint after_auth_dir_sync 82
+  write_transaction_state committed
+  trigger_failpoint after_committed 83
+  transaction_active=0
+  remove_transaction
 }
 
 case "$mode" in
-  prepare|switch|finalize) ;;
+  prepare|switch|finalize|recover) ;;
   *)
-    echo "usage: ensure-harborbeacon-token-env [prepare|switch|finalize]" >&2
+    echo "usage: ensure-harborbeacon-token-env [prepare|switch|finalize|recover]" >&2
     exit 64
     ;;
 esac
 
+umask 077
 if [ -L "$auth_dir" ]; then
   echo "refusing symlinked service-auth directory" >&2
   exit 1
@@ -170,63 +375,94 @@ chmod 0700 "$auth_dir"
 if [ "$(id -u)" -eq 0 ]; then
   chown root:root "$auth_dir"
 fi
-umask 077
 
+if ! command -v flock >/dev/null 2>&1; then
+  echo "flock is required for service-auth credential updates" >&2
+  exit 69
+fi
+validate_target "$lock_path"
+exec 9> "$lock_path"
+chmod 0600 "$lock_path"
+flock -x 9
+
+recover_transaction
+
+existing_count=0
 for name in "${credential_names[@]}"; do
   validate_target "$auth_dir/$name"
+  if [ -e "$auth_dir/$name" ]; then
+    existing_count=$((existing_count + 1))
+  fi
 done
 
-g2b_send="$(read_token_file "$auth_dir/gate-to-beacon.send")"
-g2b_accept="$(read_token_file "$auth_dir/gate-to-beacon.accept-current")"
-g2b_previous="$(read_token_file "$auth_dir/gate-to-beacon.accept-previous")"
-b2g_send="$(read_token_file "$auth_dir/beacon-to-gate.send")"
-b2g_accept="$(read_token_file "$auth_dir/beacon-to-gate.accept-current")"
-b2g_previous="$(read_token_file "$auth_dir/beacon-to-gate.accept-previous")"
-
-if [ "$mode" = "prepare" ]; then
-  legacy_g2b="$(first_valid_legacy HARBOR_GATE_TO_BEACON_TOKEN HARBORBEACON_WEB_API_TOKEN)"
-  legacy_b2g="$(first_valid_legacy HARBOR_BEACON_TO_GATE_TOKEN HARBORGATE_BEARER_TOKEN HARBOR_IM_GATEWAY_BEARER_TOKEN IM_AGENT_SERVICE_TOKEN)"
-
-  if ! valid_token "$g2b_accept"; then
-    g2b_accept="$(generate_unique_token "$legacy_g2b" "$legacy_b2g")"
-  fi
-  if ! valid_token "$b2g_accept" || [ "$b2g_accept" = "$g2b_accept" ]; then
-    b2g_accept="$(generate_unique_token "$g2b_accept" "$legacy_g2b" "$legacy_b2g")"
-  fi
-  if ! valid_token "$g2b_send"; then
-    if valid_token "$legacy_g2b"; then g2b_send="$legacy_g2b"; else g2b_send="$g2b_accept"; fi
-  fi
-  if ! valid_token "$b2g_send"; then
-    if valid_token "$legacy_b2g"; then b2g_send="$legacy_b2g"; else b2g_send="$b2g_accept"; fi
-  fi
-  if ! valid_token "$g2b_previous"; then
-    if [ "$g2b_send" != "$g2b_accept" ]; then g2b_previous="$g2b_send"; else g2b_previous=""; fi
-  fi
-  if ! valid_token "$b2g_previous"; then
-    if [ "$b2g_send" != "$b2g_accept" ]; then b2g_previous="$b2g_send"; else b2g_previous=""; fi
-  fi
-elif [ "$mode" = "switch" ]; then
-  if ! valid_token "$g2b_accept" || ! valid_token "$b2g_accept" || [ "$g2b_accept" = "$b2g_accept" ]; then
-    echo "service-auth prepare phase is incomplete" >&2
-    exit 65
-  fi
-  g2b_send="$g2b_accept"
-  b2g_send="$b2g_accept"
-else
-  if ! valid_token "$g2b_accept" || ! valid_token "$b2g_accept" \
-    || [ "$g2b_send" != "$g2b_accept" ] || [ "$b2g_send" != "$b2g_accept" ]; then
-    echo "service-auth switch phase is incomplete" >&2
-    exit 66
-  fi
-  g2b_previous=""
-  b2g_previous=""
-fi
-
-if ! valid_token "$g2b_send" || ! valid_token "$g2b_accept" \
-  || ! valid_token "$b2g_send" || ! valid_token "$b2g_accept" \
-  || [ "$g2b_accept" = "$b2g_accept" ]; then
-  echo "invalid service-auth credential state" >&2
+if [ "$existing_count" -ne 0 ] && [ "$existing_count" -ne "${#credential_names[@]}" ]; then
+  echo "incomplete service-auth credential set" >&2
   exit 67
 fi
 
+if [ "$mode" = "recover" ]; then
+  if [ "$existing_count" -ne "${#credential_names[@]}" ]; then
+    echo "service-auth credential set is not initialized" >&2
+    exit 65
+  fi
+  load_credentials
+  validate_complete_state || exit 67
+  exit 0
+fi
+
+if [ "$existing_count" -eq 0 ]; then
+  [ "$mode" = "prepare" ] || {
+    echo "service-auth prepare phase is incomplete" >&2
+    exit 65
+  }
+
+  legacy_g2b=""
+  legacy_b2g=""
+  if legacy_g2b="$(first_valid_legacy HARBOR_GATE_TO_BEACON_TOKEN HARBORBEACON_WEB_API_TOKEN)"; then
+    :
+  else
+    status="$?"
+    [ "$status" -eq 1 ] || exit "$status"
+  fi
+  if legacy_b2g="$(first_valid_legacy HARBOR_BEACON_TO_GATE_TOKEN HARBORGATE_BEARER_TOKEN HARBOR_IM_GATEWAY_BEARER_TOKEN IM_AGENT_SERVICE_TOKEN)"; then
+    :
+  else
+    status="$?"
+    [ "$status" -eq 1 ] || exit "$status"
+  fi
+
+  g2b_accept="$(generate_unique_token "$legacy_g2b" "$legacy_b2g")"
+  b2g_accept="$(generate_unique_token "$g2b_accept" "$legacy_g2b" "$legacy_b2g")"
+  if valid_token "$legacy_g2b"; then g2b_send="$legacy_g2b"; else g2b_send="$g2b_accept"; fi
+  if valid_token "$legacy_b2g"; then b2g_send="$legacy_b2g"; else b2g_send="$b2g_accept"; fi
+  if [ "$g2b_send" != "$g2b_accept" ]; then g2b_previous="$g2b_send"; else g2b_previous=""; fi
+  if [ "$b2g_send" != "$b2g_accept" ]; then b2g_previous="$b2g_send"; else b2g_previous=""; fi
+else
+  load_credentials
+  if [ "$mode" = "prepare" ]; then
+    # During prepare, sender is the authoritative old key until clients switch.
+    if valid_token "$g2b_send" && valid_token "$g2b_accept" \
+      && [ "$g2b_send" != "$g2b_accept" ]; then
+      g2b_previous="$g2b_send"
+    fi
+    if valid_token "$b2g_send" && valid_token "$b2g_accept" \
+      && [ "$b2g_send" != "$b2g_accept" ]; then
+      b2g_previous="$b2g_send"
+    fi
+  elif [ "$mode" = "switch" ]; then
+    validate_complete_state || exit 65
+    g2b_send="$g2b_accept"
+    b2g_send="$b2g_accept"
+  else
+    validate_complete_state || exit 66
+    if [ "$g2b_send" != "$g2b_accept" ] || [ "$b2g_send" != "$b2g_accept" ]; then
+      echo "service-auth switch phase is incomplete" >&2
+      exit 66
+    fi
+    g2b_previous=""
+    b2g_previous=""
+  fi
+fi
+
+validate_complete_state || exit 67
 commit_credentials

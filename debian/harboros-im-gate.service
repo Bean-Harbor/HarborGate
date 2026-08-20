@@ -1,6 +1,8 @@
 [Unit]
 Description=HarborOS IM Gateway Service
 After=network.target
+Requires=harboros-service-auth-recovery.service
+After=harboros-service-auth-recovery.service
 
 [Service]
 Type=simple
