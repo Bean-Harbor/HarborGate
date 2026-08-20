@@ -13,6 +13,7 @@ pub struct AppConfig {
     pub public_origin: String,
     pub contract_version: String,
     pub service_token: String,
+    pub service_token_previous: String,
     pub harborbeacon_base_url: String,
     pub harborbeacon_token: String,
     pub harborbeacon_web_api_token: String,
@@ -102,6 +103,10 @@ impl AppConfig {
                 .to_string_lossy()
                 .to_string()
         });
+        let gate_to_beacon_token = credential_first(
+            "HARBOR_GATE_TO_BEACON_TOKEN_FILE",
+            &["HARBOR_GATE_TO_BEACON_TOKEN", "HARBORBEACON_WEB_API_TOKEN"],
+        );
         Self {
             host: env_or("IM_AGENT_HOST", "127.0.0.1"),
             port: env_or("IM_AGENT_PORT", "8787").parse().unwrap_or(8787),
@@ -110,13 +115,17 @@ impl AppConfig {
             device_session_state_dir: PathBuf::from(device_session_state_dir),
             public_origin: env_trim("IM_AGENT_PUBLIC_ORIGIN"),
             contract_version: env_or("IM_AGENT_CONTRACT_VERSION", "2.0"),
-            service_token: env_trim("IM_AGENT_SERVICE_TOKEN"),
+            service_token: credential_first(
+                "HARBOR_BEACON_TO_GATE_TOKEN_FILE",
+                &["HARBOR_BEACON_TO_GATE_TOKEN", "IM_AGENT_SERVICE_TOKEN"],
+            ),
+            service_token_previous: credential_first(
+                "HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS_FILE",
+                &["HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS"],
+            ),
             harborbeacon_base_url: base_url,
-            harborbeacon_token: env_first(&[
-                "HARBORBEACON_WEB_API_TOKEN",
-                "HARBORBEACON_TASK_API_TOKEN",
-            ]),
-            harborbeacon_web_api_token: env_trim("HARBORBEACON_WEB_API_TOKEN"),
+            harborbeacon_token: gate_to_beacon_token.clone(),
+            harborbeacon_web_api_token: gate_to_beacon_token,
             harborbeacon_turn_endpoint: turn_endpoint,
             harbor_workspace_id: env_or("HARBOR_WORKSPACE_ID", "home-1"),
             feishu,
@@ -337,6 +346,17 @@ fn env_first(keys: &[&str]) -> String {
         }
     }
     String::new()
+}
+
+fn credential_first(file_env: &str, env_keys: &[&str]) -> String {
+    let file_path = env_trim(file_env);
+    if !file_path.is_empty() {
+        return fs::read_to_string(file_path)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+    }
+    env_first(env_keys)
 }
 
 fn strip_endpoint_suffix(base_url: &str, endpoint_suffix: &str) -> String {

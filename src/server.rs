@@ -44,6 +44,7 @@ pub struct AppState {
 }
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
+    validate_required_service_auth(&config)?;
     let gateway = Arc::new(GatewayService::from_config(&config)?);
     let feishu_websocket_started = Arc::new(AtomicBool::new(false));
     maybe_start_configured_feishu_runtime(
@@ -771,14 +772,21 @@ fn require_service_contract(config: &AppConfig, headers: &HeaderMap) -> Result<(
 
 fn require_service_auth(config: &AppConfig, headers: &HeaderMap) -> Result<(), GatewayError> {
     if config.service_token.trim().is_empty() {
-        return Ok(());
+        return Err(GatewayError::new(
+            StatusCode::UNAUTHORIZED,
+            "SERVICE_AUTH_FAILED",
+            "Service authentication is not configured",
+        ));
     }
     let authorization = headers
         .get("Authorization")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .trim();
-    if authorization != format!("Bearer {}", config.service_token) {
+    let actual = authorization.strip_prefix("Bearer ").unwrap_or("").trim();
+    if !constant_time_token_eq(actual, &config.service_token)
+        && !constant_time_token_eq(actual, &config.service_token_previous)
+    {
         return Err(GatewayError::new(
             StatusCode::UNAUTHORIZED,
             "SERVICE_AUTH_FAILED",
@@ -786,6 +794,30 @@ fn require_service_auth(config: &AppConfig, headers: &HeaderMap) -> Result<(), G
         ));
     }
     Ok(())
+}
+
+fn validate_required_service_auth(config: &AppConfig) -> anyhow::Result<()> {
+    if config.service_token.trim().is_empty() {
+        anyhow::bail!("HARBOR_BEACON_TO_GATE_TOKEN is not configured");
+    }
+    if config.harborbeacon_enabled() && config.harborbeacon_web_api_token.trim().is_empty() {
+        anyhow::bail!("HARBOR_GATE_TO_BEACON_TOKEN is not configured");
+    }
+    Ok(())
+}
+
+fn constant_time_token_eq(actual: &str, expected: &str) -> bool {
+    if actual.is_empty() || expected.is_empty() || actual.len() != expected.len() {
+        return false;
+    }
+    actual
+        .as_bytes()
+        .iter()
+        .zip(expected.as_bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (*left ^ *right)
+        })
+        == 0
 }
 
 fn beacon_proxy_target_path(path: &str, query: Option<&str>) -> String {
@@ -1092,8 +1124,8 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     use super::{
-        beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_contract,
-        requires_harboros_principal,
+        beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_auth,
+        require_service_contract, requires_harboros_principal,
     };
     use crate::config::AppConfig;
 
@@ -1250,5 +1282,49 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(error.code, "CONTRACT_VERSION_MISMATCH");
+    }
+
+    #[test]
+    fn notification_delivery_auth_accepts_current_and_previous_only() {
+        let mut config = AppConfig::from_env();
+        config.service_token = "beacon-to-gate-current".to_string();
+        config.service_token_previous = "beacon-to-gate-previous".to_string();
+
+        for token in ["beacon-to-gate-current", "beacon-to-gate-previous"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Authorization",
+                HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            require_service_auth(&config, &headers).expect("configured rotation key");
+        }
+
+        for token in ["gate-to-beacon-current", "wrong-token", ""] {
+            let mut headers = HeaderMap::new();
+            if !token.is_empty() {
+                headers.insert(
+                    "Authorization",
+                    HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+                );
+            }
+            let error = require_service_auth(&config, &headers).expect_err("wrong auth domain");
+            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(error.code, "SERVICE_AUTH_FAILED");
+        }
+    }
+
+    #[test]
+    fn notification_delivery_auth_fails_closed_without_current_key() {
+        let mut config = AppConfig::from_env();
+        config.service_token.clear();
+        config.service_token_previous = "previous-must-not-stand-alone".to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer previous-must-not-stand-alone"),
+        );
+
+        let error = require_service_auth(&config, &headers).expect_err("current key is required");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
     }
 }
