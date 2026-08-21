@@ -115,6 +115,11 @@ fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+fn write_legacy_env(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    fs::write(path, contents)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
 fn set_owner(path: &Path, uid: u32, gid: u32) {
     let status = Command::new("chown")
         .arg(format!("{uid}:{gid}"))
@@ -159,7 +164,7 @@ fn legacy_upgrade_uses_prepare_switch_finalize_without_downtime_gap() {
     let legacy = format!(
         "HARBOR_TASK_API_BEARER_TOKEN={LEGACY_TOKEN}\nHARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
     );
-    fs::write(&legacy_env, &legacy).unwrap();
+    write_legacy_env(&legacy_env, &legacy).unwrap();
 
     let prepare = run_writer("prepare", &auth_dir, &legacy_env, None);
     assert_success_without_secret_output(&prepare, &[LEGACY_TOKEN]);
@@ -211,7 +216,7 @@ fn legacy_upgrade_parses_quoted_and_unquoted_environment_values() {
         let temp = TempDir::new().unwrap();
         let auth_dir = temp.path().join("service-auth");
         let legacy_env = temp.path().join("harboros-beacon-gate");
-        fs::write(
+        write_legacy_env(
             &legacy_env,
             format!(
                 "  HARBORBEACON_WEB_API_TOKEN = {g2b_assignment}  \nIM_AGENT_SERVICE_TOKEN={b2g_assignment}\n"
@@ -246,11 +251,53 @@ fn invalid_known_legacy_assignment_fails_without_generating_credentials() {
         let temp = TempDir::new().unwrap();
         let auth_dir = temp.path().join("service-auth");
         let legacy_env = temp.path().join("harboros-beacon-gate");
-        fs::write(&legacy_env, assignment).unwrap();
+        write_legacy_env(&legacy_env, assignment).unwrap();
 
         let output = run_writer("prepare", &auth_dir, &legacy_env, None);
 
         assert!(!output.status.success());
+        assert!(CREDENTIALS.iter().all(|name| !auth_dir.join(name).exists()));
+        assert!(!auth_dir.join(".credential-transaction").exists());
+    }
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn unsafe_legacy_environment_file_fails_before_generating_credentials() {
+    use std::os::unix::fs::symlink;
+
+    for unsafe_kind in ["symlink", "readable", "writable", "owner"] {
+        let temp = TempDir::new().unwrap();
+        let auth_dir = temp.path().join("service-auth");
+        let protected = temp.path().join("legacy-source");
+        fs::write(
+            &protected,
+            format!("HARBORBEACON_WEB_API_TOKEN={G2B_LEGACY_TOKEN}\n"),
+        )
+        .unwrap();
+        let legacy_env = temp.path().join("harboros-beacon-gate");
+        match unsafe_kind {
+            "symlink" => symlink(&protected, &legacy_env).unwrap(),
+            "writable" => {
+                fs::copy(&protected, &legacy_env).unwrap();
+                set_mode(&legacy_env, 0o666);
+            }
+            "readable" => {
+                fs::copy(&protected, &legacy_env).unwrap();
+                set_mode(&legacy_env, 0o644);
+            }
+            "owner" => {
+                fs::copy(&protected, &legacy_env).unwrap();
+                set_mode(&legacy_env, 0o600);
+                set_owner(&legacy_env, 65534, 65534);
+            }
+            _ => unreachable!(),
+        }
+
+        let output = run_writer("prepare", &auth_dir, &legacy_env, None);
+
+        assert!(!output.status.success(), "accepted {unsafe_kind} legacy input");
+        assert_no_secret_output(&output, &[G2B_LEGACY_TOKEN]);
         assert!(CREDENTIALS.iter().all(|name| !auth_dir.join(name).exists()));
         assert!(!auth_dir.join(".credential-transaction").exists());
     }
@@ -289,11 +336,72 @@ fn recover_mode_never_initializes_or_rotates_credentials() {
 
 #[test]
 #[ignore = "requires root-owned Unix credential fixtures"]
+fn multiline_credential_file_fails_closed_for_every_phase() {
+    let (_temp, auth_dir, legacy_env) = initialized_fixture();
+    let target = auth_dir.join("beacon-to-gate.accept-current");
+    let original = fs::read(&target).unwrap();
+
+    for mode in ["prepare", "recover", "switch", "finalize"] {
+        let mut malformed = original.clone();
+        malformed.extend_from_slice(b"second-line-without-final-newline");
+        fs::write(&target, malformed).unwrap();
+        set_mode(&target, 0o600);
+
+        let output = run_writer(mode, &auth_dir, &legacy_env, None);
+
+        assert!(!output.status.success(), "{mode} accepted a multiline credential");
+        assert!(!auth_dir.join(".credential-transaction").exists());
+        fs::write(&target, &original).unwrap();
+        set_mode(&target, 0o600);
+    }
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn multiline_transaction_state_fails_closed_and_preserves_the_journal() {
+    let temp = TempDir::new().unwrap();
+    let auth_dir = temp.path().join("service-auth");
+    let legacy_env = temp.path().join("harboros-beacon-gate");
+    write_legacy_env(
+        &legacy_env,
+        format!(
+            "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
+        ),
+    )
+    .unwrap();
+    assert_success_without_secret_output(
+        &run_writer("prepare", &auth_dir, &legacy_env, None),
+        &[LEGACY_TOKEN],
+    );
+    let interrupted = run_writer(
+        "switch",
+        &auth_dir,
+        &legacy_env,
+        Some("after_rename_3_sigkill"),
+    );
+    assert!(!interrupted.status.success());
+    let interrupted_snapshot = snapshot(&auth_dir);
+    let transaction = auth_dir.join(".credential-transaction");
+    let state = transaction.join("state");
+    fs::write(&state, b"prepared\ncommitted").unwrap();
+    set_mode(&state, 0o600);
+
+    let recovery = run_writer("recover", &auth_dir, &legacy_env, None);
+
+    assert!(!recovery.status.success());
+    assert_no_secret_output(&recovery, &[LEGACY_TOKEN]);
+    assert_eq!(snapshot(&auth_dir), interrupted_snapshot);
+    assert!(transaction.is_dir());
+    assert_eq!(fs::read(&state).unwrap(), b"prepared\ncommitted");
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn transaction_failure_restores_all_credential_files() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
     let legacy_env = temp.path().join("harboros-beacon-gate");
-    fs::write(
+    write_legacy_env(
         &legacy_env,
         format!(
             "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
@@ -319,7 +427,7 @@ fn sigkill_interruption_is_recovered_to_the_complete_old_snapshot() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
     let legacy_env = temp.path().join("harboros-beacon-gate");
-    fs::write(
+    write_legacy_env(
         &legacy_env,
         format!(
             "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
@@ -363,7 +471,7 @@ fn journal_boundaries_recover_prepared_or_keep_committed_snapshot() {
         let temp = TempDir::new().unwrap();
         let auth_dir = temp.path().join("service-auth");
         let legacy_env = temp.path().join("harboros-beacon-gate");
-        fs::write(
+        write_legacy_env(
             &legacy_env,
             format!(
                 "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
@@ -403,7 +511,7 @@ fn journal_boundaries_recover_prepared_or_keep_committed_snapshot() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
     let legacy_env = temp.path().join("harboros-beacon-gate");
-    fs::write(
+    write_legacy_env(
         &legacy_env,
         format!(
             "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
@@ -446,7 +554,7 @@ fn recovery_is_idempotent_when_sigkill_interrupts_snapshot_restore() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
     let legacy_env = temp.path().join("harboros-beacon-gate");
-    fs::write(
+    write_legacy_env(
         &legacy_env,
         format!(
             "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
@@ -521,7 +629,7 @@ fn repeated_prepare_repairs_previous_to_match_the_active_sender() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
     let legacy_env = temp.path().join("harboros-beacon-gate");
-    fs::write(
+    write_legacy_env(
         &legacy_env,
         format!(
             "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
@@ -553,7 +661,7 @@ fn finalize_rejects_unswitched_callers() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
     let legacy_env = temp.path().join("harboros-beacon-gate");
-    fs::write(
+    write_legacy_env(
         &legacy_env,
         format!(
             "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
@@ -755,7 +863,7 @@ fn transaction_metadata_tampering_blocks_recovery_and_preserves_the_journal() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
     let legacy_env = temp.path().join("harboros-beacon-gate");
-    fs::write(
+    write_legacy_env(
         &legacy_env,
         format!(
             "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
@@ -807,7 +915,7 @@ fn restore_temporary_metadata_is_validated_and_recovery_remains_idempotent() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
     let legacy_env = temp.path().join("harboros-beacon-gate");
-    fs::write(
+    write_legacy_env(
         &legacy_env,
         format!(
             "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
@@ -868,11 +976,14 @@ fn package_uses_role_scoped_systemd_credentials_and_prepare_only() {
     let unit = fs::read_to_string(root.join("debian/harboros-im-gate.service")).unwrap();
     let recovery_unit =
         fs::read_to_string(root.join("debian/harboros-service-auth-recovery.service")).unwrap();
+    let package_builder = fs::read_to_string(root.join("debian/build-amd64-package")).unwrap();
+    let cargo = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let server = fs::read_to_string(root.join("src/server.rs")).unwrap();
 
-    assert!(workflow.contains("ensure-harborbeacon-token-env"));
-    assert!(workflow.contains("harboros-service-auth-recovery.service"));
+    assert!(workflow.contains("debian/build-amd64-package"));
     assert!(ci.contains("Run root-owned service-auth integration tests"));
     assert!(ci.contains("sudo --non-interactive \"$test_binary\" --ignored --test-threads=1"));
+    assert!(ci.contains("Build and validate AMD64 deb package"));
     assert!(control.contains("util-linux"));
     assert!(control.contains("Provides: harboros-service-auth-abi (= 1)"));
     assert!(postinst.contains("ensure-harborbeacon-token-env prepare"));
@@ -890,4 +1001,12 @@ fn package_uses_role_scoped_systemd_credentials_and_prepare_only() {
     assert!(recovery_unit.contains("Before=harboros-im-gate.service harboros-beacon.service"));
     assert!(recovery_unit.contains("ensure-harborbeacon-token-env recover"));
     assert!(!recovery_unit.contains("RemainAfterExit"));
+    assert!(package_builder.contains("dpkg-deb --root-owner-group --build"));
+    assert!(package_builder.contains("harboros-service-auth-abi (= 1)"));
+    assert!(package_builder.contains("root/root"));
+    assert!(cargo.contains("constant_time_eq"));
+    assert!(server.contains("constant_time_eq::constant_time_eq"));
+    assert!(server.contains("let current_matches ="));
+    assert!(server.contains("let previous_matches ="));
+    assert!(server.contains("current_matches | previous_matches"));
 }

@@ -89,6 +89,23 @@ validate_optional_secure_file() {
   fi
 }
 
+validate_legacy_env_file() {
+  local metadata
+
+  if [ -L "$legacy_env_file" ] || [ ! -f "$legacy_env_file" ]; then
+    echo "refusing unsafe legacy service-auth environment file" >&2
+    return 1
+  fi
+  if ! metadata="$(read_metadata "$legacy_env_file")"; then
+    echo "cannot inspect legacy service-auth environment metadata" >&2
+    return 1
+  fi
+  if [ "$metadata" != "0:0:600" ]; then
+    echo "legacy service-auth environment must be owned by root:root with mode 0600" >&2
+    return 1
+  fi
+}
+
 create_secure_directory() {
   local path="$1"
   local label="$2"
@@ -160,8 +177,16 @@ valid_optional_token() {
 read_token_file() {
   local path="$1"
   local value=""
+  local byte_count
+  local line_count
   validate_secure_file "$path" "service-auth credential" || return 1
+  line_count="$(wc -l < "$path")" || return 1
+  byte_count="$(wc -c < "$path")" || return 1
   IFS= read -r value < "$path" || true
+  if [ "$line_count" -ne 1 ] || [ "$byte_count" -ne $((${#value} + 1)) ]; then
+    echo "service-auth credential must contain exactly one line" >&2
+    return 1
+  fi
   printf '%s' "$value"
 }
 
@@ -346,11 +371,13 @@ remove_transaction() {
 
 read_transaction_state() {
   local state=""
+  local byte_count
   local line_count
   validate_secure_file "$transaction_dir/state" "service-auth transaction state" || return 1
   line_count="$(wc -l < "$transaction_dir/state")" || return 2
-  [ "$line_count" -eq 1 ] || return 2
+  byte_count="$(wc -c < "$transaction_dir/state")" || return 2
   IFS= read -r state < "$transaction_dir/state" || true
+  [ "$line_count" -eq 1 ] && [ "$byte_count" -eq $((${#state} + 1)) ] || return 2
   printf '%s' "$state"
 }
 
@@ -690,6 +717,9 @@ if [ "$existing_count" -eq 0 ]; then
 
   legacy_g2b=""
   legacy_b2g=""
+  if [ -L "$legacy_env_file" ] || [ -e "$legacy_env_file" ]; then
+    validate_legacy_env_file
+  fi
   if legacy_g2b="$(first_valid_legacy HARBOR_GATE_TO_BEACON_TOKEN HARBORBEACON_WEB_API_TOKEN)"; then
     :
   else

@@ -254,6 +254,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "constant_time_eq"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -509,6 +515,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "chrono",
+ "constant_time_eq",
  "ecb",
  "fs2",
  "futures-util",

@@ -784,9 +784,9 @@ fn require_service_auth(config: &AppConfig, headers: &HeaderMap) -> Result<(), G
         .unwrap_or("")
         .trim();
     let actual = authorization.strip_prefix("Bearer ").unwrap_or("").trim();
-    if !constant_time_token_eq(actual, &config.service_token)
-        && !constant_time_token_eq(actual, &config.service_token_previous)
-    {
+    let current_matches = service_token_matches(actual, &config.service_token);
+    let previous_matches = service_token_matches(actual, &config.service_token_previous);
+    if !(current_matches | previous_matches) {
         return Err(GatewayError::new(
             StatusCode::UNAUTHORIZED,
             "SERVICE_AUTH_FAILED",
@@ -797,27 +797,37 @@ fn require_service_auth(config: &AppConfig, headers: &HeaderMap) -> Result<(), G
 }
 
 fn validate_required_service_auth(config: &AppConfig) -> anyhow::Result<()> {
-    if config.service_token.trim().is_empty() {
-        anyhow::bail!("HARBOR_BEACON_TO_GATE_TOKEN is not configured");
+    if !valid_service_token(&config.service_token) {
+        anyhow::bail!("HARBOR_BEACON_TO_GATE_TOKEN is missing or malformed");
     }
-    if config.harborbeacon_enabled() && config.harborbeacon_web_api_token.trim().is_empty() {
-        anyhow::bail!("HARBOR_GATE_TO_BEACON_TOKEN is not configured");
+    if !config.service_token_previous.is_empty()
+        && (!valid_service_token(&config.service_token_previous)
+            || config.service_token_previous == config.service_token)
+    {
+        anyhow::bail!("HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS is malformed");
+    }
+    if config.harborbeacon_enabled()
+        && (!valid_service_token(&config.harborbeacon_web_api_token)
+            || config.harborbeacon_token != config.harborbeacon_web_api_token
+            || config.harborbeacon_web_api_token == config.service_token)
+    {
+        anyhow::bail!("HARBOR_GATE_TO_BEACON_TOKEN is missing, malformed, or not isolated");
     }
     Ok(())
 }
 
-fn constant_time_token_eq(actual: &str, expected: &str) -> bool {
+fn valid_service_token(token: &str) -> bool {
+    token.len() >= 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn service_token_matches(actual: &str, expected: &str) -> bool {
     if actual.is_empty() || expected.is_empty() || actual.len() != expected.len() {
         return false;
     }
-    actual
-        .as_bytes()
-        .iter()
-        .zip(expected.as_bytes())
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (*left ^ *right)
-        })
-        == 0
+    constant_time_eq::constant_time_eq(actual.as_bytes(), expected.as_bytes())
 }
 
 fn beacon_proxy_target_path(path: &str, query: Option<&str>) -> String {
@@ -1125,7 +1135,7 @@ mod tests {
 
     use super::{
         beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_auth,
-        require_service_contract, requires_harboros_principal,
+        require_service_contract, requires_harboros_principal, validate_required_service_auth,
     };
     use crate::config::AppConfig;
 
@@ -1287,10 +1297,13 @@ mod tests {
     #[test]
     fn notification_delivery_auth_accepts_current_and_previous_only() {
         let mut config = AppConfig::from_env();
-        config.service_token = "beacon-to-gate-current".to_string();
-        config.service_token_previous = "beacon-to-gate-previous".to_string();
+        config.service_token = "beacon_to_gate_current_0123456789abcdef".to_string();
+        config.service_token_previous = "beacon_to_gate_previous_0123456789abcdef".to_string();
 
-        for token in ["beacon-to-gate-current", "beacon-to-gate-previous"] {
+        for token in [
+            "beacon_to_gate_current_0123456789abcdef",
+            "beacon_to_gate_previous_0123456789abcdef",
+        ] {
             let mut headers = HeaderMap::new();
             headers.insert(
                 "Authorization",
@@ -1299,7 +1312,11 @@ mod tests {
             require_service_auth(&config, &headers).expect("configured rotation key");
         }
 
-        for token in ["gate-to-beacon-current", "wrong-token", ""] {
+        for token in [
+            "gate_to_beacon_current_0123456789abcdef",
+            "wrong_token_0123456789abcdef0123456789",
+            "",
+        ] {
             let mut headers = HeaderMap::new();
             if !token.is_empty() {
                 headers.insert(
@@ -1317,14 +1334,63 @@ mod tests {
     fn notification_delivery_auth_fails_closed_without_current_key() {
         let mut config = AppConfig::from_env();
         config.service_token.clear();
-        config.service_token_previous = "previous-must-not-stand-alone".to_string();
+        config.service_token_previous =
+            "previous_must_not_stand_alone_0123456789abcdef".to_string();
         let mut headers = HeaderMap::new();
         headers.insert(
             "Authorization",
-            HeaderValue::from_static("Bearer previous-must-not-stand-alone"),
+            HeaderValue::from_static(
+                "Bearer previous_must_not_stand_alone_0123456789abcdef",
+            ),
         );
 
         let error = require_service_auth(&config, &headers).expect_err("current key is required");
         assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn startup_rejects_malformed_or_colliding_service_credentials() {
+        let mut config = AppConfig::from_env();
+        config.harborbeacon_base_url = "http://127.0.0.1:4174".to_string();
+        config.harborbeacon_web_api_token =
+            "gate_to_beacon_current_0123456789abcdef".to_string();
+        config.harborbeacon_token = config.harborbeacon_web_api_token.clone();
+        config.service_token = "beacon_to_gate_current_0123456789abcdef".to_string();
+        config.service_token_previous =
+            "beacon_to_gate_previous_0123456789abcdef".to_string();
+        validate_required_service_auth(&config).expect("directional credentials are valid");
+
+        for malformed in [
+            "too-short",
+            "contains spaces 0123456789abcdef0123456789",
+            "contains.period.0123456789abcdef0123456789",
+        ] {
+            config.service_token = malformed.to_string();
+            assert!(
+                validate_required_service_auth(&config).is_err(),
+                "accepted malformed current credential: {malformed}"
+            );
+        }
+
+        config.service_token = "beacon_to_gate_current_0123456789abcdef".to_string();
+        config.service_token_previous = "too-short".to_string();
+        assert!(validate_required_service_auth(&config).is_err());
+
+        config.service_token_previous.clear();
+        config.harborbeacon_web_api_token = config.service_token.clone();
+        config.harborbeacon_token = config.harborbeacon_web_api_token.clone();
+        assert!(
+            validate_required_service_auth(&config).is_err(),
+            "accepted the same current credential in both directions"
+        );
+
+        config.harborbeacon_web_api_token =
+            "gate_to_beacon_current_0123456789abcdef".to_string();
+        config.harborbeacon_token =
+            "different_gate_token_0123456789abcdef0123".to_string();
+        assert!(
+            validate_required_service_auth(&config).is_err(),
+            "accepted divergent Gate-to-Beacon caller credentials"
+        );
     }
 }

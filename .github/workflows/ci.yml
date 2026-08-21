@@ -57,3 +57,11 @@ jobs:
 
       - name: Build release binary
         run: cargo build --locked --release --bin harboros-im-gate
+
+      - name: Build and validate AMD64 deb package
+        shell: bash
+        run: |
+          bash ./debian/build-amd64-package \
+            0.1.0-ci \
+            ./target/release/harboros-im-gate \
+            "${RUNNER_TEMP}/harborgate-deb"
