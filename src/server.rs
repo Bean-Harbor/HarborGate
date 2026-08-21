@@ -1339,9 +1339,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "Authorization",
-            HeaderValue::from_static(
-                "Bearer previous_must_not_stand_alone_0123456789abcdef",
-            ),
+            HeaderValue::from_static("Bearer previous_must_not_stand_alone_0123456789abcdef"),
         );
 
         let error = require_service_auth(&config, &headers).expect_err("current key is required");
@@ -1352,12 +1350,10 @@ mod tests {
     fn startup_rejects_malformed_or_colliding_service_credentials() {
         let mut config = AppConfig::from_env();
         config.harborbeacon_base_url = "http://127.0.0.1:4174".to_string();
-        config.harborbeacon_web_api_token =
-            "gate_to_beacon_current_0123456789abcdef".to_string();
+        config.harborbeacon_web_api_token = "gate_to_beacon_current_0123456789abcdef".to_string();
         config.harborbeacon_token = config.harborbeacon_web_api_token.clone();
         config.service_token = "beacon_to_gate_current_0123456789abcdef".to_string();
-        config.service_token_previous =
-            "beacon_to_gate_previous_0123456789abcdef".to_string();
+        config.service_token_previous = "beacon_to_gate_previous_0123456789abcdef".to_string();
         validate_required_service_auth(&config).expect("directional credentials are valid");
 
         for malformed in [
@@ -1384,10 +1380,8 @@ mod tests {
             "accepted the same current credential in both directions"
         );
 
-        config.harborbeacon_web_api_token =
-            "gate_to_beacon_current_0123456789abcdef".to_string();
-        config.harborbeacon_token =
-            "different_gate_token_0123456789abcdef0123".to_string();
+        config.harborbeacon_web_api_token = "gate_to_beacon_current_0123456789abcdef".to_string();
+        config.harborbeacon_token = "different_gate_token_0123456789abcdef0123".to_string();
         assert!(
             validate_required_service_auth(&config).is_err(),
             "accepted divergent Gate-to-Beacon caller credentials"

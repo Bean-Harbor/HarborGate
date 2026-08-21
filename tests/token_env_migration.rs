@@ -296,7 +296,10 @@ fn unsafe_legacy_environment_file_fails_before_generating_credentials() {
 
         let output = run_writer("prepare", &auth_dir, &legacy_env, None);
 
-        assert!(!output.status.success(), "accepted {unsafe_kind} legacy input");
+        assert!(
+            !output.status.success(),
+            "accepted {unsafe_kind} legacy input"
+        );
         assert_no_secret_output(&output, &[G2B_LEGACY_TOKEN]);
         assert!(CREDENTIALS.iter().all(|name| !auth_dir.join(name).exists()));
         assert!(!auth_dir.join(".credential-transaction").exists());
@@ -349,7 +352,10 @@ fn multiline_credential_file_fails_closed_for_every_phase() {
 
         let output = run_writer(mode, &auth_dir, &legacy_env, None);
 
-        assert!(!output.status.success(), "{mode} accepted a multiline credential");
+        assert!(
+            !output.status.success(),
+            "{mode} accepted a multiline credential"
+        );
         assert!(!auth_dir.join(".credential-transaction").exists());
         fs::write(&target, &original).unwrap();
         set_mode(&target, 0o600);
