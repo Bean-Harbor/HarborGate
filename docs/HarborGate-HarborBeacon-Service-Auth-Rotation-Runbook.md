@@ -64,20 +64,30 @@ execution. Each phase is idempotent and uses a six-file rollback transaction.
 
 ## Rollback
 
-Before `switch`, roll back Beacon and Gate packages in the approved package
-transaction; both callers still use the legacy credentials.
+No historical Beacon package is currently approved as a rollback artifact.
+Known legacy `postinst` implementations can preserve the model token while
+changing `/etc/default/harboros-beacon` to `0644`, so directly downgrading to an
+unverified historical package is unsafe.
 
-After `switch`, stop both services, roll back Gate first and Beacon second, then
-start both services. The unchanged legacy env supplies the previous approved
-credentials; no secret reconstruction is required.
+Before any rollback rehearsal or release, pin the actual installed Gate and
+Beacon package names, versions, binary digests, package SHA256 values, and
+systemd `ExecStart` commands. Inspect the exact rollback packages' maintainer
+scripts, then build or select approved compatibility rollback artifacts that
+preserve every secret-bearing environment file as `root:root 0600`.
 
-After `finalize`, use the same stopped two-package rollback. Do not attempt a
-single-service live rollback because the remaining RC verifier no longer
-accepts the legacy key.
+Validate the approved artifacts in a disposable systemd-enabled Debian
+environment through the full old -> RC -> rollback lifecycle. The evidence must
+show the selected rollback plan, package digests, service startup, credential
+owner/mode, and token-free logs. Manual post-downgrade `chmod` is not an
+acceptable recovery control.
+
+Until that evidence exists, rollback after `prepare`, `switch`, or `finalize` is
+`NO-GO`; do not use this runbook to operate on a target machine.
 
 ## Stop Conditions
 
 Stop if either direction cannot be verified before switching, the credential
-transaction cannot restore every file after a failpoint, the v2.0 contract
-header or error envelope changes, or deployment would require a request-level
+transaction cannot restore every file after a failpoint, approved rollback
+artifacts and their SHA256 values are not pinned, the v2.0 contract header or
+error envelope changes, or deployment would require a request-level
 authentication fallback.

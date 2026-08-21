@@ -2,12 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
+// The production writer is root-only. CI runs ignored tests in this target via sudo.
 const LEGACY_TOKEN: &str = "legacy_shared_token_0123456789abcdef0123456789abcdef";
 const G2B_LEGACY_TOKEN: &str = "legacy_gate_to_beacon_0123456789abcdef0123456789";
 const B2G_LEGACY_TOKEN: &str = "legacy_beacon_to_gate_0123456789abcdef0123456789";
@@ -90,10 +91,44 @@ fn assert_no_secret_output(output: &Output, secrets: &[&str]) {
     }
 }
 
-#[test]
-fn fresh_install_creates_distinct_directional_credentials() {
+fn assert_root_metadata(path: &Path, expected_mode: u32) {
+    let metadata = fs::symlink_metadata(path).expect("secured path should exist");
+    assert_eq!(metadata.uid(), 0, "{} is not owned by root", path.display());
+    assert_eq!(metadata.gid(), 0, "{} is not in group root", path.display());
+    assert_eq!(
+        metadata.permissions().mode() & 0o7777,
+        expected_mode,
+        "{} has the wrong mode",
+        path.display()
+    );
+}
+
+fn initialized_fixture() -> (TempDir, PathBuf, PathBuf) {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
+    let legacy_env = temp.path().join("missing-legacy-env");
+    assert_success_without_secret_output(&run_writer("prepare", &auth_dir, &legacy_env, None), &[]);
+    (temp, auth_dir, legacy_env)
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn set_owner(path: &Path, uid: u32, gid: u32) {
+    let status = Command::new("chown")
+        .arg(format!("{uid}:{gid}"))
+        .arg(path)
+        .status()
+        .expect("chown should execute");
+    assert!(status.success(), "chown failed for {}", path.display());
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn fresh_install_creates_distinct_directional_credentials() {
+    let temp = TempDir::new().unwrap();
+    let auth_dir = temp.path().join("etc/harboros/service-auth");
     let legacy_env = temp.path().join("missing-legacy-env");
 
     let output = run_writer("prepare", &auth_dir, &legacy_env, None);
@@ -108,23 +143,15 @@ fn fresh_install_creates_distinct_directional_credentials() {
     assert_eq!(credential(&auth_dir, "beacon-to-gate.send"), b2g);
     assert!(credential(&auth_dir, "gate-to-beacon.accept-previous").is_empty());
     assert!(credential(&auth_dir, "beacon-to-gate.accept-previous").is_empty());
-    assert_eq!(
-        fs::metadata(&auth_dir).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
+    assert_root_metadata(&auth_dir, 0o700);
+    assert_root_metadata(&auth_dir.join(".credential-writer.lock"), 0o600);
     for name in CREDENTIALS {
-        assert_eq!(
-            fs::metadata(auth_dir.join(name))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        assert_root_metadata(&auth_dir.join(name), 0o600);
     }
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn legacy_upgrade_uses_prepare_switch_finalize_without_downtime_gap() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
@@ -170,6 +197,7 @@ fn legacy_upgrade_uses_prepare_switch_finalize_without_downtime_gap() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn legacy_upgrade_parses_quoted_and_unquoted_environment_values() {
     let cases = [
         (G2B_LEGACY_TOKEN.to_string(), B2G_LEGACY_TOKEN.to_string()),
@@ -206,6 +234,7 @@ fn legacy_upgrade_parses_quoted_and_unquoted_environment_values() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn invalid_known_legacy_assignment_fails_without_generating_credentials() {
     let invalid_assignments = [
         "HARBORBEACON_WEB_API_TOKEN=too-short\n",
@@ -228,6 +257,7 @@ fn invalid_known_legacy_assignment_fails_without_generating_credentials() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn repeated_prepare_is_idempotent() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
@@ -241,6 +271,7 @@ fn repeated_prepare_is_idempotent() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn recover_mode_never_initializes_or_rotates_credentials() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
@@ -257,6 +288,7 @@ fn recover_mode_never_initializes_or_rotates_credentials() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn transaction_failure_restores_all_credential_files() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
@@ -282,6 +314,7 @@ fn transaction_failure_restores_all_credential_files() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn sigkill_interruption_is_recovered_to_the_complete_old_snapshot() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
@@ -317,6 +350,7 @@ fn sigkill_interruption_is_recovered_to_the_complete_old_snapshot() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn journal_boundaries_recover_prepared_or_keep_committed_snapshot() {
     let rollback_failpoints = [
         "before_prepared_sigkill",
@@ -407,6 +441,7 @@ fn journal_boundaries_recover_prepared_or_keep_committed_snapshot() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn recovery_is_idempotent_when_sigkill_interrupts_snapshot_restore() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
@@ -430,6 +465,7 @@ fn recovery_is_idempotent_when_sigkill_interrupts_snapshot_restore() {
         Some("after_rename_6_sigkill"),
     );
     assert!(!commit_interruption.status.success());
+    assert_no_secret_output(&commit_interruption, &[LEGACY_TOKEN]);
 
     let recovery_interruption = run_writer(
         "recover",
@@ -453,6 +489,7 @@ fn recovery_is_idempotent_when_sigkill_interrupts_snapshot_restore() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn concurrent_prepare_writers_are_serialized() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
@@ -479,6 +516,7 @@ fn concurrent_prepare_writers_are_serialized() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn repeated_prepare_repairs_previous_to_match_the_active_sender() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
@@ -510,6 +548,7 @@ fn repeated_prepare_repairs_previous_to_match_the_active_sender() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn finalize_rejects_unswitched_callers() {
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
@@ -533,12 +572,14 @@ fn finalize_rejects_unswitched_callers() {
 }
 
 #[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
 fn writer_refuses_symlinked_credential_target() {
     use std::os::unix::fs::symlink;
 
     let temp = TempDir::new().unwrap();
     let auth_dir = temp.path().join("service-auth");
     fs::create_dir(&auth_dir).unwrap();
+    set_mode(&auth_dir, 0o700);
     let protected = temp.path().join("protected");
     fs::write(&protected, "do-not-change\n").unwrap();
     symlink(&protected, auth_dir.join("gate-to-beacon.send")).unwrap();
@@ -555,8 +596,272 @@ fn writer_refuses_symlinked_credential_target() {
 }
 
 #[test]
+#[ignore = "requires root to drop privileges"]
+fn non_root_writer_fails_before_initializing_the_auth_directory() {
+    let temp = TempDir::new().unwrap();
+    set_mode(temp.path(), 0o755);
+    let auth_dir = temp.path().join("service-auth");
+    let legacy_env = temp.path().join("missing-legacy-env");
+    let helper = temp.path().join("ensure-harborbeacon-token-env");
+    fs::copy(
+        repo_root().join("debian/ensure-harborbeacon-token-env"),
+        &helper,
+    )
+    .unwrap();
+    set_mode(&helper, 0o755);
+    let output = Command::new("setpriv")
+        .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
+        .arg("bash")
+        .arg(&helper)
+        .arg("prepare")
+        .env("HARBOR_SERVICE_AUTH_DIR", &auth_dir)
+        .env("HARBOR_LEGACY_SHARED_ENV_FILE", &legacy_env)
+        .output()
+        .expect("setpriv should execute the writer");
+
+    assert!(!output.status.success());
+    assert!(!auth_dir.exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must run as root"));
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn auth_directory_mode_tampering_fails_closed_for_every_phase() {
+    let (_temp, auth_dir, legacy_env) = initialized_fixture();
+    let before = snapshot(&auth_dir);
+    for mode in ["prepare", "recover", "switch", "finalize"] {
+        for insecure_mode in [0o755, 0o770] {
+            set_mode(&auth_dir, insecure_mode);
+
+            let output = run_writer(mode, &auth_dir, &legacy_env, None);
+
+            assert!(
+                !output.status.success(),
+                "{mode} accepted mode {insecure_mode:o}"
+            );
+            assert_eq!(snapshot(&auth_dir), before);
+            assert!(!auth_dir.join(".credential-transaction").exists());
+            assert_eq!(
+                fs::symlink_metadata(&auth_dir)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                insecure_mode,
+                "{mode} silently repaired the directory mode"
+            );
+            set_mode(&auth_dir, 0o700);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn auth_directory_owner_tampering_fails_closed_for_every_phase() {
+    let (_temp, auth_dir, legacy_env) = initialized_fixture();
+    let before = snapshot(&auth_dir);
+    for mode in ["prepare", "recover", "switch", "finalize"] {
+        set_owner(&auth_dir, 65534, 65534);
+
+        let output = run_writer(mode, &auth_dir, &legacy_env, None);
+
+        assert!(!output.status.success(), "{mode} accepted a non-root owner");
+        assert_eq!(snapshot(&auth_dir), before);
+        assert!(!auth_dir.join(".credential-transaction").exists());
+        let metadata = fs::symlink_metadata(&auth_dir).unwrap();
+        assert_eq!(metadata.uid(), 65534, "{mode} silently repaired the owner");
+        assert_eq!(metadata.gid(), 65534, "{mode} silently repaired the group");
+        set_owner(&auth_dir, 0, 0);
+    }
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn credential_mode_tampering_fails_closed_for_every_file_and_phase() {
+    let (_temp, auth_dir, legacy_env) = initialized_fixture();
+    let before = snapshot(&auth_dir);
+    for mode in ["prepare", "recover", "switch", "finalize"] {
+        for name in CREDENTIALS {
+            for insecure_mode in [0o644, 0o660] {
+                let target = auth_dir.join(name);
+                set_mode(&target, insecure_mode);
+
+                let output = run_writer(mode, &auth_dir, &legacy_env, None);
+
+                assert!(
+                    !output.status.success(),
+                    "{mode} accepted mode {insecure_mode:o} for {name}"
+                );
+                assert_eq!(snapshot(&auth_dir), before);
+                assert!(!auth_dir.join(".credential-transaction").exists());
+                assert_eq!(
+                    fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o7777,
+                    insecure_mode,
+                    "{mode} silently repaired {name}"
+                );
+                set_mode(&target, 0o600);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn credential_owner_tampering_fails_closed_for_every_file_and_phase() {
+    let (_temp, auth_dir, legacy_env) = initialized_fixture();
+    let before = snapshot(&auth_dir);
+    for mode in ["prepare", "recover", "switch", "finalize"] {
+        for name in CREDENTIALS {
+            let target = auth_dir.join(name);
+            set_owner(&target, 65534, 65534);
+
+            let output = run_writer(mode, &auth_dir, &legacy_env, None);
+
+            assert!(
+                !output.status.success(),
+                "{mode} accepted a non-root owner for {name}"
+            );
+            assert_eq!(snapshot(&auth_dir), before);
+            assert!(!auth_dir.join(".credential-transaction").exists());
+            let metadata = fs::symlink_metadata(&target).unwrap();
+            assert_eq!(metadata.uid(), 65534, "{mode} silently repaired {name}");
+            assert_eq!(metadata.gid(), 65534, "{mode} silently repaired {name}");
+            set_owner(&target, 0, 0);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn lock_metadata_tampering_fails_closed_without_repairing_or_rotating() {
+    let (_temp, auth_dir, legacy_env) = initialized_fixture();
+    let before = snapshot(&auth_dir);
+    let lock = auth_dir.join(".credential-writer.lock");
+    set_mode(&lock, 0o644);
+
+    let output = run_writer("recover", &auth_dir, &legacy_env, None);
+
+    assert!(!output.status.success());
+    assert_eq!(snapshot(&auth_dir), before);
+    assert_eq!(
+        fs::symlink_metadata(lock).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn transaction_metadata_tampering_blocks_recovery_and_preserves_the_journal() {
+    let temp = TempDir::new().unwrap();
+    let auth_dir = temp.path().join("service-auth");
+    let legacy_env = temp.path().join("harboros-beacon-gate");
+    fs::write(
+        &legacy_env,
+        format!(
+            "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
+        ),
+    )
+    .unwrap();
+    assert_success_without_secret_output(
+        &run_writer("prepare", &auth_dir, &legacy_env, None),
+        &[LEGACY_TOKEN],
+    );
+    let interrupted = run_writer(
+        "switch",
+        &auth_dir,
+        &legacy_env,
+        Some("after_rename_3_sigkill"),
+    );
+    assert!(!interrupted.status.success());
+    let interrupted_snapshot = snapshot(&auth_dir);
+    let transaction = auth_dir.join(".credential-transaction");
+    assert_root_metadata(&transaction, 0o700);
+    assert_root_metadata(&transaction.join("stage"), 0o700);
+    assert_root_metadata(&transaction.join("backup"), 0o700);
+    assert_root_metadata(&transaction.join("absent"), 0o700);
+    assert_root_metadata(&transaction.join("state"), 0o600);
+    for name in CREDENTIALS {
+        assert_root_metadata(&transaction.join("backup").join(name), 0o600);
+        let staged = transaction.join("stage").join(name);
+        if staged.exists() {
+            assert_root_metadata(&staged, 0o600);
+        }
+    }
+    let backup = transaction.join("backup/gate-to-beacon.send");
+    set_mode(&backup, 0o644);
+
+    let recovery = run_writer("recover", &auth_dir, &legacy_env, None);
+
+    assert!(!recovery.status.success());
+    assert_eq!(snapshot(&auth_dir), interrupted_snapshot);
+    assert!(transaction.is_dir());
+    assert_eq!(
+        fs::symlink_metadata(backup).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn restore_temporary_metadata_is_validated_and_recovery_remains_idempotent() {
+    let temp = TempDir::new().unwrap();
+    let auth_dir = temp.path().join("service-auth");
+    let legacy_env = temp.path().join("harboros-beacon-gate");
+    fs::write(
+        &legacy_env,
+        format!(
+            "HARBORBEACON_WEB_API_TOKEN={LEGACY_TOKEN}\nIM_AGENT_SERVICE_TOKEN={LEGACY_TOKEN}\n"
+        ),
+    )
+    .unwrap();
+    assert_success_without_secret_output(
+        &run_writer("prepare", &auth_dir, &legacy_env, None),
+        &[LEGACY_TOKEN],
+    );
+    let before = snapshot(&auth_dir);
+    let commit_interruption = run_writer(
+        "switch",
+        &auth_dir,
+        &legacy_env,
+        Some("after_rename_6_sigkill"),
+    );
+    assert!(!commit_interruption.status.success());
+    assert_no_secret_output(&commit_interruption, &[LEGACY_TOKEN]);
+
+    let recovery_interruption = run_writer(
+        "recover",
+        &auth_dir,
+        &legacy_env,
+        Some("before_restore_rename_1_sigkill"),
+    );
+    assert!(!recovery_interruption.status.success());
+    assert_no_secret_output(&recovery_interruption, &[LEGACY_TOKEN]);
+    let transaction = auth_dir.join(".credential-transaction");
+    let restore = transaction.join("restore.gate-to-beacon.send");
+    assert_root_metadata(&restore, 0o600);
+    set_mode(&restore, 0o644);
+
+    let rejected = run_writer("recover", &auth_dir, &legacy_env, None);
+
+    assert!(!rejected.status.success());
+    assert_no_secret_output(&rejected, &[LEGACY_TOKEN]);
+    assert!(transaction.is_dir());
+    assert_eq!(
+        fs::symlink_metadata(&restore).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+
+    set_mode(&restore, 0o600);
+    let recovered = run_writer("recover", &auth_dir, &legacy_env, None);
+    assert_success_without_secret_output(&recovered, &[LEGACY_TOKEN]);
+    assert_eq!(snapshot(&auth_dir), before);
+    assert!(!transaction.exists());
+}
+
+#[test]
 fn package_uses_role_scoped_systemd_credentials_and_prepare_only() {
     let root = repo_root();
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     let workflow = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
     let postinst = fs::read_to_string(root.join("debian/postinst")).unwrap();
     let control = fs::read_to_string(root.join("debian/control")).unwrap();
@@ -566,6 +871,8 @@ fn package_uses_role_scoped_systemd_credentials_and_prepare_only() {
 
     assert!(workflow.contains("ensure-harborbeacon-token-env"));
     assert!(workflow.contains("harboros-service-auth-recovery.service"));
+    assert!(ci.contains("Run root-owned service-auth integration tests"));
+    assert!(ci.contains("sudo --non-interactive \"$test_binary\" --ignored --test-threads=1"));
     assert!(control.contains("util-linux"));
     assert!(control.contains("Provides: harboros-service-auth-abi (= 1)"));
     assert!(postinst.contains("ensure-harborbeacon-token-env prepare"));

@@ -44,5 +44,16 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets
 
+      - name: Run root-owned service-auth integration tests
+        shell: bash
+        run: |
+          test_binary="$(
+            cargo test --locked --test token_env_migration --no-run --message-format=json |
+              jq -r 'select(.reason == "compiler-artifact" and .target.name == "token_env_migration" and .profile.test) | .executable // empty' |
+              tail -n 1
+          )"
+          test -n "$test_binary"
+          sudo --non-interactive "$test_binary" --ignored --test-threads=1
+
       - name: Build release binary
         run: cargo build --locked --release --bin harboros-im-gate
