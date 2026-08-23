@@ -652,9 +652,9 @@ commit_credentials() {
 }
 
 case "$mode" in
-  prepare|switch|finalize|recover) ;;
+  prepare|switch|finalize|rollback|recover) ;;
   *)
-    echo "usage: ensure-harborbeacon-token-env [prepare|switch|finalize|recover]" >&2
+    echo "usage: ensure-harborbeacon-token-env [prepare|switch|finalize|rollback|recover]" >&2
     exit 64
     ;;
 esac
@@ -755,6 +755,37 @@ else
     validate_complete_state || exit 65
     g2b_send="$g2b_accept"
     b2g_send="$b2g_accept"
+  elif [ "$mode" = "rollback" ]; then
+    validate_complete_state || exit 66
+    if [ ! -e "$legacy_env_file" ] && [ ! -L "$legacy_env_file" ]; then
+      echo "legacy service-auth rollback credentials are missing" >&2
+      exit 65
+    fi
+    validate_legacy_env_file
+    if legacy_g2b="$(first_valid_legacy HARBOR_GATE_TO_BEACON_TOKEN HARBORBEACON_WEB_API_TOKEN)"; then
+      :
+    else
+      status="$?"
+      if [ "$status" -eq 1 ]; then
+        echo "gate-to-beacon rollback credential is missing" >&2
+        exit 65
+      fi
+      exit "$status"
+    fi
+    if legacy_b2g="$(first_valid_legacy HARBOR_BEACON_TO_GATE_TOKEN HARBORGATE_BEARER_TOKEN HARBOR_IM_GATEWAY_BEARER_TOKEN IM_AGENT_SERVICE_TOKEN)"; then
+      :
+    else
+      status="$?"
+      if [ "$status" -eq 1 ]; then
+        echo "beacon-to-gate rollback credential is missing" >&2
+        exit 65
+      fi
+      exit "$status"
+    fi
+    g2b_send="$legacy_g2b"
+    g2b_previous="$legacy_g2b"
+    b2g_send="$legacy_b2g"
+    b2g_previous="$legacy_b2g"
   else
     validate_complete_state || exit 66
     if [ "$g2b_send" != "$g2b_accept" ] || [ "$b2g_send" != "$b2g_accept" ]; then

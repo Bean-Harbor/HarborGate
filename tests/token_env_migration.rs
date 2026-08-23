@@ -111,6 +111,34 @@ fn initialized_fixture() -> (TempDir, PathBuf, PathBuf) {
     (temp, auth_dir, legacy_env)
 }
 
+fn finalized_legacy_fixture() -> (TempDir, PathBuf, PathBuf, String, String) {
+    let temp = TempDir::new().unwrap();
+    let auth_dir = temp.path().join("service-auth");
+    let legacy_env = temp.path().join("harboros-beacon-gate");
+    write_legacy_env(
+        &legacy_env,
+        format!(
+            "HARBOR_GATE_TO_BEACON_TOKEN={G2B_LEGACY_TOKEN}\nHARBOR_BEACON_TO_GATE_TOKEN={B2G_LEGACY_TOKEN}\n"
+        ),
+    )
+    .unwrap();
+    assert_success_without_secret_output(
+        &run_writer("prepare", &auth_dir, &legacy_env, None),
+        &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN],
+    );
+    let g2b_current = credential(&auth_dir, "gate-to-beacon.accept-current");
+    let b2g_current = credential(&auth_dir, "beacon-to-gate.accept-current");
+    assert_success_without_secret_output(
+        &run_writer("switch", &auth_dir, &legacy_env, None),
+        &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN],
+    );
+    assert_success_without_secret_output(
+        &run_writer("finalize", &auth_dir, &legacy_env, None),
+        &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN],
+    );
+    (temp, auth_dir, legacy_env, g2b_current, b2g_current)
+}
+
 fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
@@ -199,6 +227,194 @@ fn legacy_upgrade_uses_prepare_switch_finalize_without_downtime_gap() {
     assert!(credential(&auth_dir, "gate-to-beacon.accept-previous").is_empty());
     assert!(credential(&auth_dir, "beacon-to-gate.accept-previous").is_empty());
     assert_eq!(fs::read_to_string(&legacy_env).unwrap(), legacy);
+
+    let rollback = run_writer("rollback", &auth_dir, &legacy_env, None);
+    assert_success_without_secret_output(&rollback, &[LEGACY_TOKEN]);
+    assert_eq!(credential(&auth_dir, "gate-to-beacon.send"), LEGACY_TOKEN);
+    assert_eq!(credential(&auth_dir, "beacon-to-gate.send"), LEGACY_TOKEN);
+    assert_eq!(
+        credential(&auth_dir, "gate-to-beacon.accept-previous"),
+        LEGACY_TOKEN
+    );
+    assert_eq!(
+        credential(&auth_dir, "beacon-to-gate.accept-previous"),
+        LEGACY_TOKEN
+    );
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn rollback_after_finalize_restores_legacy_senders_and_previous() {
+    let (_temp, auth_dir, legacy_env, g2b_current, b2g_current) = finalized_legacy_fixture();
+
+    let rollback = run_writer("rollback", &auth_dir, &legacy_env, None);
+
+    assert_success_without_secret_output(&rollback, &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN]);
+    assert_eq!(
+        credential(&auth_dir, "gate-to-beacon.accept-current"),
+        g2b_current
+    );
+    assert_eq!(
+        credential(&auth_dir, "beacon-to-gate.accept-current"),
+        b2g_current
+    );
+    assert_eq!(
+        credential(&auth_dir, "gate-to-beacon.send"),
+        G2B_LEGACY_TOKEN
+    );
+    assert_eq!(
+        credential(&auth_dir, "gate-to-beacon.accept-previous"),
+        G2B_LEGACY_TOKEN
+    );
+    assert_eq!(
+        credential(&auth_dir, "beacon-to-gate.send"),
+        B2G_LEGACY_TOKEN
+    );
+    assert_eq!(
+        credential(&auth_dir, "beacon-to-gate.accept-previous"),
+        B2G_LEGACY_TOKEN
+    );
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn repeated_rollback_is_idempotent_and_can_switch_forward_again() {
+    let (_temp, auth_dir, legacy_env, g2b_current, b2g_current) = finalized_legacy_fixture();
+    assert_success_without_secret_output(
+        &run_writer("rollback", &auth_dir, &legacy_env, None),
+        &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN],
+    );
+    let rolled_back = snapshot(&auth_dir);
+
+    assert_success_without_secret_output(
+        &run_writer("rollback", &auth_dir, &legacy_env, None),
+        &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN],
+    );
+    assert_eq!(snapshot(&auth_dir), rolled_back);
+
+    assert_success_without_secret_output(
+        &run_writer("switch", &auth_dir, &legacy_env, None),
+        &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN],
+    );
+    assert_eq!(credential(&auth_dir, "gate-to-beacon.send"), g2b_current);
+    assert_eq!(credential(&auth_dir, "beacon-to-gate.send"), b2g_current);
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn rollback_failpoint_and_sigkill_restore_the_finalized_snapshot() {
+    for failpoint in ["after_rename_3", "after_rename_3_sigkill"] {
+        let (_temp, auth_dir, legacy_env, _g2b_current, _b2g_current) = finalized_legacy_fixture();
+        let finalized = snapshot(&auth_dir);
+
+        let interrupted = run_writer("rollback", &auth_dir, &legacy_env, Some(failpoint));
+
+        assert!(
+            !interrupted.status.success(),
+            "failpoint succeeded: {failpoint}"
+        );
+        assert_no_secret_output(&interrupted, &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN]);
+        let recovery = run_writer("recover", &auth_dir, &legacy_env, None);
+        assert_success_without_secret_output(&recovery, &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN]);
+        assert_eq!(snapshot(&auth_dir), finalized);
+        assert!(!auth_dir.join(".credential-transaction").exists());
+    }
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn concurrent_rollback_writers_are_serialized() {
+    let (_temp, auth_dir, legacy_env, g2b_current, b2g_current) = finalized_legacy_fixture();
+    let mut children = (0..8)
+        .map(|_| {
+            writer_command("rollback", &auth_dir, &legacy_env, None)
+                .spawn()
+                .expect("concurrent rollback writer should start")
+        })
+        .collect::<Vec<_>>();
+
+    for child in &mut children {
+        let status = child
+            .wait()
+            .expect("concurrent rollback writer should finish");
+        assert!(
+            status.success(),
+            "concurrent rollback writer failed: {status}"
+        );
+    }
+
+    assert_eq!(
+        credential(&auth_dir, "gate-to-beacon.accept-current"),
+        g2b_current
+    );
+    assert_eq!(
+        credential(&auth_dir, "beacon-to-gate.accept-current"),
+        b2g_current
+    );
+    assert_eq!(
+        credential(&auth_dir, "gate-to-beacon.send"),
+        G2B_LEGACY_TOKEN
+    );
+    assert_eq!(
+        credential(&auth_dir, "beacon-to-gate.send"),
+        B2G_LEGACY_TOKEN
+    );
+    assert!(!auth_dir.join(".credential-transaction").exists());
+}
+
+#[test]
+#[ignore = "requires root-owned Unix credential fixtures"]
+fn rollback_requires_complete_secure_legacy_credentials() {
+    use std::os::unix::fs::symlink;
+
+    for unsafe_kind in [
+        "missing-file",
+        "missing-direction",
+        "invalid",
+        "readable",
+        "owner",
+        "symlink",
+    ] {
+        let (temp, auth_dir, legacy_env, _g2b_current, _b2g_current) = finalized_legacy_fixture();
+        let finalized = snapshot(&auth_dir);
+        let protected = temp.path().join("protected-legacy");
+        match unsafe_kind {
+            "missing-file" => fs::remove_file(&legacy_env).unwrap(),
+            "missing-direction" => {
+                write_legacy_env(
+                    &legacy_env,
+                    format!("HARBOR_GATE_TO_BEACON_TOKEN={G2B_LEGACY_TOKEN}\n"),
+                )
+                .unwrap();
+            }
+            "invalid" => {
+                write_legacy_env(
+                    &legacy_env,
+                    format!(
+                        "HARBOR_GATE_TO_BEACON_TOKEN={G2B_LEGACY_TOKEN}\nHARBOR_BEACON_TO_GATE_TOKEN=too-short\n"
+                    ),
+                )
+                .unwrap();
+            }
+            "readable" => set_mode(&legacy_env, 0o644),
+            "owner" => set_owner(&legacy_env, 65534, 65534),
+            "symlink" => {
+                fs::rename(&legacy_env, &protected).unwrap();
+                symlink(&protected, &legacy_env).unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let output = run_writer("rollback", &auth_dir, &legacy_env, None);
+
+        assert!(
+            !output.status.success(),
+            "rollback accepted {unsafe_kind} legacy input"
+        );
+        assert_no_secret_output(&output, &[G2B_LEGACY_TOKEN, B2G_LEGACY_TOKEN, "too-short"]);
+        assert_eq!(snapshot(&auth_dir), finalized);
+        assert!(!auth_dir.join(".credential-transaction").exists());
+    }
 }
 
 #[test]
@@ -344,7 +560,7 @@ fn multiline_credential_file_fails_closed_for_every_phase() {
     let target = auth_dir.join("beacon-to-gate.accept-current");
     let original = fs::read(&target).unwrap();
 
-    for mode in ["prepare", "recover", "switch", "finalize"] {
+    for mode in ["prepare", "recover", "switch", "finalize", "rollback"] {
         let mut malformed = original.clone();
         malformed.extend_from_slice(b"second-line-without-final-newline");
         fs::write(&target, malformed).unwrap();
@@ -743,7 +959,7 @@ fn non_root_writer_fails_before_initializing_the_auth_directory() {
 fn auth_directory_mode_tampering_fails_closed_for_every_phase() {
     let (_temp, auth_dir, legacy_env) = initialized_fixture();
     let before = snapshot(&auth_dir);
-    for mode in ["prepare", "recover", "switch", "finalize"] {
+    for mode in ["prepare", "recover", "switch", "finalize", "rollback"] {
         for insecure_mode in [0o755, 0o770] {
             set_mode(&auth_dir, insecure_mode);
 
@@ -774,7 +990,7 @@ fn auth_directory_mode_tampering_fails_closed_for_every_phase() {
 fn auth_directory_owner_tampering_fails_closed_for_every_phase() {
     let (_temp, auth_dir, legacy_env) = initialized_fixture();
     let before = snapshot(&auth_dir);
-    for mode in ["prepare", "recover", "switch", "finalize"] {
+    for mode in ["prepare", "recover", "switch", "finalize", "rollback"] {
         set_owner(&auth_dir, 65534, 65534);
 
         let output = run_writer(mode, &auth_dir, &legacy_env, None);
@@ -794,7 +1010,7 @@ fn auth_directory_owner_tampering_fails_closed_for_every_phase() {
 fn credential_mode_tampering_fails_closed_for_every_file_and_phase() {
     let (_temp, auth_dir, legacy_env) = initialized_fixture();
     let before = snapshot(&auth_dir);
-    for mode in ["prepare", "recover", "switch", "finalize"] {
+    for mode in ["prepare", "recover", "switch", "finalize", "rollback"] {
         for name in CREDENTIALS {
             for insecure_mode in [0o644, 0o660] {
                 let target = auth_dir.join(name);
@@ -824,7 +1040,7 @@ fn credential_mode_tampering_fails_closed_for_every_file_and_phase() {
 fn credential_owner_tampering_fails_closed_for_every_file_and_phase() {
     let (_temp, auth_dir, legacy_env) = initialized_fixture();
     let before = snapshot(&auth_dir);
-    for mode in ["prepare", "recover", "switch", "finalize"] {
+    for mode in ["prepare", "recover", "switch", "finalize", "rollback"] {
         for name in CREDENTIALS {
             let target = auth_dir.join(name);
             set_owner(&target, 65534, 65534);
@@ -983,6 +1199,8 @@ fn package_uses_role_scoped_systemd_credentials_and_prepare_only() {
     let recovery_unit =
         fs::read_to_string(root.join("debian/harboros-service-auth-recovery.service")).unwrap();
     let package_builder = fs::read_to_string(root.join("debian/build-amd64-package")).unwrap();
+    let credential_writer =
+        fs::read_to_string(root.join("debian/ensure-harborbeacon-token-env")).unwrap();
     let cargo = fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let server = fs::read_to_string(root.join("src/server.rs")).unwrap();
 
@@ -995,6 +1213,8 @@ fn package_uses_role_scoped_systemd_credentials_and_prepare_only() {
     assert!(postinst.contains("ensure-harborbeacon-token-env prepare"));
     assert!(!postinst.contains("ensure-harborbeacon-token-env switch"));
     assert!(!postinst.contains("ensure-harborbeacon-token-env finalize"));
+    assert!(!postinst.contains("ensure-harborbeacon-token-env rollback"));
+    assert!(credential_writer.contains("prepare|switch|finalize|rollback|recover"));
     assert!(unit.contains("Requires=harboros-service-auth-recovery.service"));
     assert!(unit.contains("After=harboros-service-auth-recovery.service"));
     assert!(!unit.contains("EnvironmentFile=-/etc/default/harboros-beacon-gate"));

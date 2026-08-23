@@ -64,6 +64,23 @@ execution. Each phase is idempotent and uses a six-file rollback transaction.
 
 ## Rollback
 
+Before downgrading either service, restore the protected legacy senders while
+keeping the new current verifier keys available:
+
+```bash
+/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env rollback
+systemctl restart harboros-beacon.service
+systemctl restart harboros-im-gate.service
+```
+
+`rollback` is transactional and safe to repeat. It requires both old
+directional sender credentials from the unchanged root-owned `0600` legacy
+environment file. It restores each old sender into that direction's `send` and
+`accept-previous` files, including after `finalize`, but preserves both new
+`accept-current` files. This lets Beacon and Gate be downgraded one at a time
+without creating an authentication gap. Missing, malformed, symlinked,
+non-root-owned, or group/world-accessible legacy input is a hard stop.
+
 No historical Beacon package is currently approved as a rollback artifact.
 Known legacy `postinst` implementations can preserve the model token while
 changing `/etc/default/harboros-beacon` to `0644`, so directly downgrading to an
@@ -81,8 +98,10 @@ show the selected rollback plan, package digests, service startup, credential
 owner/mode, and token-free logs. Manual post-downgrade `chmod` is not an
 acceptable recovery control.
 
-Until that evidence exists, rollback after `prepare`, `switch`, or `finalize` is
-`NO-GO`; do not use this runbook to operate on a target machine.
+The credential rollback phase does not make an historical package safe. Until
+the compatibility artifact evidence exists, package downgrade after `prepare`,
+`switch`, or `finalize` is `NO-GO`; do not use this runbook to operate on a
+target machine.
 
 ## Stop Conditions
 
