@@ -105,6 +105,7 @@ impl AppConfig {
         });
         let gate_to_beacon_token = credential_first(
             "HARBOR_GATE_TO_BEACON_TOKEN_FILE",
+            "gate-to-beacon-send",
             &["HARBOR_GATE_TO_BEACON_TOKEN", "HARBORBEACON_WEB_API_TOKEN"],
         );
         Self {
@@ -117,10 +118,12 @@ impl AppConfig {
             contract_version: env_or("IM_AGENT_CONTRACT_VERSION", "2.0"),
             service_token: credential_first(
                 "HARBOR_BEACON_TO_GATE_TOKEN_FILE",
+                "beacon-to-gate-accept-current",
                 &["HARBOR_BEACON_TO_GATE_TOKEN", "IM_AGENT_SERVICE_TOKEN"],
             ),
             service_token_previous: credential_first(
                 "HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS_FILE",
+                "beacon-to-gate-accept-previous",
                 &["HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS"],
             ),
             harborbeacon_base_url: base_url,
@@ -348,15 +351,33 @@ fn env_first(keys: &[&str]) -> String {
     String::new()
 }
 
-fn credential_first(file_env: &str, env_keys: &[&str]) -> String {
-    let file_path = env_trim(file_env);
-    if !file_path.is_empty() {
+fn credential_first(file_env: &str, credential_name: &str, env_keys: &[&str]) -> String {
+    if let Some(file_path) = credential_file_path(file_env, credential_name) {
         return fs::read_to_string(file_path)
             .ok()
             .map(|value| value.trim().to_string())
             .unwrap_or_default();
     }
     env_first(env_keys)
+}
+
+fn credential_file_path(file_env: &str, credential_name: &str) -> Option<PathBuf> {
+    credential_file_path_from_values(
+        &env_trim("CREDENTIALS_DIRECTORY"),
+        &env_trim(file_env),
+        credential_name,
+    )
+}
+
+fn credential_file_path_from_values(
+    credentials_directory: &str,
+    configured_file: &str,
+    credential_name: &str,
+) -> Option<PathBuf> {
+    if !credentials_directory.is_empty() {
+        return Some(PathBuf::from(credentials_directory).join(credential_name));
+    }
+    (!configured_file.is_empty()).then(|| PathBuf::from(configured_file))
 }
 
 fn strip_endpoint_suffix(base_url: &str, endpoint_suffix: &str) -> String {
@@ -474,6 +495,25 @@ mod tests {
             enable_live_send: false,
             timeout_seconds: 20,
         }
+    }
+
+    #[test]
+    fn systemd_credentials_directory_takes_precedence_over_configured_file() {
+        assert_eq!(
+            credential_file_path_from_values(
+                "/run/credentials/harboros-im-gate.service",
+                "/tmp/explicit-token",
+                "gate-to-beacon-send",
+            ),
+            Some(PathBuf::from(
+                "/run/credentials/harboros-im-gate.service/gate-to-beacon-send",
+            ))
+        );
+        assert_eq!(
+            credential_file_path_from_values("", "/tmp/explicit-token", "unused"),
+            Some(PathBuf::from("/tmp/explicit-token"))
+        );
+        assert_eq!(credential_file_path_from_values("", "", "unused"), None);
     }
 
     #[test]

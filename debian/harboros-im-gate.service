@@ -11,9 +11,6 @@ Environment=HARBORGATE_DEVICE_SESSION_STATE_DIR=/var/lib/harboros-im-gate/device
 LoadCredential=gate-to-beacon-send:/etc/harboros/service-auth/gate-to-beacon.send
 LoadCredential=beacon-to-gate-accept-current:/etc/harboros/service-auth/beacon-to-gate.accept-current
 LoadCredential=beacon-to-gate-accept-previous:/etc/harboros/service-auth/beacon-to-gate.accept-previous
-Environment=HARBOR_GATE_TO_BEACON_TOKEN_FILE=%d/gate-to-beacon-send
-Environment=HARBOR_BEACON_TO_GATE_TOKEN_FILE=%d/beacon-to-gate-accept-current
-Environment=HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS_FILE=%d/beacon-to-gate-accept-previous
 EnvironmentFile=-/etc/default/harboros-im-gate
 ExecStart=/usr/bin/harboros-im-gate
 Restart=always

@@ -1221,6 +1221,10 @@ fn package_uses_role_scoped_systemd_credentials_and_prepare_only() {
     assert!(unit.contains("LoadCredential=gate-to-beacon-send:"));
     assert!(unit.contains("LoadCredential=beacon-to-gate-accept-current:"));
     assert!(unit.contains("LoadCredential=beacon-to-gate-accept-previous:"));
+    assert!(!unit.contains("TOKEN_FILE=%d"));
+    assert!(fs::read_to_string(root.join("src/config.rs"))
+        .unwrap()
+        .contains("CREDENTIALS_DIRECTORY"));
     assert!(!unit.contains("HARBOR_TASK_API_BEARER_TOKEN"));
     assert!(!unit.contains("HARBOR_MODEL_API_TOKEN"));
     assert!(recovery_unit.contains("Type=oneshot"));
