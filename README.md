@@ -89,9 +89,10 @@ Knowledge search and conversation JSON requests require a fresh 30-second
 single-use HarborOS token in `X-HarborOS-Auth-Token`. HarborGate validates the
 token through middleware, removes all client identity and authorization input,
 and forwards a canonical HarborOS principal with the Gate-to-Beacon service
-bearer. The proxy requires `HARBORBEACON_WEB_API_TOKEN` and never falls back to
-the legacy IM `HARBORBEACON_TASK_API_TOKEN`. Browser clients must never receive
-the service bearer.
+bearer. The proxy requires `HARBOR_GATE_TO_BEACON_TOKEN`; the legacy
+`HARBORBEACON_WEB_API_TOKEN` name is accepted only during the RC migration and
+never falls back to task or Beacon-to-Gate credentials. Browser clients must
+never receive the service bearer.
 
 Rules that must not drift:
 
@@ -137,11 +138,16 @@ Core:
 IM_AGENT_HOST=127.0.0.1
 IM_AGENT_PORT=8787
 IM_AGENT_CONTRACT_VERSION=2.0
-IM_AGENT_SERVICE_TOKEN=<shared-service-token>
+HARBOR_BEACON_TO_GATE_TOKEN=<inbound-current-token>
+HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS=<inbound-rotation-token>
 HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
-HARBORBEACON_WEB_API_TOKEN=<shared-service-token>
+HARBOR_GATE_TO_BEACON_TOKEN=<outbound-current-token>
 HARBOR_WORKSPACE_ID=home-1
 ```
+
+Packaged services receive these values through role-scoped systemd credentials.
+See `docs/HarborGate-HarborBeacon-Service-Auth-Rotation-Runbook.md` for the
+prepare, switch, finalize, and rollback order.
 
 Feishu:
 
