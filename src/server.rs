@@ -820,66 +820,74 @@ fn beacon_proxy_target_path_from_original_uri(
     let raw_suffix = request_path
         .strip_prefix(proxy_prefix)
         .ok_or_else(|| GatewayError::validation("Beacon proxy path does not match its facade"))?;
-    if let Some(target_path) = cat_detection_control_proxy_target_path(raw_suffix, query)? {
+    if let Some(target_path) = detection_control_proxy_target_path(raw_suffix, query)? {
         return Ok(target_path);
     }
     let fallback_target_path = beacon_proxy_target_path(decoded_path, query);
-    if is_cat_detection_control_target_after_url_normalization(&fallback_target_path) {
+    if is_detection_control_target_after_url_normalization(&fallback_target_path) {
         return Err(GatewayError::validation(
-            "Cat detection control path is not canonical",
+            "Detection control path is not canonical",
         ));
     }
     Ok(fallback_target_path)
 }
 
-fn cat_detection_control_proxy_target_path(
+const DETECTION_CONTROL_SUFFIXES: [&str; 2] =
+    ["/cat-detection/control", "/package-detection/control"];
+
+fn detection_control_proxy_target_path(
     raw_suffix: &str,
     query: Option<&str>,
 ) -> Result<Option<String>, GatewayError> {
     let raw_tail_after_separator = raw_suffix.strip_prefix('/').unwrap_or(raw_suffix);
     let decoded_tail = urlencoding::decode(raw_tail_after_separator).map_err(|_| {
-        GatewayError::validation("Cat detection control path contains invalid percent encoding")
+        GatewayError::validation("Detection control path contains invalid percent encoding")
     })?;
-    let decoded_control_candidate = is_cat_detection_control_path_candidate(&decoded_tail);
+    let decoded_control_candidate = detection_control_suffix(&decoded_tail).is_some();
     if !decoded_control_candidate {
         let twice_decoded_control_candidate = urlencoding::decode(&decoded_tail)
-            .map(|twice_decoded_tail| is_cat_detection_control_path_candidate(&twice_decoded_tail))
+            .map(|twice_decoded_tail| detection_control_suffix(&twice_decoded_tail).is_some())
             .unwrap_or(false);
         if twice_decoded_control_candidate {
             return Err(GatewayError::validation(
-                "Cat detection control path is not canonical",
+                "Detection control path is not canonical",
             ));
         }
         return Ok(None);
     }
 
-    let camera_id = raw_suffix
+    let raw_tail = raw_suffix
         .strip_prefix('/')
         .filter(|tail| !tail.starts_with('/'))
-        .and_then(|tail| tail.strip_prefix("cameras/"))
-        .and_then(|suffix| suffix.strip_suffix("/cat-detection/control"))
-        .filter(|camera_id| is_safe_cat_detection_control_camera_id(camera_id))
-        .ok_or_else(|| GatewayError::validation("Cat detection control path is not canonical"))?;
+        .ok_or_else(|| GatewayError::validation("Detection control path is not canonical"))?;
+    let control_suffix = detection_control_suffix(raw_tail)
+        .ok_or_else(|| GatewayError::validation("Detection control path is not canonical"))?;
+    let camera_id = raw_tail
+        .strip_prefix("cameras/")
+        .and_then(|suffix| suffix.strip_suffix(control_suffix))
+        .filter(|camera_id| is_safe_detection_control_camera_id(camera_id))
+        .ok_or_else(|| GatewayError::validation("Detection control path is not canonical"))?;
     Ok(Some(beacon_proxy_target_path(
-        &format!("cameras/{camera_id}/cat-detection/control"),
+        &format!("cameras/{camera_id}{control_suffix}"),
         query,
     )))
 }
 
-fn is_cat_detection_control_path_candidate(path: &str) -> bool {
-    path.trim_start_matches('/')
-        .strip_prefix("cameras/")
-        .and_then(|suffix| suffix.strip_suffix("/cat-detection/control"))
-        .is_some()
+fn detection_control_suffix(path: &str) -> Option<&'static str> {
+    let camera_path = path.trim_start_matches('/').strip_prefix("cameras/")?;
+    DETECTION_CONTROL_SUFFIXES
+        .iter()
+        .copied()
+        .find(|suffix| camera_path.strip_suffix(suffix).is_some())
 }
 
-fn is_cat_detection_control_target_after_url_normalization(target_path: &str) -> bool {
+fn is_detection_control_target_after_url_normalization(target_path: &str) -> bool {
     url::Url::parse(&format!("http://harborgate.invalid{target_path}"))
-        .map(|url| is_cat_detection_control_proxy_path(url.path()))
+        .map(|url| is_detection_control_proxy_path(url.path()))
         .unwrap_or(false)
 }
 
-fn is_safe_cat_detection_control_camera_id(camera_id: &str) -> bool {
+fn is_safe_detection_control_camera_id(camera_id: &str) -> bool {
     if camera_id.is_empty()
         || camera_id.contains('/')
         || camera_id.contains('\\')
@@ -892,13 +900,13 @@ fn is_safe_cat_detection_control_camera_id(camera_id: &str) -> bool {
         Ok(decoded) => decoded,
         Err(_) => return false,
     };
-    if is_unsafe_cat_detection_control_camera_id(&decoded) {
+    if is_unsafe_detection_control_camera_id(&decoded) {
         return false;
     }
     true
 }
 
-fn is_unsafe_cat_detection_control_camera_id(camera_id: &str) -> bool {
+fn is_unsafe_detection_control_camera_id(camera_id: &str) -> bool {
     camera_id.contains('\\')
         || camera_id.contains("//")
         || camera_id
@@ -942,7 +950,7 @@ fn requires_harboros_principal(method: &Method, target_path: &str) -> bool {
     if method == Method::GET && is_cat_detection_observation_proxy_path(path) {
         return true;
     }
-    if matches!(method, &Method::GET | &Method::PUT) && is_cat_detection_control_proxy_path(path) {
+    if matches!(method, &Method::GET | &Method::PUT) && is_detection_control_proxy_path(path) {
         return true;
     }
     if path == DETECTION_JOBS || path.starts_with(&format!("{DETECTION_JOBS}/")) {
@@ -967,10 +975,8 @@ fn is_cat_detection_observation_proxy_path(path: &str) -> bool {
         .is_some_and(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
 }
 
-fn is_cat_detection_control_proxy_path(path: &str) -> bool {
-    path.strip_prefix("/api/cameras/")
-        .and_then(|suffix| suffix.strip_suffix("/cat-detection/control"))
-        .is_some_and(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
+fn is_detection_control_proxy_path(path: &str) -> bool {
+    detection_control_camera_id(path).is_some()
 }
 
 fn cat_detection_observation_camera_id(target_path: &str) -> Option<String> {
@@ -981,11 +987,11 @@ fn cat_detection_observation_camera_id(target_path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn cat_detection_control_camera_id(target_path: &str) -> Option<String> {
+fn detection_control_camera_id(target_path: &str) -> Option<String> {
     let path = target_path.split('?').next().unwrap_or(target_path);
-    let encoded = path
-        .strip_prefix("/api/cameras/")?
-        .strip_suffix("/cat-detection/control")?;
+    let camera_path = path.strip_prefix("/api/cameras/")?;
+    let control_suffix = detection_control_suffix(&format!("cameras/{camera_path}"))?;
+    let encoded = camera_path.strip_suffix(control_suffix)?;
     if encoded.is_empty() || encoded.contains('/') {
         return None;
     }
@@ -1009,7 +1015,7 @@ async fn authenticate_proxy_principal(
         return authenticate_harboros_request(state, headers).await;
     }
     if matches!(method, &Method::GET | &Method::PUT) {
-        if let Some(camera_id) = cat_detection_control_camera_id(target_path) {
+        if let Some(camera_id) = detection_control_camera_id(target_path) {
             return Ok(HarborOsPrincipal {
                 source: "harbornavi-lan".to_string(),
                 principal_id: "harbornavi-lan:anonymous".to_string(),
