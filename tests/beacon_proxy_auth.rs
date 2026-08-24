@@ -70,6 +70,8 @@ async fn capture_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
+    let is_supported_control_request = matches!(&method, &Method::GET | &Method::PUT)
+        && uri.path().ends_with("/cat-detection/control");
     captured.lock().await.push(CapturedRequest {
         method,
         path_and_query: uri.to_string(),
@@ -99,6 +101,14 @@ async fn capture_request(
             "Sat, 02 Aug 2026 00:00:00 GMT".parse().unwrap(),
         );
         return response;
+    }
+    if is_supported_control_request {
+        return (
+            StatusCode::ACCEPTED,
+            [("content-type", "application/json")],
+            Bytes::from_static(br#"{"state":"accepted"}"#),
+        )
+            .into_response();
     }
     Json(json!({"ok": true})).into_response()
 }
@@ -356,6 +366,511 @@ async fn observation_is_open_while_detection_job_control_requires_authentication
 }
 
 #[tokio::test]
+async fn cat_detection_control_requires_harboros_principal_and_preserves_upstream_response() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+    let request_body = br#"{"enabled":true,"mode":"balanced"}"#;
+
+    let control_paths = [
+        "/api/beacon/cameras/camera%2F252/cat-detection/control",
+        "/api/harbor-assistant/cameras/camera%2F252/cat-detection/control",
+        "/api/harbor-gate/api/beacon/cameras/camera%2F252/cat-detection/control",
+    ];
+
+    for path in control_paths {
+        for method in [Method::GET, Method::PUT] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .header("content-type", "application/json")
+                .header(
+                    "x-harboros-auth-token",
+                    format!("control-token-{method}-{path}"),
+                )
+                .body(if method == Method::PUT {
+                    Body::from(Bytes::from_static(request_body))
+                } else {
+                    Body::empty()
+                })
+                .unwrap();
+
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "{method} {path}");
+            assert_eq!(
+                response_body(response).await,
+                r#"{"state":"accepted"}"#,
+                "{method} {path}"
+            );
+        }
+    }
+
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 6);
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(
+            request.path_and_query,
+            "/api/cameras/camera%2F252/cat-detection/control"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-principal-id").unwrap(),
+            "harboros:uid:42"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-principal-roles").unwrap(),
+            "FULL_ADMIN,SYSTEM_READ"
+        );
+        if index % 2 == 1 {
+            assert_eq!(request.body, Bytes::from_static(request_body));
+        } else {
+            assert!(request.body.is_empty());
+        }
+    }
+    drop(requests);
+    assert_eq!(authenticator.tokens().await.len(), 6);
+}
+
+#[tokio::test]
+async fn cat_detection_control_allows_anonymous_lan_get_and_put_without_session() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+
+    for method in [Method::GET, Method::PUT] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method.clone())
+                    .uri("/api/beacon/cameras/camera-252/cat-detection/control")
+                    .header("content-type", "application/json")
+                    .body(if method == Method::PUT {
+                        Body::from(r#"{"enabled":true,"stream_profile":"sub"}"#)
+                    } else {
+                        Body::empty()
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "{method}");
+        assert_eq!(response_body(response).await, r#"{"state":"accepted"}"#);
+    }
+
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(
+            request.headers.get("x-harbor-principal-source").unwrap(),
+            "harbornavi-lan"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-principal-id").unwrap(),
+            "harbornavi-lan:anonymous"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-principal-roles").unwrap(),
+            "CAMERA_CONTROL"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-camera-scope").unwrap(),
+            "camera-252"
+        );
+    }
+    drop(requests);
+    assert!(authenticator.tokens().await.is_empty());
+}
+
+#[tokio::test]
+async fn cat_detection_control_does_not_downgrade_failed_harboros_authentication() {
+    let (beacon_url, observer_captured) = mock_beacon().await;
+    let observer = FakeAuthenticator::new(Err(HarborOsAuthFailure::FullAdminRequired));
+    let (observer_state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(observer.clone()),
+    );
+    let observer_response = router(observer_state)
+        .oneshot(
+            Request::get("/api/beacon/cameras/camera-252/cat-detection/control")
+                .header("x-harboros-auth-token", "observation-only-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(observer_response.status(), StatusCode::FORBIDDEN);
+    assert!(observer_captured.lock().await.is_empty());
+    assert_eq!(observer.tokens().await, vec!["observation-only-token"]);
+}
+
+#[tokio::test]
+async fn malformed_or_unsupported_cat_detection_control_paths_remain_unprivileged() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+
+    for (method, path) in [
+        (
+            Method::GET,
+            "/api/beacon/cameras/camera-252/cat-detection/control/extra",
+        ),
+        (
+            Method::POST,
+            "/api/beacon/cameras/camera-252/cat-detection/control",
+        ),
+        (
+            Method::DELETE,
+            "/api/harbor-assistant/cameras/camera-252/cat-detection/control",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("x-harboros-auth-token", "unused-control-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+
+    assert_eq!(captured.lock().await.len(), 3);
+    assert!(authenticator.tokens().await.is_empty());
+}
+
+#[tokio::test]
+async fn malformed_control_canonicalization_is_rejected_before_authentication_or_proxying() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+    let invalid_control_suffixes = [
+        "//cameras/camera-252/cat-detection/control",
+        "/cameras%2Fcamera-252/cat-detection/control",
+        "/cameras/camera-252/cat-detection%2Fcontrol",
+        "/cameras/./cat-detection/control",
+        "/cameras/../cat-detection/control",
+        "/cameras/%2E/cat-detection/control",
+        "/cameras/%2E%2E/cat-detection/control",
+        "/cameras/camera%5C252/cat-detection/control",
+        "/cameras/camera\\252/cat-detection/control",
+    ];
+
+    for facade in [
+        "/api/beacon",
+        "/api/harbor-assistant",
+        "/api/harbor-gate/api/beacon",
+    ] {
+        for suffix in invalid_control_suffixes {
+            let path = format!("{facade}{suffix}");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put(&path)
+                        .header("x-harboros-auth-token", "must-not-be-consumed")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+        }
+    }
+
+    assert!(captured.lock().await.is_empty());
+    assert!(authenticator.tokens().await.is_empty());
+}
+
+#[tokio::test]
+async fn double_encoded_control_candidates_are_rejected_before_authentication_or_proxying() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+    let invalid_control_suffixes = [
+        "/cameras%252Fcamera-252/cat-detection/control",
+        "/cameras/camera-252/cat-detection%252Fcontrol",
+        "/cameras%252F%252E%252Fcat-detection%252Fcontrol",
+        "/cameras%252Fcamera%255C252%252Fcat-detection%252Fcontrol",
+    ];
+
+    for facade in [
+        "/api/beacon",
+        "/api/harbor-assistant",
+        "/api/harbor-gate/api/beacon",
+    ] {
+        for suffix in invalid_control_suffixes {
+            let path = format!("{facade}{suffix}");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put(&path)
+                        .header("x-harboros-auth-token", "must-not-be-consumed")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+        }
+    }
+
+    assert!(captured.lock().await.is_empty());
+    assert!(authenticator.tokens().await.is_empty());
+}
+
+#[tokio::test]
+async fn control_paths_with_prefixed_canonicalization_are_rejected_before_authentication_or_proxying(
+) {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+    let invalid_control_suffixes = [
+        "/ignored/../cameras/camera-252/cat-detection/control",
+        "/ignored/%2E%2E/cameras/camera-252/cat-detection/control",
+        "/ignored/%252E%252E/cameras/camera-252/cat-detection/control",
+        "/ignored\\..\\cameras\\camera-252\\cat-detection\\control",
+        "/ignored%5C..%5Ccameras%5Ccamera-252%5Ccat-detection%5Ccontrol",
+    ];
+
+    for facade in [
+        "/api/beacon",
+        "/api/harbor-assistant",
+        "/api/harbor-gate/api/beacon",
+    ] {
+        for method in [Method::GET, Method::PUT] {
+            for suffix in invalid_control_suffixes {
+                let path = format!("{facade}{suffix}");
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method.clone())
+                            .uri(&path)
+                            .header("x-harboros-auth-token", "must-not-be-consumed")
+                            .body(Body::from("{}"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    assert!(captured.lock().await.is_empty());
+    assert!(authenticator.tokens().await.is_empty());
+}
+
+#[tokio::test]
+async fn ordinary_percent_encoded_paths_keep_axum_decoded_proxy_semantics() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+    let facades = [
+        "/api/beacon",
+        "/api/harbor-assistant",
+        "/api/harbor-gate/api/beacon",
+    ];
+
+    for facade in facades {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "{facade}/cameras/camera%2D252/cat-detection/observation"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    for facade in facades {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("{facade}/vision/detection%2Djobs/job%2D1"))
+                    .header("x-harboros-auth-token", format!("token-{facade}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 6);
+    for request in requests.iter().take(3) {
+        assert_eq!(
+            request.path_and_query,
+            "/api/cameras/camera-252/cat-detection/observation"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-camera-scope").unwrap(),
+            "camera-252"
+        );
+    }
+    for request in requests.iter().skip(3) {
+        assert_eq!(request.path_and_query, "/api/vision/detection-jobs/job-1");
+        assert_eq!(
+            request.headers.get("x-harbor-principal-id").unwrap(),
+            "harboros:uid:42"
+        );
+    }
+    drop(requests);
+    assert_eq!(authenticator.tokens().await.len(), 3);
+}
+
+#[tokio::test]
+async fn canonical_control_keeps_single_decoded_camera_ids_and_replaces_client_identity() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+    let camera_ids = ["camera%25fleet", "camera%252F252"];
+    let facades = [
+        "/api/beacon",
+        "/api/harbor-assistant",
+        "/api/harbor-gate/api/beacon",
+    ];
+    let mut expected_requests = Vec::new();
+
+    for camera_id in camera_ids {
+        for facade in facades {
+            for method in [Method::GET, Method::PUT] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method.clone())
+                            .uri(format!(
+                                "{facade}/cameras/{camera_id}/cat-detection/control"
+                            ))
+                            .header("content-type", "application/json")
+                            .header("authorization", "Bearer browser-controlled")
+                            .header(
+                                "x-harboros-auth-token",
+                                format!("token-{camera_id}-{facade}-{method}"),
+                            )
+                            .header("x-harbor-principal-source", "client")
+                            .header("x-harbor-principal-id", "client:spoof")
+                            .header("x-harbor-principal-roles", "SUPERUSER")
+                            .header("x-harbor-workspace-id", "evil")
+                            .body(Body::from("{}"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                assert_eq!(
+                    response.headers().get("content-type").unwrap(),
+                    "application/json"
+                );
+                expected_requests.push((
+                    method,
+                    format!("/api/cameras/{camera_id}/cat-detection/control"),
+                ));
+            }
+        }
+    }
+
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), expected_requests.len());
+    for (request, (method, target_path)) in requests.iter().zip(expected_requests) {
+        assert_eq!(request.method, method);
+        assert_eq!(request.path_and_query, target_path);
+        assert_eq!(
+            request.headers.get("content-type").unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer beacon-service-secret"
+        );
+        assert!(request.headers.get("x-harboros-auth-token").is_none());
+        assert_eq!(
+            request.headers.get("x-harbor-principal-source").unwrap(),
+            "harboros"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-principal-id").unwrap(),
+            "harboros:uid:42"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-principal-roles").unwrap(),
+            "FULL_ADMIN,SYSTEM_READ"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-workspace-id").unwrap(),
+            "home-1"
+        );
+    }
+    drop(requests);
+    assert_eq!(authenticator.tokens().await.len(), 12);
+}
+
+#[tokio::test]
 async fn authenticated_detection_job_request_replaces_spoofed_principal() {
     let (beacon_url, captured) = mock_beacon().await;
     let authenticator = FakeAuthenticator::successful();
@@ -516,7 +1031,7 @@ async fn anonymous_observation_uses_camera_scoped_lan_principal_and_keeps_mutati
 }
 
 #[tokio::test]
-async fn device_session_endpoints_no_longer_gate_camera_observation() {
+async fn device_session_cookie_does_not_limit_anonymous_lan_cat_detection_control() {
     let (beacon_url, captured) = mock_beacon().await;
     let authenticator = FakeAuthenticator::successful();
     let (state, _temp_dir) = test_state(
@@ -524,6 +1039,7 @@ async fn device_session_endpoints_no_longer_gate_camera_observation() {
         "beacon-service-secret",
         Arc::new(authenticator.clone()),
     );
+    let device_sessions = state.device_sessions.clone();
     let pairing = state
         .device_sessions
         .issue_pairing("camera-252", 300)
@@ -637,14 +1153,97 @@ async fn device_session_endpoints_no_longer_gate_camera_observation() {
     );
 
     let detection_jobs = Request::get("/api/beacon/vision/detection-jobs")
-        .header("cookie", cookie)
+        .header("cookie", &cookie)
         .body(Body::empty())
         .unwrap();
     assert_eq!(
-        app.oneshot(detection_jobs).await.unwrap().status(),
+        app.clone().oneshot(detection_jobs).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
-    assert_eq!(captured.lock().await.len(), 2);
+    let get_control =
+        Request::get("/api/harbor-gate/api/beacon/cameras/camera-252/cat-detection/control")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+    assert_eq!(
+        app.clone().oneshot(get_control).await.unwrap().status(),
+        StatusCode::ACCEPTED
+    );
+    let put_control =
+        Request::put("/api/harbor-gate/api/beacon/cameras/camera-252/cat-detection/control")
+            .header("content-type", "application/json")
+            .header("cookie", &cookie)
+            .body(Body::from(r#"{"enabled":true,"stream_profile":"sub"}"#))
+            .unwrap();
+    assert_eq!(
+        app.clone().oneshot(put_control).await.unwrap().status(),
+        StatusCode::ACCEPTED
+    );
+
+    for method in [Method::GET, Method::PUT] {
+        let wrong_camera = Request::builder()
+            .method(method)
+            .uri("/api/harbor-gate/api/beacon/cameras/camera-999/cat-detection/control")
+            .header("content-type", "application/json")
+            .header("cookie", &cookie)
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(wrong_camera).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    let anonymous_control =
+        Request::get("/api/harbor-gate/api/beacon/cameras/camera-252/cat-detection/control")
+            .body(Body::empty())
+            .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(anonymous_control)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+
+    let session_token = cookie.split_once('=').expect("device session cookie").1;
+    device_sessions.revoke(session_token).unwrap();
+    let revoked_control =
+        Request::get("/api/harbor-gate/api/beacon/cameras/camera-252/cat-detection/control")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+    assert_eq!(
+        app.oneshot(revoked_control).await.unwrap().status(),
+        StatusCode::ACCEPTED
+    );
+
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 8);
+    for request in &requests[2..] {
+        assert_eq!(
+            request.headers.get("x-harbor-principal-source").unwrap(),
+            "harbornavi-lan"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-principal-id").unwrap(),
+            "harbornavi-lan:anonymous"
+        );
+        assert_eq!(
+            request.headers.get("x-harbor-principal-roles").unwrap(),
+            "CAMERA_CONTROL"
+        );
+        let expected_camera = if request.path_and_query.contains("camera-999") {
+            "camera-999"
+        } else {
+            "camera-252"
+        };
+        assert_eq!(
+            request.headers.get("x-harbor-camera-scope").unwrap(),
+            expected_camera
+        );
+    }
     assert!(authenticator.tokens().await.is_empty());
 }
 
