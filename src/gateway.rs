@@ -3933,6 +3933,35 @@ mod tests {
     }
 
     #[test]
+    fn structured_package_notification_selects_one_native_image() {
+        let payload = json!({
+            "content": {
+                "title": "HarborNavi 包裹提醒",
+                "body": "门口可能出现了一个包裹。",
+                "attachments": [{
+                    "artifact_id": "snapshots~camera.252~frame.jpg",
+                    "kind": "image",
+                    "label": "包裹抓拍",
+                    "mime_type": "image/jpeg",
+                    "path": null,
+                    "url": "/api/cameras/recordings/artifacts/snapshots~camera.252~frame.jpg"
+                }],
+                "delivery_hints": [{"kind": "native_image", "max_items": 1}]
+            }
+        });
+
+        let content = delivery_content(&payload);
+        let attachments = hinted_notification_attachments(&content);
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0]["kind"], "image");
+        assert_eq!(
+            attachments[0]["artifact_id"],
+            "snapshots~camera.252~frame.jpg"
+        );
+    }
+
+    #[test]
     fn weixin_selects_mixed_url_backed_snapshot_and_clip() {
         let response = json!({
             "artifacts": [
