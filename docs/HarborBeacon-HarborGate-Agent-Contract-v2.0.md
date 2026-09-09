@@ -34,6 +34,23 @@ HarborGate owns IM transport:
 - delivery retry and provider failure mapping
 - redacted gateway status
 
+## Product Boundary Scope
+
+This v2.0 contract only freezes the HarborBeacon <-> HarborGate IM/channel
+service-to-service seam. It does not assign the wider product boundaries:
+
+- HarborCloud owns account, entitlement, Hub identity, WebRTC signaling, and
+  cloud metadata.
+- HarborLink owns Hub-side outbound MQTT, command acknowledgements, and local
+  Home Assistant/camera bridge execution.
+- harbor-dock owns Android/Paper UI state and user intent.
+- HarborNAS-webui owns HarborOS WebUI presentation and same-origin operation
+  surfaces.
+
+HarborGate may normalize assistant turns from channel clients, but it must not
+become the backend for HarborCloud entitlement, HarborLink MQTT, HarborDock
+remote home/camera control, or WebUI display truth.
+
 ## Hard Boundary Rules
 
 - Repos communicate only through HTTP/JSON.
@@ -44,6 +61,8 @@ HarborGate owns IM transport:
 - HarborBeacon must treat `transport.route_key` as opaque routing metadata.
 - HarborGate may cache only opaque `conversation.handle` and `continuation`
   values returned by HarborBeacon.
+- HarborGate must not own HarborCloud entitlement, HarborLink MQTT command/ack,
+  HarborDock UI intent, or HarborNAS WebUI display state.
 - Group chat remains out of scope for this upgrade.
 
 ## Versioning
@@ -309,3 +328,5 @@ v2.0 is release-ready only when:
   cancel, record, and playback cases.
 - Direct IM delivery and raw platform credential ownership remain outside
   HarborBeacon.
+- HarborCloud entitlement, HarborLink MQTT, HarborDock remote home/camera
+  control, and WebUI display state remain outside this IM contract.

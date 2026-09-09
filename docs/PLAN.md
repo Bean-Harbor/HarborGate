@@ -12,14 +12,17 @@ The retired Python runtime is preserved only in Git history and the archive tag
 
 ## Mission
 
-Keep HarborGate as the IM transport boundary and northbound channel edge for HarborBeacon:
+Keep HarborGate as the IM transport boundary and northbound assistant/channel
+edge for HarborBeacon:
 
 - own Feishu, Weixin, webhook, setup/admin, route registry, delivery, and
   redacted gateway status
-- own Android/Web channel-edge turn entry and Beacon admin/config proxying
+- own Android/Web assistant-channel turn entry and Beacon admin/config proxying
 - call HarborBeacon only through HTTP/JSON
 - keep business state, active-frame semantics, approvals, artifacts, and audit in
   HarborBeacon
+- keep HarborCloud entitlement, HarborLink MQTT command/ack, HarborDock remote
+  home/camera control, and WebUI display state outside HarborGate semantics
 
 ## Current Workstreams
 
@@ -32,6 +35,15 @@ Keep HarborGate as the IM transport boundary and northbound channel edge for Har
    - package only `harborgate/bin/harborgate`
    - do not vendor Python site-packages
    - rollback by installing an older verified release artifact
+   - current HarborAssistant handoff id:
+     `harborassistant-live-solidify-20260529`; the Gate deb is
+     `harboros-im-gate_20260529+harborassistant.live.solidify_harborassistant-live-solidify-20260529_linux_amd64.deb`
+     under `.197`
+     `/home/harbor-innovations/artifacts/harborassistant-live-solidify-20260529/output`
+   - Gate package acceptance for this handoff is setup/manage/status under
+     `/api/harbor-gate/*`, explicit v2.0 runtime defaults, the
+     `harboros-im-gate.service` unit, and no IM business semantics added to
+     HarborAssistant or Beacon
 
 3. Product acceptance
    - verify Harbor Assistant Messages tab against `/api/setup/status`
@@ -48,6 +60,8 @@ The project is not release-ready if active code:
 - routes business behavior from `active_frame.kind`
 - imports HarborBeacon runtime code
 - persists Beacon-owned device credentials, model secrets, or camera config in Gate
+- treats HarborCloud, HarborLink, HarborDock, or WebUI state as Gate-owned
+  business truth
 - reintroduces Python runtime packaging or `im_agent` entrypoints
 
 ## Verification
@@ -63,3 +77,14 @@ Builder:
 ```bash
 cargo zigbuild --release --bin harborgate --target x86_64-unknown-linux-musl
 ```
+
+## Current Release Blocker
+
+The `harborassistant-live-solidify-20260529` package lane is dry-verified but
+not live-installed because build host `.197` cannot currently reach HarborOS
+`.82`: ping drops, TCP `22/80/443/4174/8787` time out, and SSH jump to `.82:22`
+fails. Live Gate acceptance resumes only after `.82` is reachable through `.197`
+or another confirmed jump host.
+
+Central install, rollback, and live-gate instructions live in
+`C:\Users\beanw\OpenSource\HarborBeacon\docs\harbor-assistant-offline-delivery-runbook.md`.

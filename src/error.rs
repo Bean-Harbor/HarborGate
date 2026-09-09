@@ -11,6 +11,7 @@ pub struct GatewayError {
     pub code: String,
     pub message: String,
     pub trace_id: Option<String>,
+    pub(crate) delivery_failure: Option<Value>,
 }
 
 impl GatewayError {
@@ -20,6 +21,7 @@ impl GatewayError {
             code: code.into(),
             message: message.into(),
             trace_id: None,
+            delivery_failure: None,
         }
     }
 
@@ -28,6 +30,11 @@ impl GatewayError {
         if !trace_id.trim().is_empty() {
             self.trace_id = Some(trace_id);
         }
+        self
+    }
+
+    pub(crate) fn with_delivery_failure(mut self, item: Value) -> Self {
+        self.delivery_failure = Some(item);
         self
     }
 

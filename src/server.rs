@@ -1,11 +1,21 @@
 use crate::config::AppConfig;
+use crate::device_session::{DeviceSessionError, DeviceSessionStore, ExchangedDeviceSession};
 use crate::error::GatewayError;
 use crate::gateway::GatewayService;
-use crate::runtime::{maybe_start_feishu_websocket_runtime, maybe_start_weixin_poll_runtime};
+use crate::harboros_auth::{
+    HarborOsAuthFailure, HarborOsAuthenticator, HarborOsPrincipal, MiddlewareHarborOsAuthenticator,
+};
+use crate::runtime::{
+    maybe_start_feishu_websocket_runtime, maybe_start_weixin_poll_runtime,
+    start_delivery_recovery_runtime,
+};
 use crate::setup::SetupPortalService;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
-use axum::http::{header::CONTENT_TYPE, HeaderMap, Method, StatusCode};
+use axum::http::{
+    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
+    HeaderMap, HeaderValue, Method, StatusCode,
+};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
@@ -19,6 +29,9 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 const HARBOR_GATE_PUBLIC_PREFIX: &str = "/api/harbor-gate";
+const HARBOROS_AUTH_TOKEN_HEADER: &str = "X-HarborOS-Auth-Token";
+const DEVICE_SESSION_COOKIE: &str = "harbornavi_device_session";
+const DEVICE_SESSION_TTL_SECONDS: u64 = 12 * 60 * 60;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,9 +39,12 @@ pub struct AppState {
     pub gateway: Arc<GatewayService>,
     pub setup: Arc<SetupPortalService>,
     pub feishu_websocket_started: Arc<AtomicBool>,
+    pub harboros_authenticator: Arc<dyn HarborOsAuthenticator>,
+    pub device_sessions: Arc<DeviceSessionStore>,
 }
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
+    validate_required_service_auth(&config)?;
     let gateway = Arc::new(GatewayService::from_config(&config)?);
     let feishu_websocket_started = Arc::new(AtomicBool::new(false));
     maybe_start_configured_feishu_runtime(
@@ -38,11 +54,16 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
         feishu_websocket_started.clone(),
     );
     maybe_start_weixin_poll_runtime(gateway.clone(), config.enable_weixin_runtime);
+    start_delivery_recovery_runtime(gateway.clone());
     let state = AppState {
         config: config.clone(),
         setup: Arc::new(SetupPortalService::new(config.clone(), gateway.clone())),
         gateway,
         feishu_websocket_started,
+        harboros_authenticator: Arc::new(MiddlewareHarborOsAuthenticator::default()),
+        device_sessions: Arc::new(DeviceSessionStore::new(
+            config.device_session_state_dir.clone(),
+        )),
     };
     let app = router(state);
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
@@ -68,10 +89,30 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/harbor-gate/api/gateway/status", get(gateway_status))
         .route("/api/harbor-gate/api/gateway/turns", post(gateway_turn))
+        .route(
+            "/api/harbor-gate/api/device-session",
+            get(device_session_status),
+        )
+        .route(
+            "/api/harbor-gate/api/device-session/exchange",
+            post(device_session_exchange),
+        )
+        .route(
+            "/api/harbor-gate/api/device-session/logout",
+            post(device_session_logout),
+        )
         .route("/api/harbor-assistant", any(harbor_assistant_proxy_root))
         .route("/api/harbor-assistant/{*path}", any(harbor_assistant_proxy))
         .route("/api/beacon", any(beacon_proxy_root))
         .route("/api/beacon/{*path}", any(beacon_proxy))
+        .route(
+            "/api/harbor-gate/api/beacon",
+            any(prefixed_beacon_proxy_root),
+        )
+        .route(
+            "/api/harbor-gate/api/beacon/{*path}",
+            any(prefixed_beacon_proxy),
+        )
         .route(
             "/api/harbor-gate/api/notifications/deliveries",
             post(notification_delivery),
@@ -187,6 +228,8 @@ async fn gateway_status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
+    require_service_contract(&state.config, &headers)?;
+    require_service_auth(&state.config, &headers)?;
     Ok(Json(
         state.setup.gateway_status_payload(host_header(&headers)),
     ))
@@ -243,6 +286,126 @@ async fn beacon_proxy(
         headers,
         beacon_proxy_target_path(&path, uri.query()),
         "/api/beacon",
+        body,
+    )
+    .await
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DeviceSessionExchangeRequest {
+    pairing_code: String,
+}
+
+async fn device_session_exchange(
+    State(state): State<AppState>,
+    Json(payload): Json<DeviceSessionExchangeRequest>,
+) -> axum::response::Response {
+    let response = state
+        .device_sessions
+        .exchange(&payload.pairing_code, DEVICE_SESSION_TTL_SECONDS)
+        .map(device_session_response)
+        .unwrap_or_else(|error| device_session_gateway_error(error).into_response());
+    no_store_response(response)
+}
+
+async fn device_session_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let response = match device_session_cookie(&headers) {
+        Some(token) => match state.device_sessions.current(token) {
+            Ok(principal) => Json(json!({
+                "authenticated": true,
+                "camera_id": principal.camera_id,
+                "expires_at_epoch_seconds": principal.expires_at_epoch_seconds,
+            }))
+            .into_response(),
+            Err(error) => device_session_gateway_error(error).into_response(),
+        },
+        None => device_session_gateway_error(DeviceSessionError::InvalidSession).into_response(),
+    };
+    no_store_response(response)
+}
+
+async fn device_session_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(token) = device_session_cookie(&headers) {
+        match state.device_sessions.revoke(token) {
+            Ok(()) | Err(DeviceSessionError::InvalidSession) => {}
+            Err(error) => {
+                return no_store_response(device_session_gateway_error(error).into_response())
+            }
+        }
+    }
+    let mut response = Json(json!({"authenticated": false})).into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_static(
+            "harbornavi_device_session=; Path=/api/harbor-gate/; HttpOnly; SameSite=Strict; Max-Age=0",
+        ),
+    );
+    no_store_response(response)
+}
+
+fn no_store_response(mut response: axum::response::Response) -> axum::response::Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn device_session_response(exchanged: ExchangedDeviceSession) -> axum::response::Response {
+    let mut response = Json(json!({
+        "authenticated": true,
+        "camera_id": exchanged.principal.camera_id,
+        "expires_at_epoch_seconds": exchanged.principal.expires_at_epoch_seconds,
+    }))
+    .into_response();
+    let cookie = format!(
+        "{DEVICE_SESSION_COOKIE}={}; Path=/api/harbor-gate/; HttpOnly; SameSite=Strict; Max-Age={DEVICE_SESSION_TTL_SECONDS}",
+        exchanged.token
+    );
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("device session cookie"),
+    );
+    response
+}
+
+async fn prefixed_beacon_proxy_root(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<axum::response::Response, GatewayError> {
+    proxy_beacon_request(
+        state,
+        method,
+        headers,
+        beacon_proxy_target_path("", uri.query()),
+        "/api/harbor-gate/api/beacon",
+        body,
+    )
+    .await
+}
+
+async fn prefixed_beacon_proxy(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<axum::response::Response, GatewayError> {
+    proxy_beacon_request(
+        state,
+        method,
+        headers,
+        beacon_proxy_target_path(&path, uri.query()),
+        "/api/harbor-gate/api/beacon",
         body,
     )
     .await
@@ -305,15 +468,33 @@ async fn proxy_beacon_request(
             "HarborBeacon admin proxy is not configured",
         ));
     }
+    let harborbeacon_web_api_token = state.config.harborbeacon_web_api_token.trim();
+    if harborbeacon_web_api_token.is_empty() {
+        return Err(GatewayError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HARBORBEACON_SERVICE_AUTH_UNAVAILABLE",
+            "HarborBeacon proxy service token is not configured",
+        ));
+    }
+    let principal = if requires_harboros_principal(&method, &target_path) {
+        Some(authenticate_proxy_principal(&state, &method, &target_path, &headers).await?)
+    } else {
+        None
+    };
     let url = format!("{base_url}{target_path}");
     let reqwest_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).map_err(|err| {
             GatewayError::validation(format!("unsupported proxy method {}: {err}", method))
         })?;
-    let mut request = Client::new()
+    let request = Client::new()
         .request(reqwest_method, url)
+        .headers(beacon_upstream_headers(
+            &headers,
+            harborbeacon_web_api_token,
+            principal.as_ref(),
+            &state.config.harbor_workspace_id,
+        )?)
         .body(body.to_vec());
-    request = forward_beacon_headers(request, &headers, state.config.harborbeacon_token.as_str());
     let response = request.send().await.map_err(|err| {
         GatewayError::infrastructure(format!("Could not reach HarborBeacon admin API: {err}"))
     })?;
@@ -329,6 +510,11 @@ async fn proxy_beacon_request(
     let mut result = (status, body).into_response();
     copy_response_header(&upstream_headers, result.headers_mut(), "content-type");
     copy_response_header(&upstream_headers, result.headers_mut(), "cache-control");
+    copy_response_header(&upstream_headers, result.headers_mut(), "accept-ranges");
+    copy_response_header(&upstream_headers, result.headers_mut(), "content-range");
+    copy_response_header(&upstream_headers, result.headers_mut(), "content-length");
+    copy_response_header(&upstream_headers, result.headers_mut(), "etag");
+    copy_response_header(&upstream_headers, result.headers_mut(), "last-modified");
     copy_response_header(
         &upstream_headers,
         result.headers_mut(),
@@ -586,14 +772,21 @@ fn require_service_contract(config: &AppConfig, headers: &HeaderMap) -> Result<(
 
 fn require_service_auth(config: &AppConfig, headers: &HeaderMap) -> Result<(), GatewayError> {
     if config.service_token.trim().is_empty() {
-        return Ok(());
+        return Err(GatewayError::new(
+            StatusCode::UNAUTHORIZED,
+            "SERVICE_AUTH_FAILED",
+            "Service authentication is not configured",
+        ));
     }
     let authorization = headers
         .get("Authorization")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .trim();
-    if authorization != format!("Bearer {}", config.service_token) {
+    let actual = authorization.strip_prefix("Bearer ").unwrap_or("").trim();
+    let current_matches = service_token_matches(actual, &config.service_token);
+    let previous_matches = service_token_matches(actual, &config.service_token_previous);
+    if !(current_matches | previous_matches) {
         return Err(GatewayError::new(
             StatusCode::UNAUTHORIZED,
             "SERVICE_AUTH_FAILED",
@@ -603,6 +796,40 @@ fn require_service_auth(config: &AppConfig, headers: &HeaderMap) -> Result<(), G
     Ok(())
 }
 
+fn validate_required_service_auth(config: &AppConfig) -> anyhow::Result<()> {
+    if !valid_service_token(&config.service_token) {
+        anyhow::bail!("HARBOR_BEACON_TO_GATE_TOKEN is missing or malformed");
+    }
+    if !config.service_token_previous.is_empty()
+        && (!valid_service_token(&config.service_token_previous)
+            || config.service_token_previous == config.service_token)
+    {
+        anyhow::bail!("HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS is malformed");
+    }
+    if config.harborbeacon_enabled()
+        && (!valid_service_token(&config.harborbeacon_web_api_token)
+            || config.harborbeacon_token != config.harborbeacon_web_api_token
+            || config.harborbeacon_web_api_token == config.service_token)
+    {
+        anyhow::bail!("HARBOR_GATE_TO_BEACON_TOKEN is missing, malformed, or not isolated");
+    }
+    Ok(())
+}
+
+fn valid_service_token(token: &str) -> bool {
+    token.len() >= 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn service_token_matches(actual: &str, expected: &str) -> bool {
+    if actual.is_empty() || expected.is_empty() || actual.len() != expected.len() {
+        return false;
+    }
+    constant_time_eq::constant_time_eq(actual.as_bytes(), expected.as_bytes())
+}
+
 fn beacon_proxy_target_path(path: &str, query: Option<&str>) -> String {
     let tail = path.trim_start_matches('/');
     let base = if tail.is_empty() {
@@ -610,7 +837,7 @@ fn beacon_proxy_target_path(path: &str, query: Option<&str>) -> String {
     } else {
         format!("/api/{tail}")
     };
-    match query.filter(|value| !value.trim().is_empty()) {
+    match sanitized_beacon_query(query) {
         Some(query) => format!("{base}?{query}"),
         None => base,
     }
@@ -620,32 +847,246 @@ fn harbor_assistant_proxy_target_path(path: &str, query: Option<&str>) -> String
     beacon_proxy_target_path(path, query)
 }
 
-fn forward_beacon_headers(
-    mut request: reqwest::RequestBuilder,
+fn sanitized_beacon_query(query: Option<&str>) -> Option<String> {
+    let query = query.filter(|value| !value.trim().is_empty())?;
+    let pairs = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, _)| !is_identity_query_key(key))
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.extend_pairs(pairs);
+    Some(serializer.finish())
+}
+
+fn is_identity_query_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "user_id"
+            | "open_id"
+            | "harboros_user"
+            | "harboros_user_id"
+            | "workspace_id"
+            | "principal_id"
+            | "account_id"
+    )
+}
+
+fn requires_harboros_principal(method: &Method, target_path: &str) -> bool {
+    let path = target_path.split('?').next().unwrap_or(target_path);
+    const DETECTION_JOBS: &str = "/api/vision/detection-jobs";
+    if method == Method::GET && is_cat_detection_observation_proxy_path(path) {
+        return true;
+    }
+    if path == DETECTION_JOBS || path.starts_with(&format!("{DETECTION_JOBS}/")) {
+        return true;
+    }
+    match (method, path) {
+        (&Method::POST, "/api/knowledge/search")
+        | (&Method::GET, "/api/knowledge/conversations")
+        | (&Method::PATCH, "/api/knowledge/conversation-settings") => true,
+        (&Method::GET | &Method::DELETE, path) => path
+            .strip_prefix("/api/knowledge/conversations/")
+            .is_some_and(|conversation_id| {
+                !conversation_id.is_empty() && !conversation_id.contains('/')
+            }),
+        _ => false,
+    }
+}
+
+fn is_cat_detection_observation_proxy_path(path: &str) -> bool {
+    path.strip_prefix("/api/cameras/")
+        .and_then(|suffix| suffix.strip_suffix("/cat-detection/observation"))
+        .is_some_and(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
+}
+
+fn cat_detection_observation_camera_id(target_path: &str) -> Option<String> {
+    let path = target_path.split('?').next().unwrap_or(target_path);
+    path.strip_prefix("/api/cameras/")
+        .and_then(|suffix| suffix.strip_suffix("/cat-detection/observation"))
+        .filter(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
+        .map(str::to_string)
+}
+
+async fn authenticate_proxy_principal(
+    state: &AppState,
+    method: &Method,
+    target_path: &str,
     headers: &HeaderMap,
-    harborbeacon_token: &str,
-) -> reqwest::RequestBuilder {
+) -> Result<HarborOsPrincipal, GatewayError> {
+    if headers.contains_key(HARBOROS_AUTH_TOKEN_HEADER) {
+        return authenticate_harboros_request(state, headers).await;
+    }
+    if method != Method::GET {
+        return Err(harboros_auth_gateway_error(
+            HarborOsAuthFailure::InvalidToken,
+        ));
+    }
+    let camera_id = cat_detection_observation_camera_id(target_path)
+        .ok_or_else(|| harboros_auth_gateway_error(HarborOsAuthFailure::InvalidToken))?;
+    Ok(HarborOsPrincipal {
+        source: "harbornavi-lan".to_string(),
+        principal_id: "harbornavi-lan:anonymous".to_string(),
+        roles: vec!["CAMERA_VIEW".to_string()],
+        camera_scope: Some(camera_id),
+    })
+}
+
+async fn authenticate_harboros_request(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<HarborOsPrincipal, GatewayError> {
+    let token = headers
+        .get(HARBOROS_AUTH_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 8192)
+        .ok_or_else(|| harboros_auth_gateway_error(HarborOsAuthFailure::InvalidToken))?;
+    state
+        .harboros_authenticator
+        .authenticate(token)
+        .await
+        .map_err(harboros_auth_gateway_error)
+}
+
+fn harboros_auth_gateway_error(failure: HarborOsAuthFailure) -> GatewayError {
+    match failure {
+        HarborOsAuthFailure::InvalidToken => GatewayError::new(
+            StatusCode::UNAUTHORIZED,
+            "HARBOROS_AUTH_FAILED",
+            "Missing or invalid HarborOS one-time authentication token",
+        ),
+        HarborOsAuthFailure::AccessDenied => GatewayError::new(
+            StatusCode::FORBIDDEN,
+            "HARBOROS_ACCESS_DENIED",
+            "HarborOS denied access",
+        ),
+        HarborOsAuthFailure::WebUiAccessRequired => GatewayError::new(
+            StatusCode::FORBIDDEN,
+            "HARBOROS_WEBUI_ACCESS_REQUIRED",
+            "HarborOS WebUI access is required",
+        ),
+        HarborOsAuthFailure::FullAdminRequired => GatewayError::new(
+            StatusCode::FORBIDDEN,
+            "HARBOROS_FULL_ADMIN_REQUIRED",
+            "HarborOS FULL_ADMIN role is required",
+        ),
+        HarborOsAuthFailure::Unavailable => GatewayError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HARBOROS_AUTH_UNAVAILABLE",
+            "HarborOS authentication service is unavailable",
+        ),
+    }
+}
+
+fn device_session_gateway_error(error: DeviceSessionError) -> GatewayError {
+    match error {
+        DeviceSessionError::InvalidPairing => GatewayError::new(
+            StatusCode::UNAUTHORIZED,
+            "DEVICE_PAIRING_FAILED",
+            "Pairing code is invalid or expired",
+        ),
+        DeviceSessionError::InvalidSession => GatewayError::new(
+            StatusCode::UNAUTHORIZED,
+            "DEVICE_SESSION_REQUIRED",
+            "A valid HarborNavi device session is required",
+        ),
+        DeviceSessionError::CameraDenied => GatewayError::new(
+            StatusCode::FORBIDDEN,
+            "DEVICE_CAMERA_ACCESS_DENIED",
+            "Device session is not authorized for this camera",
+        ),
+        DeviceSessionError::Unavailable(_) => GatewayError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DEVICE_SESSION_UNAVAILABLE",
+            "HarborNavi device session service is unavailable",
+        ),
+    }
+}
+
+fn device_session_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| {
+            (name.trim() == DEVICE_SESSION_COOKIE)
+                .then_some(value.trim())
+                .filter(|value| !value.is_empty() && value.len() <= 256)
+        })
+}
+
+fn beacon_upstream_headers(
+    headers: &HeaderMap,
+    harborbeacon_web_api_token: &str,
+    principal: Option<&HarborOsPrincipal>,
+    workspace_id: &str,
+) -> Result<HeaderMap, GatewayError> {
+    let mut upstream = HeaderMap::new();
     for name in [
         "content-type",
+        "range",
+        "if-range",
         "x-request-id",
         "x-trace-id",
-        "x-harbor-user-id",
-        "x-harbor-open-id",
-        "x-harboros-user",
-        "x-harbor-os-user",
     ] {
         if let Some(value) = headers.get(name) {
-            request = request.header(name, value);
+            upstream.insert(name, value.clone());
         }
     }
-    if harborbeacon_token.trim().is_empty() {
-        if let Some(value) = headers.get("authorization") {
-            request = request.header("authorization", value);
+    let service_authorization =
+        HeaderValue::from_str(&format!("Bearer {}", harborbeacon_web_api_token.trim())).map_err(
+            |_| {
+                GatewayError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "HARBORBEACON_SERVICE_AUTH_UNAVAILABLE",
+                    "HarborBeacon proxy service token is invalid",
+                )
+            },
+        )?;
+    upstream.insert(AUTHORIZATION, service_authorization);
+
+    if let Some(principal) = principal {
+        insert_trusted_header(
+            &mut upstream,
+            "X-Harbor-Principal-Source",
+            &principal.source,
+        )?;
+        insert_trusted_header(
+            &mut upstream,
+            "X-Harbor-Principal-Id",
+            &principal.principal_id,
+        )?;
+        insert_trusted_header(
+            &mut upstream,
+            "X-Harbor-Principal-Roles",
+            &principal.roles.join(","),
+        )?;
+        insert_trusted_header(&mut upstream, "X-Harbor-Workspace-Id", workspace_id.trim())?;
+        if let Some(camera_scope) = principal.camera_scope.as_deref() {
+            insert_trusted_header(&mut upstream, "X-Harbor-Camera-Scope", camera_scope)?;
         }
-    } else {
-        request = request.bearer_auth(harborbeacon_token.trim().to_string());
     }
-    request
+    Ok(upstream)
+}
+
+fn insert_trusted_header(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &str,
+) -> Result<(), GatewayError> {
+    let value = HeaderValue::from_str(value).map_err(|_| {
+        GatewayError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HARBOROS_AUTH_UNAVAILABLE",
+            "HarborOS returned an invalid authenticated principal",
+        )
+    })?;
+    headers.insert(name, value);
+    Ok(())
 }
 
 fn copy_response_header(source: &HeaderMap, target: &mut HeaderMap, name: &'static str) {
@@ -693,7 +1134,8 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     use super::{
-        beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_contract,
+        beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_auth,
+        require_service_contract, requires_harboros_principal, validate_required_service_auth,
     };
     use crate::config::AppConfig;
 
@@ -705,8 +1147,11 @@ mod tests {
             "/api/knowledge/search"
         );
         assert_eq!(
-            beacon_proxy_target_path("devices/camera-1/evidence", Some("user_id=u1")),
-            "/api/devices/camera-1/evidence?user_id=u1"
+            beacon_proxy_target_path(
+                "devices/camera-1/evidence",
+                Some("user_id=u1&open_id=ou1&limit=2")
+            ),
+            "/api/devices/camera-1/evidence?limit=2"
         );
         assert_eq!(
             beacon_proxy_target_path("", Some("refresh=1")),
@@ -764,6 +1209,78 @@ mod tests {
     }
 
     #[test]
+    fn harboros_authentication_covers_rag_and_detection_job_contracts() {
+        assert!(requires_harboros_principal(
+            &axum::http::Method::POST,
+            "/api/knowledge/search"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/cameras/camera-252/cat-detection/observation?stream_profile=sub"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/knowledge/conversations"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/knowledge/conversations/conversation-1"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::DELETE,
+            "/api/knowledge/conversations/conversation-1"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::PATCH,
+            "/api/knowledge/conversation-settings"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::POST,
+            "/api/vision/detection-jobs"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/vision/detection-jobs"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/vision/detection-jobs/job-1"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::POST,
+            "/api/vision/detection-jobs/job-1/renew"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::DELETE,
+            "/api/vision/detection-jobs/job-1"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::PATCH,
+            "/api/vision/detection-jobs/job-1/results/latest"
+        ));
+        assert!(!requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/knowledge/search/suggestions"
+        ));
+        assert!(!requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/devices/camera-1/evidence"
+        ));
+        assert!(!requires_harboros_principal(
+            &axum::http::Method::POST,
+            "/api/knowledge/conversations"
+        ));
+        assert!(!requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/knowledge/conversations/"
+        ));
+        assert!(!requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/knowledge/conversations/conversation-1/messages"
+        ));
+    }
+
+    #[test]
     fn notification_delivery_requires_v20_contract_header() {
         let mut config = AppConfig::from_env();
         config.contract_version = "2.0".to_string();
@@ -775,5 +1292,99 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(error.code, "CONTRACT_VERSION_MISMATCH");
+    }
+
+    #[test]
+    fn notification_delivery_auth_accepts_current_and_previous_only() {
+        let mut config = AppConfig::from_env();
+        config.service_token = "beacon_to_gate_current_0123456789abcdef".to_string();
+        config.service_token_previous = "beacon_to_gate_previous_0123456789abcdef".to_string();
+
+        for token in [
+            "beacon_to_gate_current_0123456789abcdef",
+            "beacon_to_gate_previous_0123456789abcdef",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Authorization",
+                HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            require_service_auth(&config, &headers).expect("configured rotation key");
+        }
+
+        for token in [
+            "gate_to_beacon_current_0123456789abcdef",
+            "wrong_token_0123456789abcdef0123456789",
+            "",
+        ] {
+            let mut headers = HeaderMap::new();
+            if !token.is_empty() {
+                headers.insert(
+                    "Authorization",
+                    HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+                );
+            }
+            let error = require_service_auth(&config, &headers).expect_err("wrong auth domain");
+            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(error.code, "SERVICE_AUTH_FAILED");
+        }
+    }
+
+    #[test]
+    fn notification_delivery_auth_fails_closed_without_current_key() {
+        let mut config = AppConfig::from_env();
+        config.service_token.clear();
+        config.service_token_previous =
+            "previous_must_not_stand_alone_0123456789abcdef".to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer previous_must_not_stand_alone_0123456789abcdef"),
+        );
+
+        let error = require_service_auth(&config, &headers).expect_err("current key is required");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn startup_rejects_malformed_or_colliding_service_credentials() {
+        let mut config = AppConfig::from_env();
+        config.harborbeacon_base_url = "http://127.0.0.1:4174".to_string();
+        config.harborbeacon_web_api_token = "gate_to_beacon_current_0123456789abcdef".to_string();
+        config.harborbeacon_token = config.harborbeacon_web_api_token.clone();
+        config.service_token = "beacon_to_gate_current_0123456789abcdef".to_string();
+        config.service_token_previous = "beacon_to_gate_previous_0123456789abcdef".to_string();
+        validate_required_service_auth(&config).expect("directional credentials are valid");
+
+        for malformed in [
+            "too-short",
+            "contains spaces 0123456789abcdef0123456789",
+            "contains.period.0123456789abcdef0123456789",
+        ] {
+            config.service_token = malformed.to_string();
+            assert!(
+                validate_required_service_auth(&config).is_err(),
+                "accepted malformed current credential: {malformed}"
+            );
+        }
+
+        config.service_token = "beacon_to_gate_current_0123456789abcdef".to_string();
+        config.service_token_previous = "too-short".to_string();
+        assert!(validate_required_service_auth(&config).is_err());
+
+        config.service_token_previous.clear();
+        config.harborbeacon_web_api_token = config.service_token.clone();
+        config.harborbeacon_token = config.harborbeacon_web_api_token.clone();
+        assert!(
+            validate_required_service_auth(&config).is_err(),
+            "accepted the same current credential in both directions"
+        );
+
+        config.harborbeacon_web_api_token = "gate_to_beacon_current_0123456789abcdef".to_string();
+        config.harborbeacon_token = "different_gate_token_0123456789abcdef0123".to_string();
+        assert!(
+            validate_required_service_auth(&config).is_err(),
+            "accepted divergent Gate-to-Beacon caller credentials"
+        );
     }
 }

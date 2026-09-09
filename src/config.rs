@@ -9,13 +9,18 @@ pub struct AppConfig {
     pub port: u16,
     pub data_dir: PathBuf,
     pub state_dir: PathBuf,
+    pub device_session_state_dir: PathBuf,
     pub public_origin: String,
     pub contract_version: String,
     pub service_token: String,
+    pub service_token_previous: String,
     pub harborbeacon_base_url: String,
     pub harborbeacon_token: String,
+    pub harborbeacon_web_api_token: String,
     pub harborbeacon_turn_endpoint: String,
+    pub harbor_workspace_id: String,
     pub feishu: FeishuConfig,
+    pub feishu_mail: FeishuMailConfig,
     pub weixin: WeixinConfig,
     pub enable_feishu_websocket: bool,
     pub enable_weixin_runtime: bool,
@@ -41,6 +46,21 @@ pub struct FeishuConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct FeishuMailConfig {
+    pub enabled: bool,
+    pub sender_mailbox: String,
+    pub user_access_token: String,
+    pub user_refresh_token: String,
+    pub user_token_state_path: String,
+    pub default_from_name: String,
+    pub app_id: String,
+    pub app_secret: String,
+    pub base_url: String,
+    pub auth_base_url: String,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct WeixinConfig {
     pub state_dir: PathBuf,
     pub account_id: String,
@@ -54,6 +74,8 @@ pub struct WeixinConfig {
 
 impl AppConfig {
     pub fn from_env() -> Self {
+        let feishu = FeishuConfig::from_env();
+        let feishu_mail = FeishuMailConfig::from_env(&feishu);
         let data_dir = env_or("IM_AGENT_DATA_DIR", "data/sessions");
         let state_dir = env_or_else("IM_AGENT_STATE_DIR", || {
             PathBuf::from(&data_dir)
@@ -75,21 +97,42 @@ impl AppConfig {
             ),
             "/api/turns",
         );
+        let device_session_state_dir = env_or_else("HARBORGATE_DEVICE_SESSION_STATE_DIR", || {
+            PathBuf::from(&state_dir)
+                .join("device-sessions")
+                .to_string_lossy()
+                .to_string()
+        });
+        let gate_to_beacon_token = credential_first(
+            "HARBOR_GATE_TO_BEACON_TOKEN_FILE",
+            "gate-to-beacon-send",
+            &["HARBOR_GATE_TO_BEACON_TOKEN", "HARBORBEACON_WEB_API_TOKEN"],
+        );
         Self {
             host: env_or("IM_AGENT_HOST", "127.0.0.1"),
             port: env_or("IM_AGENT_PORT", "8787").parse().unwrap_or(8787),
             data_dir: PathBuf::from(data_dir),
             state_dir: PathBuf::from(state_dir),
+            device_session_state_dir: PathBuf::from(device_session_state_dir),
             public_origin: env_trim("IM_AGENT_PUBLIC_ORIGIN"),
             contract_version: env_or("IM_AGENT_CONTRACT_VERSION", "2.0"),
-            service_token: env_trim("IM_AGENT_SERVICE_TOKEN"),
+            service_token: credential_first(
+                "HARBOR_BEACON_TO_GATE_TOKEN_FILE",
+                "beacon-to-gate-accept-current",
+                &["HARBOR_BEACON_TO_GATE_TOKEN", "IM_AGENT_SERVICE_TOKEN"],
+            ),
+            service_token_previous: credential_first(
+                "HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS_FILE",
+                "beacon-to-gate-accept-previous",
+                &["HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS"],
+            ),
             harborbeacon_base_url: base_url,
-            harborbeacon_token: env_first(&[
-                "HARBORBEACON_WEB_API_TOKEN",
-                "HARBORBEACON_TASK_API_TOKEN",
-            ]),
+            harborbeacon_token: gate_to_beacon_token.clone(),
+            harborbeacon_web_api_token: gate_to_beacon_token,
             harborbeacon_turn_endpoint: turn_endpoint,
-            feishu: FeishuConfig::from_env(),
+            harbor_workspace_id: env_or("HARBOR_WORKSPACE_ID", "home-1"),
+            feishu,
+            feishu_mail,
             weixin: WeixinConfig::from_env(),
             enable_feishu_websocket: env_flag_default("HARBORGATE_RUST_FEISHU_WEBSOCKET", true),
             enable_weixin_runtime: env_flag_default("HARBORGATE_WEIXIN_RUNTIME_ENABLED", true),
@@ -204,6 +247,58 @@ impl FeishuConfig {
     }
 }
 
+impl FeishuMailConfig {
+    pub fn from_env(feishu: &FeishuConfig) -> Self {
+        Self {
+            enabled: env_flag("FEISHU_MAIL_ENABLED"),
+            sender_mailbox: env_trim("FEISHU_MAIL_SENDER_MAILBOX"),
+            user_access_token: env_trim("FEISHU_MAIL_USER_ACCESS_TOKEN"),
+            user_refresh_token: env_trim("FEISHU_MAIL_USER_REFRESH_TOKEN"),
+            user_token_state_path: env_trim("FEISHU_MAIL_TOKEN_STATE_PATH"),
+            default_from_name: env_trim("FEISHU_MAIL_DEFAULT_FROM_NAME"),
+            app_id: env_or_else("FEISHU_MAIL_APP_ID", || feishu.app_id.clone()),
+            app_secret: env_or_else("FEISHU_MAIL_APP_SECRET", || feishu.app_secret.clone()),
+            base_url: env_or_else("FEISHU_MAIL_BASE_URL", || feishu.base_url.clone()),
+            auth_base_url: env_or_else("FEISHU_MAIL_AUTH_BASE_URL", || {
+                feishu.auth_base_url.clone()
+            }),
+            timeout_seconds: env_or(
+                "FEISHU_MAIL_TIMEOUT_SECONDS",
+                &feishu.timeout_seconds.to_string(),
+            )
+            .parse()
+            .unwrap_or(feishu.timeout_seconds),
+        }
+    }
+
+    pub fn configured(&self) -> bool {
+        let app_credentials_configured =
+            !self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty();
+        let refresh_configured = (!self.user_refresh_token.trim().is_empty()
+            || !self.user_token_state_path.trim().is_empty())
+            && app_credentials_configured;
+        self.enabled
+            && !self.sender_mailbox.trim().is_empty()
+            && (!self.user_access_token.trim().is_empty()
+                || refresh_configured
+                || app_credentials_configured)
+    }
+
+    pub fn auth_mode(&self) -> &'static str {
+        if !self.user_refresh_token.trim().is_empty()
+            || !self.user_token_state_path.trim().is_empty()
+        {
+            "user_refresh_token"
+        } else if !self.user_access_token.trim().is_empty() {
+            "user_access_token"
+        } else if !self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty() {
+            "tenant_access_token"
+        } else {
+            "unconfigured"
+        }
+    }
+}
+
 pub fn env_flag(key: &str) -> bool {
     matches!(
         env_trim(key).to_lowercase().as_str(),
@@ -254,6 +349,35 @@ fn env_first(keys: &[&str]) -> String {
         }
     }
     String::new()
+}
+
+fn credential_first(file_env: &str, credential_name: &str, env_keys: &[&str]) -> String {
+    if let Some(file_path) = credential_file_path(file_env, credential_name) {
+        return fs::read_to_string(file_path)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+    }
+    env_first(env_keys)
+}
+
+fn credential_file_path(file_env: &str, credential_name: &str) -> Option<PathBuf> {
+    credential_file_path_from_values(
+        &env_trim("CREDENTIALS_DIRECTORY"),
+        &env_trim(file_env),
+        credential_name,
+    )
+}
+
+fn credential_file_path_from_values(
+    credentials_directory: &str,
+    configured_file: &str,
+    credential_name: &str,
+) -> Option<PathBuf> {
+    if !credentials_directory.is_empty() {
+        return Some(PathBuf::from(credentials_directory).join(credential_name));
+    }
+    (!configured_file.is_empty()).then(|| PathBuf::from(configured_file))
 }
 
 fn strip_endpoint_suffix(base_url: &str, endpoint_suffix: &str) -> String {
@@ -371,6 +495,25 @@ mod tests {
             enable_live_send: false,
             timeout_seconds: 20,
         }
+    }
+
+    #[test]
+    fn systemd_credentials_directory_takes_precedence_over_configured_file() {
+        assert_eq!(
+            credential_file_path_from_values(
+                "/run/credentials/harboros-im-gate.service",
+                "/tmp/explicit-token",
+                "gate-to-beacon-send",
+            ),
+            Some(PathBuf::from(
+                "/run/credentials/harboros-im-gate.service/gate-to-beacon-send",
+            ))
+        );
+        assert_eq!(
+            credential_file_path_from_values("", "/tmp/explicit-token", "unused"),
+            Some(PathBuf::from("/tmp/explicit-token"))
+        );
+        assert_eq!(credential_file_path_from_values("", "", "unused"), None);
     }
 
     #[test]

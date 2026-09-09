@@ -12,7 +12,7 @@ command -v dpkg-deb >/dev/null
 command -v riscv64-linux-gnu-gcc >/dev/null
 export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER:-riscv64-linux-gnu-gcc}"
 
-cargo build --release --target "${TARGET}" --bin "${BIN_NAME}"
+cargo build --locked --release --target "${TARGET}" --bin "${BIN_NAME}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 case "${OUT_DIR}" in
@@ -25,6 +25,7 @@ deb_path="${out_dir}/${PKG_NAME}_${VERSION}_${DEB_ARCH}.deb"
 rm -rf "${pkg_root}"
 mkdir -p "${pkg_root}/DEBIAN" \
   "${pkg_root}/usr/bin" \
+  "${pkg_root}/usr/lib/harboros-im-gate" \
   "${pkg_root}/etc/systemd/system"
 find "${out_dir}/package" -type d -exec chmod a-s,u=rwx,go=rx {} +
 
@@ -32,11 +33,14 @@ install -m 0755 "${repo_root}/target/${TARGET}/release/${BIN_NAME}" \
   "${pkg_root}/usr/bin/${BIN_NAME}"
 install -m 0644 "${repo_root}/debian/${BIN_NAME}.service" \
   "${pkg_root}/etc/systemd/system/${BIN_NAME}.service"
+install -m 0644 "${repo_root}/debian/harboros-service-auth-recovery.service" \
+  "${pkg_root}/etc/systemd/system/harboros-service-auth-recovery.service"
+install -m 0755 "${repo_root}/debian/ensure-harborbeacon-token-env" \
+  "${pkg_root}/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env"
 
 sed \
   -e "s/VERSION_PLACEHOLDER/${VERSION}/g" \
   -e "s/^Architecture:.*/Architecture: ${DEB_ARCH}/g" \
-  -e "s/^Depends:.*/Depends: libc6, ca-certificates/g" \
   "${repo_root}/debian/control" > "${pkg_root}/DEBIAN/control"
 
 install -m 0755 "${repo_root}/debian/postinst" "${pkg_root}/DEBIAN/postinst"

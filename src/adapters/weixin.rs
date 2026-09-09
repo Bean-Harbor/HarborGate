@@ -1,14 +1,17 @@
-use crate::adapters::PlatformAdapter;
+use crate::adapters::{PlatformAdapter, PreparedOutbound};
 use crate::config::WeixinConfig;
 use crate::error::GatewayError;
 use crate::models::{utc_now_iso, InboundMessage, OutboundMessage};
 use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyInit};
 use async_trait::async_trait;
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use axum::http::StatusCode;
 use base64::Engine as _;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -72,6 +75,7 @@ struct NativeWeixinAttachment {
 
 #[derive(Debug, Clone)]
 struct WeixinUploadedImage {
+    provider_media_id: String,
     original_download_param: String,
     aeskey_hex: String,
     original_ciphertext_size: usize,
@@ -79,16 +83,30 @@ struct WeixinUploadedImage {
 
 #[derive(Debug, Clone)]
 struct WeixinUploadedMedia {
+    provider_media_id: String,
     download_param: String,
     aeskey_hex: String,
     plaintext_size: usize,
     ciphertext_size: usize,
 }
 
+#[derive(Debug, Clone)]
+struct WeixinSendReceipt {
+    provider_client_id: String,
+    provider_message_id: Option<String>,
+}
+
 pub struct WeixinAdapter {
     config: WeixinConfig,
     http: Client,
     state: Mutex<WeixinState>,
+    inbox_lock: Mutex<()>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WeixinPollBatch {
+    pub updates: Vec<Value>,
+    pub next_cursor: String,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +143,7 @@ impl WeixinAdapter {
             config,
             http: Client::new(),
             state: Mutex::new(WeixinState { account, transport }),
+            inbox_lock: Mutex::new(()),
         }
     }
 
@@ -257,7 +276,7 @@ impl WeixinAdapter {
         Ok(())
     }
 
-    pub async fn poll_updates(&self) -> Result<Vec<Value>, GatewayError> {
+    pub async fn poll_updates(&self) -> Result<WeixinPollBatch, GatewayError> {
         self.refresh_account_from_disk();
         let account = self.account();
         if !account.configured() {
@@ -266,7 +285,10 @@ impl WeixinAdapter {
                 "connected": false,
                 "last_poll_outcome": "waiting_for_credentials",
             }));
-            return Ok(vec![]);
+            return Ok(WeixinPollBatch {
+                updates: vec![],
+                next_cursor: String::new(),
+            });
         }
         self.update_transport(json_map!({
             "status": "polling",
@@ -310,7 +332,10 @@ impl WeixinAdapter {
                         "last_getupdates_message_ids": Vec::<Value>::new(),
                         "last_getupdates_private_message_ids": Vec::<Value>::new(),
                     }));
-                    return Ok(vec![]);
+                    return Ok(WeixinPollBatch {
+                        updates: vec![],
+                        next_cursor: sync_buf,
+                    });
                 }
                 self.update_transport(json_map!({
                     "status": poll_status,
@@ -333,7 +358,6 @@ impl WeixinAdapter {
             .and_then(Value::as_str)
             .unwrap_or(&sync_buf)
             .to_string();
-        save_sync_buf(&self.config.state_dir, &account.account_id, &next_sync)?;
         let messages: Vec<Value> = response
             .get("msgs")
             .and_then(Value::as_array)
@@ -385,7 +409,188 @@ impl WeixinAdapter {
             updates.insert("last_private_text_message_at".into(), json!(now));
         }
         self.update_transport(updates);
-        Ok(messages)
+        Ok(WeixinPollBatch {
+            updates: messages,
+            next_cursor: next_sync,
+        })
+    }
+
+    pub fn persist_inbound_batch(&self, updates: &[Value]) -> Result<(), GatewayError> {
+        let account = self.account();
+        if account.account_id.trim().is_empty() {
+            return Err(self.weixin_error("Weixin account is not configured"));
+        }
+        let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        let mut inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
+        let items = inbox
+            .entry("items")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| self.weixin_error("Weixin inbox items are invalid"))?;
+        for payload in updates.iter().filter(|payload| payload.is_object()) {
+            let inbox_id = stable_weixin_inbox_id(&account.account_id, payload)?;
+            let payload_fingerprint = weixin_payload_fingerprint(payload)?;
+            if let Some(existing) = items.get(&inbox_id) {
+                if existing.get("payload_fingerprint").and_then(Value::as_str)
+                    != Some(payload_fingerprint.as_str())
+                {
+                    return Err(GatewayError::new(
+                        StatusCode::CONFLICT,
+                        "WEIXIN_INBOX_IDENTITY_CONFLICT",
+                        "Weixin provider message identity was reused with a different payload",
+                    ));
+                }
+                continue;
+            }
+            items.insert(
+                inbox_id.clone(),
+                json!({
+                    "inbox_id": inbox_id,
+                    "provider_message_id": extract_weixin_message_id(payload),
+                    "payload_fingerprint": payload_fingerprint,
+                    "payload": payload,
+                    "status": "pending",
+                    "retryable": true,
+                    "attempts": 0,
+                    "owner": null,
+                    "claim_token": null,
+                    "claim_expires_at": null,
+                    "last_error": null,
+                    "created_at": utc_now_iso(),
+                    "updated_at": utc_now_iso(),
+                }),
+            );
+        }
+        inbox.insert("version".into(), json!(1));
+        inbox.insert("updated_at".into(), json!(utc_now_iso()));
+        save_inbox(&self.config.state_dir, &account.account_id, &inbox)
+    }
+
+    pub fn commit_poll_cursor(&self, next_cursor: &str) -> Result<(), GatewayError> {
+        let account = self.account();
+        if account.account_id.trim().is_empty() {
+            return Err(self.weixin_error("Weixin account is not configured"));
+        }
+        save_sync_buf(&self.config.state_dir, &account.account_id, next_cursor)
+    }
+
+    pub fn claim_inbound(
+        &self,
+        owner: &str,
+        lease_seconds: u64,
+    ) -> Result<Option<Value>, GatewayError> {
+        let account = self.account();
+        if account.account_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        let mut inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
+        let items = inbox
+            .entry("items")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| self.weixin_error("Weixin inbox items are invalid"))?;
+        let candidate = items.iter().find_map(|(inbox_id, item)| {
+            let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+            let retryable = item.get("retryable").and_then(Value::as_bool) != Some(false);
+            let claimable = matches!(status, "pending" | "failed") && retryable
+                || status == "processing" && !weixin_inbox_claim_is_unexpired(item);
+            claimable.then(|| inbox_id.clone())
+        });
+        let Some(inbox_id) = candidate else {
+            return Ok(None);
+        };
+        let item = items
+            .get_mut(&inbox_id)
+            .ok_or_else(|| self.weixin_error("Weixin inbox item disappeared during claim"))?;
+        let attempts = item
+            .get("attempts")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let claim_token = Uuid::new_v4().simple().to_string();
+        item["status"] = json!("processing");
+        item["attempts"] = json!(attempts);
+        item["owner"] = json!(owner);
+        item["claim_token"] = json!(claim_token);
+        item["claim_expires_at"] = json!(Utc::now()
+            .checked_add_signed(ChronoDuration::seconds(
+                i64::try_from(lease_seconds.max(1)).unwrap_or(i64::MAX),
+            ))
+            .unwrap_or_else(|| Utc::now() + ChronoDuration::days(365_000))
+            .to_rfc3339());
+        item["updated_at"] = json!(utc_now_iso());
+        let claimed = item.clone();
+        inbox.insert("updated_at".into(), json!(utc_now_iso()));
+        save_inbox(&self.config.state_dir, &account.account_id, &inbox)?;
+        Ok(Some(json!({
+            "inbox_id": inbox_id,
+            "claim_token": claim_token,
+            "payload": claimed.get("payload").cloned().unwrap_or(Value::Null),
+            "item": claimed,
+        })))
+    }
+
+    pub fn finish_inbound(
+        &self,
+        inbox_id: &str,
+        claim_token: &str,
+        succeeded: bool,
+        retryable: bool,
+        last_error: Option<&str>,
+    ) -> Result<(), GatewayError> {
+        let account = self.account();
+        let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        let mut inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
+        let item = inbox
+            .get_mut("items")
+            .and_then(Value::as_object_mut)
+            .and_then(|items| items.get_mut(inbox_id))
+            .ok_or_else(|| self.weixin_error("Weixin inbox claim is missing"))?;
+        if item.get("status").and_then(Value::as_str) != Some("processing")
+            || item.get("claim_token").and_then(Value::as_str) != Some(claim_token)
+        {
+            return Err(self.weixin_error("stale Weixin inbox claim"));
+        }
+        item["status"] = json!(if succeeded {
+            "succeeded"
+        } else if retryable {
+            "failed"
+        } else {
+            "terminal_failed"
+        });
+        item["retryable"] = json!(!succeeded && retryable);
+        item["last_error"] = last_error.map_or(Value::Null, |error| json!(error));
+        item["owner"] = Value::Null;
+        item["claim_token"] = Value::Null;
+        item["claim_expires_at"] = Value::Null;
+        item["updated_at"] = json!(utc_now_iso());
+        inbox.insert("updated_at".into(), json!(utc_now_iso()));
+        save_inbox(&self.config.state_dir, &account.account_id, &inbox)
+    }
+
+    pub fn retryable_inbox_count(&self) -> Result<usize, GatewayError> {
+        self.inbox_count(|item| {
+            matches!(
+                item.get("status").and_then(Value::as_str),
+                Some("pending" | "processing" | "failed")
+            ) && item.get("retryable").and_then(Value::as_bool) != Some(false)
+        })
+    }
+
+    pub fn inbox_status_count(&self, expected: &str) -> Result<usize, GatewayError> {
+        self.inbox_count(|item| item.get("status").and_then(Value::as_str) == Some(expected))
+    }
+
+    fn inbox_count(&self, predicate: impl Fn(&Value) -> bool) -> Result<usize, GatewayError> {
+        let account = self.account();
+        let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        let inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
+        Ok(inbox
+            .get("items")
+            .and_then(Value::as_object)
+            .map(|items| items.values().filter(|item| predicate(item)).count())
+            .unwrap_or(0))
     }
 
     pub fn is_duplicate_update(&self, payload: &Value) -> bool {
@@ -429,6 +634,13 @@ impl WeixinAdapter {
         }
     }
 
+    fn update_delivery_batch(&self, batch_id: &str, status: &str, items: &[Value]) {
+        self.update_transport(json_map!({
+            "last_delivery_batch_id": batch_id,
+            "last_delivery_batch": delivery_batch_snapshot(batch_id, status, items),
+        }));
+    }
+
     fn transport_status_value(&self) -> Value {
         self.refresh_account_from_disk();
         let state = self.state.lock().expect("weixin state lock poisoned");
@@ -456,22 +668,23 @@ impl WeixinAdapter {
         Value::Object(transport)
     }
 
-    async fn send_text_chunks(
+    async fn send_message_items(
         &self,
         account: &WeixinAccount,
         chat_id: &str,
         context_token: &str,
-        text: &str,
-    ) -> Result<String, GatewayError> {
-        let mut last_client_id = String::new();
-        for chunk in split_text_for_weixin(text, MAX_TEXT_CHUNK_LENGTH) {
-            let payload = build_send_message_payload(chat_id, &chunk, Some(context_token), None);
-            last_client_id = payload
-                .pointer("/msg/client_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            self.post_json(
+        item_list: Vec<Value>,
+        client_id: Option<&str>,
+    ) -> Result<WeixinSendReceipt, GatewayError> {
+        let payload =
+            build_send_message_payload_items(chat_id, item_list, Some(context_token), client_id);
+        let client_id = payload
+            .pointer("/msg/client_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let response = self
+            .post_json(
                 &account.base_url,
                 EP_SEND_MESSAGE,
                 payload,
@@ -479,33 +692,10 @@ impl WeixinAdapter {
                 self.config.timeout_seconds,
             )
             .await?;
-        }
-        Ok(last_client_id)
-    }
-
-    async fn send_message_items(
-        &self,
-        account: &WeixinAccount,
-        chat_id: &str,
-        context_token: &str,
-        item_list: Vec<Value>,
-    ) -> Result<String, GatewayError> {
-        let payload =
-            build_send_message_payload_items(chat_id, item_list, Some(context_token), None);
-        let client_id = payload
-            .pointer("/msg/client_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        self.post_json(
-            &account.base_url,
-            EP_SEND_MESSAGE,
-            payload,
-            Some(&account.token),
-            self.config.timeout_seconds,
-        )
-        .await?;
-        Ok(client_id)
+        Ok(WeixinSendReceipt {
+            provider_client_id: client_id,
+            provider_message_id: weixin_provider_message_id(&response),
+        })
     }
 
     async fn upload_image(
@@ -557,6 +747,7 @@ impl WeixinAdapter {
             )
             .await?;
         Ok(WeixinUploadedImage {
+            provider_media_id: filekey,
             original_download_param: download_param,
             aeskey_hex: hex_lower(&aeskey),
             original_ciphertext_size: aes_ecb_padded_size(bytes.len()),
@@ -613,6 +804,7 @@ impl WeixinAdapter {
             )
             .await?;
         Ok(WeixinUploadedMedia {
+            provider_media_id: filekey,
             download_param,
             aeskey_hex: hex_lower(&aeskey),
             plaintext_size: bytes.len(),
@@ -763,6 +955,15 @@ impl PlatformAdapter for WeixinAdapter {
         "weixin"
     }
 
+    fn delivery_claim_lease_seconds(&self) -> u64 {
+        let upload_and_send_http_calls = CDN_UPLOAD_MAX_RETRIES as u64 + 2;
+        self.config
+            .timeout_seconds
+            .saturating_mul(upload_and_send_http_calls)
+            .saturating_mul(2)
+            .saturating_add(30)
+    }
+
     fn normalize_inbound(&self, payload: Value) -> Result<InboundMessage, GatewayError> {
         let sender_id = payload
             .get("from_user_id")
@@ -871,8 +1072,66 @@ impl PlatformAdapter for WeixinAdapter {
             )));
         }
 
+        let prepared_media_state = outbound.metadata.get("provider_media_state");
         let native_attachments = if should_send_native_attachment_reply(&outbound) {
-            resolve_native_media_attachments(&outbound)?
+            let resolved = prepared_media_state
+                .and_then(|state| state.get("message_item"))
+                .map(|_| {
+                    vec![NativeWeixinAttachment {
+                        delivery_kind: prepared_media_state
+                            .and_then(|state| state.get("delivery_kind"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("file")
+                            .to_string(),
+                        path: PathBuf::new(),
+                        file_name: String::new(),
+                    }]
+                })
+                .map(Ok)
+                .unwrap_or_else(|| resolve_native_media_attachments(&outbound));
+            match resolved {
+                Ok(attachments) => attachments,
+                Err(error) => {
+                    let error_text = redact_sensitive_text(
+                        &error.message,
+                        &[&account.account_id, &account.token, &context_token],
+                    );
+                    let delivery_batch_id = format!("wxbatch_{}", Uuid::new_v4().simple());
+                    let kinds = outbound
+                        .attachments
+                        .iter()
+                        .map(attachment_delivery_kind_from_value)
+                        .collect::<Vec<_>>();
+                    let mut items = planned_delivery_items(&delivery_batch_id, &kinds);
+                    attach_delivery_item_references(&mut items, 0, &outbound.attachments);
+                    for index in 0..items.len() {
+                        mark_delivery_item(
+                            &mut items,
+                            index,
+                            "failed",
+                            None,
+                            false,
+                            Some(&error_text),
+                        );
+                    }
+                    self.update_transport(json_map!({
+                        "status": "send_failed",
+                        "connected": true,
+                        "last_error": error_text.clone(),
+                        "last_send_at": utc_now_iso(),
+                        "last_send_status": "failed",
+                        "last_send_error": error_text,
+                        "last_send_retryable": false,
+                        "last_send_provider_message_id": "",
+                        "last_send_context_token_used": true,
+                        "last_send_attachment_count": outbound.attachments.len(),
+                        "last_send_content_kind": "attachment_resolution_failed",
+                        "last_delivery_batch_id": delivery_batch_id.clone(),
+                        "last_delivery_batch": delivery_batch_snapshot(&delivery_batch_id, "failed", &items),
+                    }));
+                    return Err(error);
+                }
+            }
         } else {
             vec![]
         };
@@ -897,8 +1156,13 @@ impl PlatformAdapter for WeixinAdapter {
                 .all(|attachment| attachment.delivery_kind == "image")
             {
                 "image".to_string()
-            } else {
+            } else if native_attachments
+                .iter()
+                .all(|attachment| attachment.delivery_kind == native_attachments[0].delivery_kind)
+            {
                 native_attachments[0].delivery_kind.clone()
+            } else {
+                "mixed".to_string()
             }
         } else {
             String::new()
@@ -908,6 +1172,43 @@ impl PlatformAdapter for WeixinAdapter {
         } else {
             outbound.attachments.len()
         };
+        let delivery_item_key = outbound
+            .metadata
+            .get("delivery_item_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let prepared_provider_client_id = outbound
+            .metadata
+            .get("provider_client_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let delivery_batch_id = delivery_item_key
+            .map(|key| stable_weixin_delivery_id("wxbatch", key, 0))
+            .unwrap_or_else(|| format!("wxbatch_{}", Uuid::new_v4().simple()));
+        let delivery_item_kinds = if has_native_attachments {
+            let mut kinds = Vec::with_capacity(send_unit_count);
+            if !native_caption.is_empty() {
+                kinds.push("text".to_string());
+            }
+            kinds.extend(
+                native_attachments
+                    .iter()
+                    .map(|attachment| attachment.delivery_kind.clone()),
+            );
+            kinds
+        } else {
+            vec!["text".to_string(); chunks.len()]
+        };
+        let mut delivery_items = planned_delivery_items(&delivery_batch_id, &delivery_item_kinds);
+        if has_native_attachments {
+            attach_delivery_item_references(
+                &mut delivery_items,
+                usize::from(!native_caption.is_empty()),
+                &outbound.attachments,
+            );
+        }
 
         self.update_transport(json_map!({
             "status": "sending",
@@ -923,86 +1224,209 @@ impl PlatformAdapter for WeixinAdapter {
             "last_send_context_token_used": true,
             "last_send_attachment_count": native_attachment_count,
             "last_send_content_kind": if has_native_attachments { format!("text+{delivered_attachment_kind}") } else { "text".to_string() },
+            "last_delivery_batch_id": delivery_batch_id.clone(),
+            "last_delivery_batch": delivery_batch_snapshot(&delivery_batch_id, "sending", &delivery_items),
         }));
 
         let mut last_client_id = String::new();
+        let mut last_provider_message_id = None;
         let mut attachment_fallback_used = false;
         let send_result = async {
-            if has_native_attachments
-                && native_attachments
-                    .iter()
-                    .all(|attachment| attachment.delivery_kind == "image")
-            {
-                let mut uploaded_images = Vec::new();
-                for attachment in &native_attachments {
-                    uploaded_images.push(
+            if has_native_attachments {
+                let attachment_item_offset = usize::from(!native_caption.is_empty());
+                let mut uploaded_items = Vec::with_capacity(native_attachments.len());
+                for (index, attachment) in native_attachments.iter().enumerate() {
+                    let prepared_item = if index == 0 {
+                        prepared_media_state
+                            .and_then(|state| state.get("message_item"))
+                            .cloned()
+                            .map(|item| {
+                                (
+                                    item,
+                                    prepared_media_state
+                                        .and_then(|state| state.get("used_file_fallback"))
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                )
+                            })
+                    } else {
+                        None
+                    };
+                    let upload_result = if let Some(item) = prepared_item {
+                        Ok(item)
+                    } else if attachment.delivery_kind == "image" {
                         self.upload_image(&account, attachment, &outbound.chat_id)
-                            .await?,
-                    );
+                            .await
+                            .map(|uploaded| (build_native_image_message_item(&uploaded), false))
+                    } else {
+                        let media_type = if attachment.delivery_kind == "video" {
+                            UPLOAD_MEDIA_VIDEO
+                        } else {
+                            UPLOAD_MEDIA_FILE
+                        };
+                        self.upload_media(&account, attachment, media_type, &outbound.chat_id)
+                            .await
+                            .map(|uploaded| {
+                                if attachment.delivery_kind == "video" {
+                                    (build_native_video_message_item(&uploaded), false)
+                                } else {
+                                    (
+                                        build_native_file_message_item(
+                                            &uploaded,
+                                            &attachment.file_name,
+                                        ),
+                                        true,
+                                    )
+                                }
+                            })
+                    };
+                    match upload_result {
+                        Ok(item) => uploaded_items.push(item),
+                        Err(error) => {
+                            return Err((error, attachment_item_offset + index));
+                        }
+                    }
                 }
+
+                let mut delivery_item_index = 0;
                 if !native_caption.is_empty() {
-                    last_client_id = self
+                    match self
                         .send_message_items(
                             &account,
                             &outbound.chat_id,
                             &context_token,
                             vec![build_text_message_item(&native_caption)],
+                            delivery_item_key
+                                .map(|key| stable_weixin_delivery_id("wxmsg", key, 0))
+                                .as_deref(),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(receipt) => {
+                            last_client_id = receipt.provider_client_id;
+                            last_provider_message_id = receipt.provider_message_id;
+                            mark_delivery_item(
+                                &mut delivery_items,
+                                delivery_item_index,
+                                "sent",
+                                last_provider_message_id.as_deref(),
+                                false,
+                                None,
+                            );
+                            self.update_delivery_batch(
+                                &delivery_batch_id,
+                                "sending",
+                                &delivery_items,
+                            );
+                            delivery_item_index += 1;
+                        }
+                        Err(error) => return Err((error, delivery_item_index)),
+                    }
                 }
-                for uploaded in uploaded_images {
-                    last_client_id = self
+                for (attachment_index, (item, used_file_fallback)) in
+                    uploaded_items.into_iter().enumerate()
+                {
+                    attachment_fallback_used |= used_file_fallback;
+                    let provider_client_id =
+                        prepared_provider_client_id.map(str::to_string).or_else(|| {
+                            delivery_item_key.map(|key| {
+                                stable_weixin_delivery_id("wxmsg", key, attachment_index + 1)
+                            })
+                        });
+                    match self
                         .send_message_items(
                             &account,
                             &outbound.chat_id,
                             &context_token,
-                            vec![build_native_image_message_item(&uploaded)],
+                            vec![item],
+                            provider_client_id.as_deref(),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(receipt) => {
+                            last_client_id = receipt.provider_client_id;
+                            last_provider_message_id = receipt.provider_message_id;
+                            mark_delivery_item(
+                                &mut delivery_items,
+                                delivery_item_index,
+                                "sent",
+                                last_provider_message_id.as_deref(),
+                                false,
+                                None,
+                            );
+                            self.update_delivery_batch(
+                                &delivery_batch_id,
+                                "sending",
+                                &delivery_items,
+                            );
+                            delivery_item_index += 1;
+                        }
+                        Err(error) => return Err((error, delivery_item_index)),
+                    }
                 }
-            } else if let Some(attachment) = native_attachments.first() {
-                let media_type = if attachment.delivery_kind == "video" {
-                    UPLOAD_MEDIA_VIDEO
-                } else {
-                    UPLOAD_MEDIA_FILE
-                };
-                let uploaded = self
-                    .upload_media(&account, attachment, media_type, &outbound.chat_id)
-                    .await?;
-                if !native_caption.is_empty() {
-                    last_client_id = self
-                        .send_message_items(
-                            &account,
-                            &outbound.chat_id,
-                            &context_token,
-                            vec![build_text_message_item(&native_caption)],
-                        )
-                        .await?;
-                }
-                let item = if attachment.delivery_kind == "video" {
-                    build_native_video_message_item(&uploaded)
-                } else {
-                    build_native_file_message_item(&uploaded, &attachment.file_name)
-                };
-                if attachment.delivery_kind == "file" {
-                    attachment_fallback_used = true;
-                }
-                last_client_id = self
-                    .send_message_items(&account, &outbound.chat_id, &context_token, vec![item])
-                    .await?;
             } else {
-                last_client_id = self
-                    .send_text_chunks(&account, &outbound.chat_id, &context_token, &outbound.text)
-                    .await?;
+                for (index, chunk) in chunks.iter().enumerate() {
+                    match self
+                        .send_message_items(
+                            &account,
+                            &outbound.chat_id,
+                            &context_token,
+                            vec![build_text_message_item(chunk)],
+                            delivery_item_key
+                                .map(|key| stable_weixin_delivery_id("wxmsg", key, index))
+                                .as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(receipt) => {
+                            last_client_id = receipt.provider_client_id;
+                            last_provider_message_id = receipt.provider_message_id;
+                            mark_delivery_item(
+                                &mut delivery_items,
+                                index,
+                                "sent",
+                                last_provider_message_id.as_deref(),
+                                false,
+                                None,
+                            );
+                            self.update_delivery_batch(
+                                &delivery_batch_id,
+                                "sending",
+                                &delivery_items,
+                            );
+                        }
+                        Err(error) => return Err((error, index)),
+                    }
+                }
             }
-            Ok::<(), GatewayError>(())
+            Ok::<(), (GatewayError, usize)>(())
         }
         .await;
 
-        if let Err(error) = send_result {
+        if let Err((error, failed_item_index)) = send_result {
             let error_text = redact_sensitive_text(
                 &error.message,
                 &[&account.account_id, &account.token, &context_token],
+            );
+            let retryable = true;
+            mark_delivery_item(
+                &mut delivery_items,
+                failed_item_index,
+                "failed",
+                None,
+                retryable,
+                Some(&error_text),
+            );
+            if retryable {
+                mark_remaining_delivery_items_pending_retry(
+                    &mut delivery_items,
+                    failed_item_index + 1,
+                );
+            }
+            self.update_delivery_batch(
+                &delivery_batch_id,
+                if retryable { "pending_retry" } else { "failed" },
+                &delivery_items,
             );
             self.update_transport(json_map!({
                 "status": "send_failed",
@@ -1011,8 +1435,8 @@ impl PlatformAdapter for WeixinAdapter {
                 "last_error": error_text.clone(),
                 "last_send_status": "failed",
                 "last_send_error": error_text,
-                "last_send_retryable": !has_native_attachments,
-                "last_send_provider_message_id": last_client_id.clone(),
+                "last_send_retryable": retryable,
+                "last_send_provider_message_id": last_provider_message_id.clone().unwrap_or_default(),
                 "last_send_context_token_used": true,
                 "last_send_attachment_count": native_attachment_count,
                 "last_send_content_kind": if has_native_attachments { format!("text+{delivered_attachment_kind}") } else { "text".to_string() },
@@ -1020,6 +1444,7 @@ impl PlatformAdapter for WeixinAdapter {
             return Err(error);
         }
 
+        self.update_delivery_batch(&delivery_batch_id, "sent", &delivery_items);
         self.update_transport(json_map!({
             "status": "polling_idle",
             "connected": true,
@@ -1028,7 +1453,7 @@ impl PlatformAdapter for WeixinAdapter {
             "last_send_status": "sent",
             "last_send_error": "",
             "last_send_retryable": false,
-            "last_send_provider_message_id": last_client_id.clone(),
+            "last_send_provider_message_id": last_provider_message_id.clone().unwrap_or_default(),
             "last_send_context_token_used": true,
             "last_send_attachment_count": native_attachment_count,
             "last_send_content_kind": if has_native_attachments { format!("text+{delivered_attachment_kind}") } else { "text".to_string() },
@@ -1051,8 +1476,9 @@ impl PlatformAdapter for WeixinAdapter {
             "timestamp": outbound.timestamp,
             "delivery": "weixin",
             "sent": true,
-            "message_id": last_client_id,
-            "provider_message_id": last_client_id,
+            "message_id": last_provider_message_id,
+            "provider_message_id": last_provider_message_id,
+            "provider_client_id": last_client_id,
             "attachments": response_attachments,
             "metadata": {
                 "context_token_used": true,
@@ -1062,8 +1488,115 @@ impl PlatformAdapter for WeixinAdapter {
                 "native_attachment_count": native_attachments.len(),
                 "native_attachment_kind": delivered_attachment_kind,
                 "native_attachment_fallback": attachment_fallback_used,
+                "delivery_batch": delivery_batch_snapshot(&delivery_batch_id, "sent", &delivery_items),
             },
         }))
+    }
+
+    async fn prepare_outbound(
+        &self,
+        outbound: &OutboundMessage,
+    ) -> Result<Option<PreparedOutbound>, GatewayError> {
+        if !should_send_native_attachment_reply(outbound) || outbound.attachments.len() != 1 {
+            return Ok(None);
+        }
+        self.refresh_account_from_disk();
+        let account = self.account();
+        if !account.configured() {
+            return Err(GatewayError::validation(
+                "Weixin adapter is not configured. Open Weixin setup first.",
+            ));
+        }
+        let context_token = load_context_tokens(&self.config.state_dir, &account.account_id)
+            .get(&outbound.chat_id)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if context_token.is_empty() {
+            return Err(GatewayError::validation(format!(
+                "No Weixin context_token cached for chat_id={}. Send a DM from WeChat first.",
+                outbound.chat_id
+            )));
+        }
+        let attachment = native_media_attachment_from_value(&outbound.attachments[0])?;
+        let (provider_media_id, message_item, used_file_fallback) =
+            if attachment.delivery_kind == "image" {
+                let uploaded = self
+                    .upload_image(&account, &attachment, &outbound.chat_id)
+                    .await?;
+                (
+                    uploaded.provider_media_id.clone(),
+                    build_native_image_message_item(&uploaded),
+                    false,
+                )
+            } else {
+                let media_type = if attachment.delivery_kind == "video" {
+                    UPLOAD_MEDIA_VIDEO
+                } else {
+                    UPLOAD_MEDIA_FILE
+                };
+                let uploaded = self
+                    .upload_media(&account, &attachment, media_type, &outbound.chat_id)
+                    .await?;
+                let message_item = if attachment.delivery_kind == "video" {
+                    build_native_video_message_item(&uploaded)
+                } else {
+                    build_native_file_message_item(&uploaded, &attachment.file_name)
+                };
+                (
+                    uploaded.provider_media_id.clone(),
+                    message_item,
+                    attachment.delivery_kind == "file",
+                )
+            };
+        let delivery_item_key = outbound
+            .metadata
+            .get("delivery_item_key")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let stage = if attachment.delivery_kind == "file" {
+            "fallback"
+        } else {
+            "native"
+        };
+        let provider_client_id =
+            stable_weixin_delivery_id("wxmsg", &format!("{delivery_item_key}|{stage}"), 1);
+        Ok(Some(PreparedOutbound {
+            provider_media_id,
+            provider_client_id: Some(provider_client_id),
+            state: json!({
+                "message_item": message_item,
+                "delivery_kind": attachment.delivery_kind,
+                "used_file_fallback": used_file_fallback,
+            }),
+        }))
+    }
+
+    async fn send_prepared_outbound(
+        &self,
+        mut outbound: OutboundMessage,
+        prepared: Option<&PreparedOutbound>,
+    ) -> Result<Value, GatewayError> {
+        let Some(prepared) = prepared else {
+            return self.send_outbound(outbound).await;
+        };
+        outbound
+            .metadata
+            .insert("provider_media_state".into(), prepared.state.clone());
+        if let Some(provider_client_id) = &prepared.provider_client_id {
+            outbound
+                .metadata
+                .insert("provider_client_id".into(), json!(provider_client_id));
+        }
+        let mut response = self.send_outbound(outbound).await?;
+        if let Some(object) = response.as_object_mut() {
+            object.insert(
+                "provider_media_id".into(),
+                json!(prepared.provider_media_id),
+            );
+        }
+        Ok(response)
     }
 
     fn profile(&self) -> Value {
@@ -1110,9 +1643,118 @@ fn default_transport_state(configured: bool) -> serde_json::Map<String, Value> {
         "last_send_context_token_used": false,
         "last_send_attachment_count": 0,
         "last_send_content_kind": "",
+        "last_delivery_batch_id": "",
+        "last_delivery_batch": Value::Null,
         "last_inbound_at": "",
         "last_inbound_message_id": "",
         "last_inbound_chat_id": "",
+    })
+}
+
+fn planned_delivery_items(batch_id: &str, kinds: &[String]) -> Vec<Value> {
+    kinds
+        .iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            json!({
+                "item_id": format!("{batch_id}-{:03}", index + 1),
+                "index": index,
+                "kind": kind,
+                "status": "planned",
+                "provider_message_id": null,
+                "retryable": false,
+                "error": null,
+            })
+        })
+        .collect()
+}
+
+fn mark_delivery_item(
+    items: &mut [Value],
+    index: usize,
+    status: &str,
+    provider_message_id: Option<&str>,
+    retryable: bool,
+    error: Option<&str>,
+) {
+    let Some(item) = items.get_mut(index).and_then(Value::as_object_mut) else {
+        return;
+    };
+    item.insert("status".into(), json!(status));
+    item.insert(
+        "provider_message_id".into(),
+        provider_message_id
+            .filter(|value| !value.trim().is_empty())
+            .map_or(Value::Null, |value| json!(value)),
+    );
+    item.insert("retryable".into(), json!(retryable));
+    item.insert(
+        "error".into(),
+        error
+            .filter(|value| !value.trim().is_empty())
+            .map_or(Value::Null, |value| json!(value)),
+    );
+}
+
+fn mark_remaining_delivery_items_pending_retry(items: &mut [Value], start_index: usize) {
+    for index in start_index..items.len() {
+        if items[index]
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "planned")
+        {
+            mark_delivery_item(items, index, "pending_retry", None, true, None);
+        }
+    }
+}
+
+fn attach_delivery_item_references(items: &mut [Value], offset: usize, attachments: &[Value]) {
+    for (attachment_index, attachment) in attachments.iter().enumerate() {
+        let Some(artifact_ref) = delivery_artifact_ref(attachment) else {
+            continue;
+        };
+        let Some(item) = items
+            .get_mut(offset + attachment_index)
+            .and_then(Value::as_object_mut)
+        else {
+            break;
+        };
+        item.insert("artifact_ref".into(), json!(artifact_ref));
+    }
+}
+
+fn delivery_artifact_ref(attachment: &Value) -> Option<String> {
+    attachment
+        .pointer("/metadata/harborlink_artifact_id")
+        .or_else(|| attachment.get("media_asset_id"))
+        .or_else(|| attachment.get("label"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn delivery_batch_snapshot(batch_id: &str, status: &str, items: &[Value]) -> Value {
+    let count_status = |expected: &str| {
+        items
+            .iter()
+            .filter(|item| {
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|item_status| item_status == expected)
+            })
+            .count()
+    };
+    json!({
+        "delivery_batch_id": batch_id,
+        "status": status,
+        "item_count": items.len(),
+        "planned_count": count_status("planned"),
+        "sent_count": count_status("sent"),
+        "failed_count": count_status("failed"),
+        "pending_retry_count": count_status("pending_retry"),
+        "items": items,
+        "updated_at": utc_now_iso(),
     })
 }
 
@@ -1134,6 +1776,10 @@ fn context_file(state_dir: &Path, account_id: &str) -> PathBuf {
 
 fn processed_file(state_dir: &Path, account_id: &str) -> PathBuf {
     account_dir(state_dir).join(format!("{}.processed_messages.json", safe_slug(account_id)))
+}
+
+fn inbox_file(state_dir: &Path, account_id: &str) -> PathBuf {
+    account_dir(state_dir).join(format!("{}.inbox.json", safe_slug(account_id)))
 }
 
 fn transport_state_file(state_dir: &Path, account_id: &str) -> PathBuf {
@@ -1239,6 +1885,7 @@ fn clear_weixin_account_state(state_dir: &Path, account_id: &str) -> Vec<String>
         sync_file(state_dir, account_id),
         context_file(state_dir, account_id),
         processed_file(state_dir, account_id),
+        inbox_file(state_dir, account_id),
         transport_state_file(state_dir, account_id),
     ] {
         if fs::remove_file(&path).is_ok() {
@@ -1263,12 +1910,89 @@ fn load_sync_buf(state_dir: &Path, account_id: &str) -> String {
         .unwrap_or_default()
 }
 
+fn load_inbox(
+    state_dir: &Path,
+    account_id: &str,
+) -> Result<serde_json::Map<String, Value>, GatewayError> {
+    let path = inbox_file(state_dir, account_id);
+    if !path.exists() {
+        return Ok(json_map!({
+            "version": 1,
+            "items": json!({}),
+            "updated_at": utc_now_iso(),
+        }));
+    }
+    let raw = fs::read_to_string(&path)?;
+    let value: Value = serde_json::from_str(&raw).map_err(|error| {
+        GatewayError::infrastructure(format!(
+            "Weixin inbox {} contains invalid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    value.as_object().cloned().ok_or_else(|| {
+        GatewayError::infrastructure(format!(
+            "Weixin inbox {} must be a JSON object",
+            path.display()
+        ))
+    })
+}
+
+fn save_inbox(
+    state_dir: &Path,
+    account_id: &str,
+    inbox: &serde_json::Map<String, Value>,
+) -> Result<(), GatewayError> {
+    let path = inbox_file(state_dir, account_id);
+    fs::create_dir_all(account_dir(state_dir))?;
+    let bytes = serde_json::to_vec_pretty(&Value::Object(inbox.clone()))?;
+    AtomicFile::new(&path, AllowOverwrite)
+        .write(|file| -> std::io::Result<()> {
+            use std::io::Write as _;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })
+        .map_err(std::io::Error::from)?;
+    Ok(())
+}
+
+fn stable_weixin_inbox_id(account_id: &str, payload: &Value) -> Result<String, GatewayError> {
+    let provider_message_id = extract_weixin_message_id(payload);
+    let stable_source = if provider_message_id.is_empty() {
+        weixin_payload_fingerprint(payload)?
+    } else {
+        provider_message_id
+    };
+    let mut hasher = Sha256::new();
+    for part in [account_id.as_bytes(), stable_source.as_bytes()] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    Ok(format!("wxinbox_{:x}", hasher.finalize()))
+}
+
+fn weixin_payload_fingerprint(payload: &Value) -> Result<String, GatewayError> {
+    let bytes = serde_json::to_vec(payload)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn weixin_inbox_claim_is_unexpired(item: &Value) -> bool {
+    item.get("claim_expires_at")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|expires_at| expires_at.with_timezone(&Utc) > Utc::now())
+}
+
 fn save_sync_buf(state_dir: &Path, account_id: &str, sync_buf: &str) -> Result<(), GatewayError> {
     fs::create_dir_all(account_dir(state_dir))?;
-    fs::write(
-        sync_file(state_dir, account_id),
-        serde_json::to_string_pretty(&json!({"get_updates_buf": sync_buf}))?,
-    )?;
+    let path = sync_file(state_dir, account_id);
+    let bytes = serde_json::to_vec_pretty(&json!({"get_updates_buf": sync_buf}))?;
+    AtomicFile::new(&path, AllowOverwrite)
+        .write(|file| -> std::io::Result<()> {
+            use std::io::Write as _;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })
+        .map_err(std::io::Error::from)?;
     Ok(())
 }
 
@@ -1461,6 +2185,24 @@ fn build_send_message_payload_items(
     json!({"msg": msg})
 }
 
+fn stable_weixin_delivery_id(prefix: &str, delivery_item_key: &str, index: usize) -> String {
+    let digest = format!(
+        "{:x}",
+        md5::compute(format!("{delivery_item_key}|{index}").as_bytes())
+    );
+    format!("{prefix}_{}", &digest[..24])
+}
+
+fn weixin_provider_message_id(response: &Value) -> Option<String> {
+    response
+        .get("message_id")
+        .or_else(|| response.pointer("/data/msg_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn build_text_message_item(text: &str) -> Value {
     json!({"type": ITEM_TEXT, "text_item": {"text": text}})
 }
@@ -1515,8 +2257,7 @@ fn should_send_native_attachment_reply(outbound: &OutboundMessage) -> bool {
         .metadata
         .get("source")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        == "harborbeacon"
+        .is_some_and(|source| matches!(source, "harborbeacon" | "notification_delivery"))
         && !outbound.attachments.is_empty()
 }
 
@@ -1536,16 +2277,30 @@ fn resolve_native_media_attachments(
             "Weixin native media reply requires at least one attachment",
         ));
     }
-    if resolved.len() > 1
-        && resolved
-            .iter()
-            .any(|attachment| attachment.delivery_kind != "image")
-    {
-        return Err(GatewayError::validation(
-            "Weixin multi-attachment native reply only supports images",
-        ));
+    Ok(resolved)
+}
+
+fn attachment_delivery_kind_from_value(value: &Value) -> String {
+    let kind = value
+        .get("kind")
+        .or_else(|| value.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let mime_type = value
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if kind == "image" || mime_type.starts_with("image/") {
+        "image".to_string()
+    } else if kind == "video" || mime_type.starts_with("video/") {
+        "video".to_string()
+    } else {
+        "file".to_string()
     }
-    Ok(resolved.into_iter().take(3).collect())
 }
 
 fn native_media_attachment_from_value(
@@ -1811,6 +2566,102 @@ mod tests {
     }
 
     #[test]
+    fn durable_inbox_commit_precedes_cursor_and_provider_replay_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-inbox".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config.clone());
+        let update = json!({
+            "msg_id": "provider-message-1",
+            "from_user_id": "wx-user",
+            "item_list": [{"type": 1, "text_item": {"text": "cat clips"}}]
+        });
+
+        adapter
+            .persist_inbound_batch(std::slice::from_ref(&update))
+            .expect("inbox commit must succeed");
+
+        assert_eq!(load_sync_buf(dir.path(), "bot-inbox"), "");
+        assert_eq!(adapter.retryable_inbox_count().unwrap(), 1);
+        adapter
+            .persist_inbound_batch(&[update])
+            .expect("provider replay must upsert the same inbox item");
+        assert_eq!(adapter.retryable_inbox_count().unwrap(), 1);
+        adapter.commit_poll_cursor("cursor-2").unwrap();
+        assert_eq!(load_sync_buf(dir.path(), "bot-inbox"), "cursor-2");
+    }
+
+    #[test]
+    fn durable_inbox_recovers_after_restart_and_keeps_success_tombstone() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-restart".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config.clone());
+        adapter
+            .persist_inbound_batch(&[json!({
+                "msg_id": "provider-message-restart",
+                "from_user_id": "wx-user",
+                "item_list": [{"type": 1, "text_item": {"text": "cat clips"}}]
+            })])
+            .unwrap();
+        drop(adapter);
+
+        let restarted = WeixinAdapter::new(config);
+        let claim = restarted
+            .claim_inbound("runtime-1", 300)
+            .unwrap()
+            .expect("pending inbox item must survive restart");
+        restarted
+            .finish_inbound(
+                claim["inbox_id"].as_str().unwrap(),
+                claim["claim_token"].as_str().unwrap(),
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(restarted.retryable_inbox_count().unwrap(), 0);
+        assert_eq!(restarted.inbox_status_count("succeeded").unwrap(), 1);
+    }
+
+    #[test]
+    fn delivery_claim_lease_exceeds_native_and_fallback_http_budget() {
+        let dir = tempdir().unwrap();
+        let timeout_seconds = 45;
+        let adapter = WeixinAdapter::new(WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-1".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds,
+            poll_timeout_ms: 35000,
+        });
+        let upload_and_send_http_calls = CDN_UPLOAD_MAX_RETRIES as u64 + 2;
+        let native_and_fallback_budget = timeout_seconds * upload_and_send_http_calls * 2;
+
+        assert!(adapter.delivery_claim_lease_seconds() > native_and_fallback_budget);
+    }
+
+    #[test]
     fn normalize_inbound_stores_context_token() {
         let dir = tempdir().unwrap();
         let config = WeixinConfig {
@@ -1847,5 +2698,172 @@ mod tests {
         assert_eq!(payload["msg"]["to_user_id"], "wx-user");
         assert_eq!(payload["msg"]["client_id"], "client-1");
         assert_eq!(payload["msg"]["context_token"], "ctx");
+    }
+
+    #[test]
+    fn stable_delivery_item_key_reuses_provider_client_id() {
+        let first = stable_weixin_delivery_id("wxmsg", "idem-1:artifact-1", 0);
+        let replay = stable_weixin_delivery_id("wxmsg", "idem-1:artifact-1", 0);
+        let other = stable_weixin_delivery_id("wxmsg", "idem-1:artifact-2", 0);
+
+        assert_eq!(first, replay);
+        assert_ne!(first, other);
+        let payload = build_send_message_payload_items(
+            "wx-user",
+            vec![build_text_message_item("clip")],
+            Some("ctx"),
+            Some(&first),
+        );
+        assert_eq!(payload["msg"]["client_id"], first);
+    }
+
+    #[test]
+    fn provider_message_id_never_falls_back_to_client_id() {
+        assert_eq!(
+            weixin_provider_message_id(&json!({"message_id": "provider-message-1"})).as_deref(),
+            Some("provider-message-1")
+        );
+        assert_eq!(
+            weixin_provider_message_id(&json!({"data": {"msg_id": "provider-message-2"}}))
+                .as_deref(),
+            Some("provider-message-2")
+        );
+        assert!(weixin_provider_message_id(&json!({"client_id": "wxmsg-client-only"})).is_none());
+        assert!(weixin_provider_message_id(&json!({})).is_none());
+    }
+
+    #[test]
+    fn native_media_resolution_accepts_mixed_image_and_video() {
+        let dir = tempdir().unwrap();
+        let image = dir.path().join("snapshot.jpg");
+        let video = dir.path().join("clip.mp4");
+        fs::write(&image, [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        fs::write(&video, b"clip").unwrap();
+        let outbound = OutboundMessage {
+            platform: "weixin".into(),
+            chat_id: "wx-user".into(),
+            text: "照片和视频如下".into(),
+            attachments: vec![
+                json!({"kind": "image", "mime_type": "image/jpeg", "path": image}),
+                json!({"kind": "video", "mime_type": "video/mp4", "path": video}),
+            ],
+            timestamp: utc_now_iso(),
+            metadata: json_map!({"source": "harborbeacon"}),
+        };
+
+        let resolved = resolve_native_media_attachments(&outbound).unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].delivery_kind, "image");
+        assert_eq!(resolved[1].delivery_kind, "video");
+    }
+
+    #[test]
+    fn native_media_resolution_keeps_more_than_three_videos() {
+        let dir = tempdir().unwrap();
+        let attachments = (1..=5)
+            .map(|index| {
+                let video = dir.path().join(format!("cat-{index}.mp4"));
+                fs::write(&video, b"clip").unwrap();
+                json!({"kind": "video", "mime_type": "video/mp4", "path": video})
+            })
+            .collect();
+        let outbound = OutboundMessage {
+            platform: "weixin".into(),
+            chat_id: "wx-user".into(),
+            text: "今日猫活动视频".into(),
+            attachments,
+            timestamp: utc_now_iso(),
+            metadata: json_map!({"source": "harborbeacon"}),
+        };
+
+        let resolved = resolve_native_media_attachments(&outbound).unwrap();
+
+        assert_eq!(resolved.len(), 5);
+    }
+
+    #[test]
+    fn delivery_batch_tracks_each_video_and_pending_retry_item() {
+        let kinds = vec![
+            "text".to_string(),
+            "video".to_string(),
+            "video".to_string(),
+            "video".to_string(),
+        ];
+        let mut items = planned_delivery_items("wxbatch_test", &kinds);
+        mark_delivery_item(&mut items, 0, "sent", Some("provider-text"), false, None);
+        mark_delivery_item(&mut items, 1, "sent", Some("provider-video-1"), false, None);
+        mark_delivery_item(&mut items, 2, "failed", None, true, Some("timeout"));
+        mark_remaining_delivery_items_pending_retry(&mut items, 3);
+
+        let snapshot = delivery_batch_snapshot("wxbatch_test", "pending_retry", &items);
+
+        assert_eq!(snapshot["item_count"], 4);
+        assert_eq!(snapshot["planned_count"], 0);
+        assert_eq!(snapshot["sent_count"], 2);
+        assert_eq!(snapshot["failed_count"], 1);
+        assert_eq!(snapshot["pending_retry_count"], 1);
+        assert_eq!(snapshot["items"][1]["kind"], "video");
+        assert_eq!(
+            snapshot["items"][1]["provider_message_id"],
+            "provider-video-1"
+        );
+        assert_eq!(snapshot["items"][3]["status"], "pending_retry");
+        assert!(snapshot.to_string().find(".mp4").is_none());
+    }
+
+    #[test]
+    fn delivery_batch_correlates_video_without_exposing_local_path() {
+        let attachments = vec![json!({
+            "kind": "video",
+            "path": "/run/harborgate-cache/private-cat-video.mp4",
+            "metadata": {
+                "harborlink_artifact_id": "recordings~camera-252~cat-event-7.mp4"
+            }
+        })];
+        let mut items = planned_delivery_items(
+            "wxbatch_artifact",
+            &["text".to_string(), "video".to_string()],
+        );
+
+        attach_delivery_item_references(&mut items, 1, &attachments);
+
+        assert_eq!(
+            items[1]["artifact_ref"],
+            "recordings~camera-252~cat-event-7.mp4"
+        );
+        assert!(items[1].get("path").is_none());
+        assert!(!items[1].to_string().contains("harborgate-cache"));
+    }
+
+    #[test]
+    fn missing_native_video_is_a_failed_video_item_instead_of_text_success() {
+        let outbound = OutboundMessage {
+            platform: "weixin".into(),
+            chat_id: "wx-user".into(),
+            text: "今日猫活动视频".into(),
+            attachments: vec![json!({
+                "kind": "video",
+                "mime_type": "video/mp4",
+                "path": "missing-cat-video.mp4"
+            })],
+            timestamp: utc_now_iso(),
+            metadata: json_map!({"source": "harborbeacon"}),
+        };
+
+        let error = resolve_native_media_attachments(&outbound).unwrap_err();
+        let kinds = outbound
+            .attachments
+            .iter()
+            .map(attachment_delivery_kind_from_value)
+            .collect::<Vec<_>>();
+        let mut items = planned_delivery_items("wxbatch_missing", &kinds);
+        mark_delivery_item(&mut items, 0, "failed", None, false, Some(&error.message));
+        let snapshot = delivery_batch_snapshot("wxbatch_missing", "failed", &items);
+
+        assert_eq!(snapshot["items"][0]["kind"], "video");
+        assert_eq!(snapshot["items"][0]["status"], "failed");
+        assert_eq!(snapshot["sent_count"], 0);
+        assert_eq!(snapshot["failed_count"], 1);
     }
 }

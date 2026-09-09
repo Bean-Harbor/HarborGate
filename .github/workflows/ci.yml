@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout HarborGate
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup component add rustfmt clippy
+
+      - name: Cache cargo builds
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: >-
+          cargo clippy --locked --all-targets -- -D warnings
+          -A clippy::collapsible-str-replace
+          -A clippy::too-many-arguments
+          -A clippy::unnecessary-lazy-evaluations
+          -A clippy::single-element-loop
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Run root-owned service-auth integration tests
+        shell: bash
+        run: |
+          test_binary="$(
+            cargo test --locked --test token_env_migration --no-run --message-format=json |
+              jq -r 'select(.reason == "compiler-artifact" and .target.name == "token_env_migration" and .profile.test) | .executable // empty' |
+              tail -n 1
+          )"
+          test -n "$test_binary"
+          sudo --non-interactive "$test_binary" --ignored --test-threads=1
+
+      - name: Build release binary
+        run: cargo build --locked --release --bin harboros-im-gate
+
+      - name: Build and validate AMD64 deb package
+        shell: bash
+        run: |
+          bash ./debian/build-amd64-package \
+            0.1.0-ci \
+            ./target/release/harboros-im-gate \
+            "${RUNNER_TEMP}/harborgate-deb"
+          bash ./scripts/verify_harboros_im_gate_deb.sh \
+            "${RUNNER_TEMP}/harborgate-deb/harboros-im-gate_0.1.0-ci_linux_amd64.deb"
