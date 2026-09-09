@@ -5,7 +5,11 @@
 This document is historical after the 2026-04-26 decision to move the active
 HarborBeacon <-> HarborGate seam to Contract v2.0.
 
-Use `HarborBeacon-HarborGate-Agent-Contract-v2.0.md` for current work.
+Use `HarborBeacon-HarborGate-Agent-Contract-v2.0.md` and
+`harbor-framework-protocol-map.md` for current work. The normative MUST/SHOULD
+statements below apply only to the archived v1.5 rollout and must not be used
+as current implementation guidance. In particular, do not revive the old task
+ingress, legacy continuation argument, or v1.5 rollback gates as active paths.
 
 ## Status
 

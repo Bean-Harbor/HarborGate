@@ -4,6 +4,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import shutil
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -51,7 +54,7 @@ def test_component_contract_records_existing_delivery_semantics() -> None:
 
 
 def test_k3_service_keeps_device_sessions_in_the_persistent_writable_data_root() -> None:
-    service = (ROOT / "debian" / "harboros-im-gate.service").read_text(
+    service = (ROOT / "debian" / "harbornavi-k3" / "harboros-im-gate.service").read_text(
         encoding="utf-8"
     )
     layout = (ROOT / "scripts" / "ensure-data-layout").read_text(encoding="utf-8")
@@ -60,7 +63,11 @@ def test_k3_service_keeps_device_sessions_in_the_persistent_writable_data_root()
         "Environment=HARBORGATE_DEVICE_SESSION_STATE_DIR="
         "/data/harborgate/device-sessions"
     ) in service
-    assert "EnvironmentFile=/data/harboros/secrets/beacon-gate.env" in service
+    assert "Environment=HARBORGATE_RUNTIME_PROFILE=k3" in service
+    assert "Requires=harboros-service-auth-recovery.service" in service
+    for credential in ["gate-to-beacon-send", "beacon-to-gate-accept-current", "beacon-to-gate-accept-previous"]:
+        assert f"LoadCredential={credential}:" in service
+    assert "EnvironmentFile=/data/harboros/secrets/beacon-gate.env" not in service
     assert "ProtectSystem=strict" in service
     assert "ReadWritePaths=/data/harborgate" in service
     assert "/var/lib/harboros-im-gate/device-sessions" not in service
@@ -68,6 +75,35 @@ def test_k3_service_keeps_device_sessions_in_the_persistent_writable_data_root()
     assert "/etc/default/harboros-im-gate" not in service
     assert '"$root/device-sessions"' in layout
     assert 'install -d -m 0700' in layout
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires a POSIX shell")
+@pytest.mark.parametrize("canonical", [False, True])
+def test_legacy_k3_entrypoint_preserves_build_options(tmp_path: Path, canonical: bool) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    wrapper = scripts / "build_harbornavi_k3_deb.sh"
+    shutil.copyfile(ROOT / "scripts" / wrapper.name, wrapper)
+    (scripts / "build_harborgate_k3_deb.sh").write_text(
+        "printf '%s\\n' \"$RUST_TARGET\" \"$DEBIAN_VERSION\" \"$DEB_ARCH\" \"$OUT_DIR\"\n",
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment.pop("RUST_TARGET", None)
+    environment.pop("DEBIAN_VERSION", None)
+    environment.update(TARGET="x86_64-unknown-linux-gnu", VERSION="0.1.0+compat",
+                       DEB_ARCH="amd64", OUT_DIR=str(tmp_path / "output with spaces"))
+    if canonical:
+        environment.update(RUST_TARGET="riscv64gc-unknown-linux-gnu",
+                           DEBIAN_VERSION="0.1.0+canonical", DEB_ARCH="riscv64")
+    result = subprocess.run(["bash", str(wrapper)], env=environment, check=True,
+                            capture_output=True, text=True)
+    assert result.stdout.splitlines() == [
+        "riscv64gc-unknown-linux-gnu" if canonical else "x86_64-unknown-linux-gnu",
+        "0.1.0+canonical" if canonical else "0.1.0+compat",
+        "riscv64" if canonical else "amd64",
+        str(tmp_path / "output with spaces"),
+    ]
 
 
 def load_script(name: str):

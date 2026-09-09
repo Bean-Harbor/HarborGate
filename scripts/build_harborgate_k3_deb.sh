@@ -80,6 +80,7 @@ install -d \
   "$pkg_dir/DEBIAN" \
   "$pkg_dir/usr/bin" \
   "$pkg_dir/usr/lib/harborgate" \
+  "$pkg_dir/usr/lib/harboros-im-gate" \
   "$pkg_dir/usr/lib/systemd/system" \
   "$pkg_dir/usr/share/doc/harboros-im-gate" \
   "$pkg_dir/usr/share/harboros/component-contracts"
@@ -88,15 +89,19 @@ install -m 0755 \
   "$pkg_dir/usr/bin/harboros-im-gate"
 install -m 0755 scripts/ensure-data-layout \
   "$pkg_dir/usr/lib/harborgate/ensure-data-layout"
-install -m 0644 debian/harboros-im-gate.service \
+install -m 0755 debian/ensure-harborbeacon-token-env \
+  "$pkg_dir/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env"
+install -m 0644 debian/harboros-service-auth-recovery.service \
+  "$pkg_dir/usr/lib/systemd/system/harboros-service-auth-recovery.service"
+install -m 0644 debian/harbornavi-k3/harboros-im-gate.service \
   "$pkg_dir/usr/lib/systemd/system/harboros-im-gate.service"
 install -m 0644 LICENSE "$pkg_dir/usr/share/doc/harboros-im-gate/copyright"
 sed \
   -e "s/VERSION_PLACEHOLDER/${DEBIAN_VERSION}/g" \
   -e "s/ARCH_PLACEHOLDER/${deb_arch}/g" \
-  debian/control > "$pkg_dir/DEBIAN/control"
-sed 's/\r$//' debian/postinst > "$pkg_dir/DEBIAN/postinst"
-sed 's/\r$//' debian/prerm > "$pkg_dir/DEBIAN/prerm"
+  debian/harbornavi-k3/control > "$pkg_dir/DEBIAN/control"
+sed 's/\r$//' debian/harbornavi-k3/postinst > "$pkg_dir/DEBIAN/postinst"
+sed 's/\r$//' debian/harbornavi-k3/prerm > "$pkg_dir/DEBIAN/prerm"
 chmod 0755 "$pkg_dir/DEBIAN/postinst" "$pkg_dir/DEBIAN/prerm"
 sed -e "s/SOURCE_COMMIT_PLACEHOLDER/${source_commit}/g" \
   debian/component-contract.json.in \

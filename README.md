@@ -3,14 +3,20 @@
 HarborGate is the Rust-based IM transport gateway for HarborBeacon.
 
 The active IM service-to-service contract is
-[`HarborBeacon-HarborGate-Agent-Contract-v2.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v2.0.md).
+[`HarborBeacon-HarborGate-Agent-Contract-v2.0.md`](./docs/HarborBeacon-HarborGate-Agent-Contract-v2.0.md).
 The northbound channel-edge upgrade is
-[`HarborBeacon-HarborGate-Agent-Contract-v3.0.md`](./HarborBeacon-HarborGate-Agent-Contract-v3.0.md).
+[`HarborBeacon-HarborGate-Agent-Contract-v3.0.md`](./docs/HarborBeacon-HarborGate-Agent-Contract-v3.0.md).
 HarborGate owns IM adapters, channel-edge entrypoints, platform credentials,
 setup/admin pages, inbound normalization, route registry, outbound delivery,
 and redacted gateway status.
 HarborBeacon owns business conversation state, active frames, approvals,
 artifacts, audit, and local model policy.
+
+HarborCloud owns account, entitlement, Hub identity, WebRTC signaling, and cloud
+metadata. HarborLink owns Hub-side outbound MQTT and Home Assistant/camera
+bridge execution. harbor-dock owns Android/Paper UI intent. HarborNAS-webui
+owns HarborOS UI presentation. HarborGate must not absorb those product
+boundaries.
 
 ## Runtime
 
@@ -67,14 +73,22 @@ export HARBORGATE_DEBIAN_SNAPSHOT=20260801T000000Z
 ```
 
 The K3 service remains loopback-only and stores sessions and transport state
-under `/data/harborgate`. HarborOS System provisions the shared service bearer;
-the Gate package never generates or exports that cross-component secret. The
-package depends on the compatible HarborOS System line and loads only the
-required `/data/harboros/secrets/beacon-gate.env`; no `/etc/default` file may
-override the K3 listener, data roots, contract, or bearer values. Startup fails
-closed unless the listener is loopback `127.0.0.1:8787`, the contract is `2.0`,
-all component state is under `/data/harborgate`, and both distinct 32-byte
-bearers are present.
+under `/data/harborgate`. Its unit selects `HARBORGATE_RUNTIME_PROFILE=k3`;
+standard AMD64 packages retain the normal configurable runtime profile. K3
+package templates live in `debian/harbornavi-k3`, and both package paths include
+the directional service-credential writer and recovery unit. Installation runs
+only `prepare`; credential switch, finalize and rollback remain explicit
+operations. K3 loads its Gate-to-Beacon sender and current/previous
+Beacon-to-Gate receivers through systemd `LoadCredential` from
+`/etc/harboros/service-auth`, with recovery ordered before startup. It does not
+load the old shared `/data/harboros/secrets/beacon-gate.env` or `/etc/default`
+overrides. Startup fails closed unless its listener, data roots, v2.0 contract
+and distinct credentials satisfy the K3 profile.
+
+The earlier `scripts/build_harbornavi_k3_deb.sh` entrypoint forwards to the
+audited builder. It accepts the existing `TARGET`, `VERSION`, and `OUT_DIR`
+settings, while requiring the same explicit version and provenance environment
+as the canonical build.
 
 The repository CI proves an amd64 package install and loopback health smoke. It
 cross-builds the riscv64 package but does not claim that QEMU or real K3 runtime
@@ -123,7 +137,7 @@ POST /api/web/turns
 X-Contract-Version: 2.0
 ```
 
-Android/Web clients enter through HarborGate:
+Android/Web assistant chat clients may enter through HarborGate:
 
 ```text
 POST /api/gateway/turns
@@ -136,13 +150,18 @@ Beacon-owned admin/config APIs are proxied through HarborGate:
 /api/harbor-gate/api/beacon/* -> HarborBeacon /api/*
 ```
 
+This proxy is not a cloud, Hub, or UI state owner. HarborDock remote home/camera
+control remains a HarborCloud + HarborLink + harbor-dock concern unless an
+approved assistant turn explicitly enters the Beacon/Gate seam.
+
 Knowledge search and conversation JSON requests require a fresh 30-second
 single-use HarborOS token in `X-HarborOS-Auth-Token`. HarborGate validates the
 token through middleware, removes all client identity and authorization input,
 and forwards a canonical HarborOS principal with the Gate-to-Beacon service
-bearer. The proxy requires `HARBORBEACON_WEB_API_TOKEN` and never falls back to
-the legacy IM `HARBORBEACON_TASK_API_TOKEN`. Browser clients must never receive
-the service bearer.
+bearer. The proxy requires `HARBOR_GATE_TO_BEACON_TOKEN`; the legacy
+`HARBORBEACON_WEB_API_TOKEN` name is accepted only during the RC migration and
+never falls back to task or Beacon-to-Gate credentials. Browser clients must
+never receive the service bearer.
 
 Rules that must not drift:
 
@@ -151,6 +170,8 @@ Rules that must not drift:
 - do not interpret `active_frame.kind` for business routing
 - do not import HarborBeacon runtime code
 - do not store IM platform credentials in HarborBeacon
+- do not route HarborCloud entitlement, HarborLink MQTT, HarborDock remote
+  control, or WebUI display state through HarborGate business semantics
 
 HarborGate exposes outbound delivery for HarborBeacon:
 
@@ -188,11 +209,16 @@ Core:
 IM_AGENT_HOST=127.0.0.1
 IM_AGENT_PORT=8787
 IM_AGENT_CONTRACT_VERSION=2.0
-IM_AGENT_SERVICE_TOKEN=<shared-service-token>
+HARBOR_BEACON_TO_GATE_TOKEN=<inbound-current-token>
+HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS=<inbound-rotation-token>
 HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
-HARBORBEACON_WEB_API_TOKEN=<shared-service-token>
+HARBOR_GATE_TO_BEACON_TOKEN=<outbound-current-token>
 HARBOR_WORKSPACE_ID=home-1
 ```
+
+Packaged services receive these values through role-scoped systemd credentials.
+See `docs/HarborGate-HarborBeacon-Service-Auth-Rotation-Runbook.md` for the
+prepare, switch, finalize, and rollback order.
 
 Feishu:
 

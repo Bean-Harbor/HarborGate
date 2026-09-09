@@ -1,16 +1,9 @@
-#!/bin/sh
+#!/bin/bash
 set -e
 
-/usr/lib/harborgate/ensure-data-layout
-
-if command -v deb-systemd-helper >/dev/null 2>&1; then
-  deb-systemd-helper unmask harboros-im-gate.service >/dev/null || true
-  deb-systemd-helper enable harboros-im-gate.service >/dev/null || true
-fi
-
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  systemctl daemon-reload
-  systemctl try-restart harboros-im-gate.service || true
-fi
+/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env prepare
+systemctl daemon-reload
+systemctl enable harboros-im-gate.service
+systemctl restart harboros-im-gate.service
 
 exit 0

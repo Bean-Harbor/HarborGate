@@ -2,10 +2,9 @@ Package: harboros-im-gate
 Version: VERSION_PLACEHOLDER
 Section: utils
 Priority: optional
-Architecture: ARCH_PLACEHOLDER
-Depends: harboros-system (>= 0.1.0+harbornavi.k3.evt1), harboros-system (<< 0.2), libc6, ca-certificates, init-system-helpers
-X-HarborOS-Dependency-Closure: central-ubuntu-26.04-resolver-required
+Architecture: amd64
+Depends: libc6, util-linux
+Provides: harboros-service-auth-abi (= 1)
 Maintainer: Harborinno Ltd.
-Description: HarborOS IM transport gateway
- HarborGate owns authenticated IM ingress, platform adapters, and outbound
- delivery for the HarborBeacon v2.0 service contract.
+Description: HarborNAS IM Gateway Service
+  Background service that communicates with multi IM channel.

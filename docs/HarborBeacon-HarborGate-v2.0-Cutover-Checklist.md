@@ -42,6 +42,10 @@ Control-pack readiness requires:
 - group chat.
 - direct IM delivery from HarborBeacon.
 - raw platform credentials in HarborBeacon.
+- HarborCloud entitlement, Hub identity, WebRTC signaling, and cloud metadata.
+- HarborLink MQTT command/ack and local Home Assistant/camera bridge execution.
+- HarborDock remote home/camera control backend behavior.
+- HarborNAS WebUI display state.
 
 ## Live Weixin Matrix
 

@@ -1,9 +1,7 @@
-#!/bin/sh
+#!/bin/bash
 set -e
 
-if [ "${1:-}" = "remove" ] && command -v systemctl >/dev/null 2>&1 \
-  && [ -d /run/systemd/system ]; then
-  systemctl stop harboros-im-gate.service || true
-fi
+systemctl stop harboros-im-gate.service || true
+systemctl disable harboros-im-gate.service || true
 
 exit 0

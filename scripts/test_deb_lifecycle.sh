@@ -9,6 +9,10 @@ depends="$(dpkg-deb --field "$artifact" Depends)"
 grep -Fq 'harboros-system (>= 0.1.0+harbornavi.k3.evt1)' <<<"$depends"
 grep -Fq 'harboros-system (<< 0.2)' <<<"$depends"
 
+[[ ! -e /etc/harboros/service-auth ]] || {
+  echo "error: lifecycle fixture requires a disposable container without service credentials" >&2
+  exit 2
+}
 fixture="$(mktemp -d)"
 trap 'rm -rf -- "$fixture"' EXIT
 install -d "$fixture/system/DEBIAN" "$fixture/system/usr/lib/systemd/system"
@@ -33,6 +37,17 @@ dpkg --configure harboros-im-gate
 test -x /usr/bin/harboros-im-gate
 test -f /usr/lib/systemd/system/harboros-im-gate.service
 test -x /usr/lib/harborgate/ensure-data-layout
+test -x /usr/lib/harboros-im-gate/ensure-harborbeacon-token-env
+test -f /usr/lib/systemd/system/harboros-service-auth-recovery.service
+test "$(dpkg-deb --field "$artifact" Provides)" = 'harboros-service-auth-abi (= 1)'
+test "$(stat -c '%u:%g:%a' /etc/harboros/service-auth)" = '0:0:700'
+for name in gate-to-beacon.send gate-to-beacon.accept-current gate-to-beacon.accept-previous beacon-to-gate.send beacon-to-gate.accept-current beacon-to-gate.accept-previous; do
+  test "$(stat -c '%u:%g:%a' "/etc/harboros/service-auth/$name")" = '0:0:600'
+done
+cmp /etc/harboros/service-auth/gate-to-beacon.send /etc/harboros/service-auth/gate-to-beacon.accept-current
+cmp /etc/harboros/service-auth/beacon-to-gate.send /etc/harboros/service-auth/beacon-to-gate.accept-current
+! cmp -s /etc/harboros/service-auth/gate-to-beacon.send /etc/harboros/service-auth/beacon-to-gate.send
+cp -a /etc/harboros/service-auth "$fixture/auth-before"
 test -f /usr/share/harboros/component-contracts/harboros-im-gate.json
 test -f /usr/share/doc/harboros-im-gate/k3-runtime-evidence-required.json
 test -f /usr/share/doc/harboros-im-gate/first-party-rights-approval.json
@@ -45,7 +60,7 @@ grep -Fq 'Environment=HARBORGATE_DEVICE_SESSION_STATE_DIR=/data/harborgate/devic
   /usr/lib/systemd/system/harboros-im-gate.service
 grep -Fq 'Requires=harboros-bootstrap.service' \
   /usr/lib/systemd/system/harboros-im-gate.service
-grep -Fq 'EnvironmentFile=/data/harboros/secrets/beacon-gate.env' \
+grep -Fq 'LoadCredential=gate-to-beacon-send:/etc/harboros/service-auth/gate-to-beacon.send' \
   /usr/lib/systemd/system/harboros-im-gate.service
 ! grep -Fq '/etc/default/harboros-im-gate' \
   /usr/lib/systemd/system/harboros-im-gate.service
@@ -61,6 +76,7 @@ bash ./scripts/test_runtime_smoke.sh
 # inventing a second package version outside the frozen EVT package set.
 dpkg --unpack "$artifact"
 dpkg --configure harboros-im-gate
+diff --recursive "$fixture/auth-before" /etc/harboros/service-auth
 dpkg --remove harboros-im-gate
 test ! -e /usr/bin/harboros-im-gate
 test -d /data/harborgate
