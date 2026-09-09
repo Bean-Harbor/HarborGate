@@ -10,6 +10,7 @@ use tokio::runtime::Handle;
 use tracing::{info, warn};
 use tungstenite::connect;
 use tungstenite::Message as WsMessage;
+use uuid::Uuid;
 
 pub fn maybe_start_feishu_websocket_runtime(
     gateway: Arc<GatewayService>,
@@ -31,32 +32,49 @@ pub fn maybe_start_weixin_poll_runtime(gateway: Arc<GatewayService>, enabled: bo
     thread::spawn(move || run_weixin_poll_runtime(gateway, handle));
 }
 
+pub fn start_delivery_recovery_runtime(gateway: Arc<GatewayService>) {
+    tokio::spawn(async move {
+        loop {
+            match gateway.retry_pending_deliveries().await {
+                Ok(attempted) if attempted > 0 => {
+                    info!(attempted, "Retryable delivery recovery pass completed")
+                }
+                Ok(_) => {}
+                Err(error) => warn!("Retryable delivery recovery pass failed: {error}"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
 fn run_weixin_poll_runtime(gateway: Arc<GatewayService>, handle: Handle) {
     let mut backoff_seconds = 1u64;
+    let owner = format!("weixin-runtime-{}", Uuid::new_v4().simple());
     loop {
         let adapter = gateway.weixin_adapter();
         if !adapter.configured() {
             thread::sleep(Duration::from_secs(5));
             continue;
         }
+        drain_weixin_inbox(&gateway, &adapter, &handle, &owner);
         match handle.block_on(adapter.poll_updates()) {
-            Ok(updates) => {
-                backoff_seconds = 1;
-                for payload in updates {
-                    if adapter.is_duplicate_update(&payload) {
-                        continue;
-                    }
-                    let handled =
-                        handle.block_on(gateway.handle_inbound("weixin", payload.clone()));
-                    match handled {
-                        Ok(_) => {
-                            if let Err(error) = adapter.mark_update_processed(&payload) {
-                                warn!("Weixin update duplicate guard persist failed: {error}");
-                            }
-                        }
-                        Err(error) => warn!("Weixin inbound update handling failed: {error}"),
-                    }
+            Ok(batch) => {
+                if let Err(error) = adapter.persist_inbound_batch(&batch.updates) {
+                    let delay = backoff_seconds.min(30);
+                    warn!("Weixin durable inbox commit failed: {error}; cursor not advanced; retrying in {delay}s");
+                    thread::sleep(Duration::from_secs(delay));
+                    backoff_seconds = (backoff_seconds * 2).min(30);
+                    continue;
                 }
+                if let Err(error) = adapter.commit_poll_cursor(&batch.next_cursor) {
+                    let delay = backoff_seconds.min(30);
+                    warn!("Weixin cursor commit failed after durable inbox commit: {error}; provider replay will be deduplicated; retrying in {delay}s");
+                    thread::sleep(Duration::from_secs(delay));
+                    backoff_seconds = (backoff_seconds * 2).min(30);
+                    continue;
+                }
+                backoff_seconds = 1;
+                drain_weixin_inbox(&gateway, &adapter, &handle, &owner);
             }
             Err(error) => {
                 let delay = backoff_seconds.min(30);
@@ -66,6 +84,64 @@ fn run_weixin_poll_runtime(gateway: Arc<GatewayService>, handle: Handle) {
             }
         }
     }
+}
+
+fn drain_weixin_inbox(
+    gateway: &Arc<GatewayService>,
+    adapter: &Arc<crate::adapters::weixin::WeixinAdapter>,
+    handle: &Handle,
+    owner: &str,
+) {
+    for _ in 0..100 {
+        let claim = match adapter.claim_inbound(owner, 15 * 60) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => return,
+            Err(error) => {
+                warn!("Weixin inbox claim failed: {error}");
+                return;
+            }
+        };
+        let Some(inbox_id) = claim.get("inbox_id").and_then(Value::as_str) else {
+            warn!("Weixin inbox claim did not include inbox_id");
+            return;
+        };
+        let Some(claim_token) = claim.get("claim_token").and_then(Value::as_str) else {
+            warn!("Weixin inbox claim did not include claim_token");
+            return;
+        };
+        let payload = claim.get("payload").cloned().unwrap_or(Value::Null);
+        match handle.block_on(gateway.handle_inbound("weixin", payload)) {
+            Ok(_) => {
+                if let Err(error) = adapter.finish_inbound(inbox_id, claim_token, true, false, None)
+                {
+                    warn!("Weixin inbox success tombstone persist failed: {error}");
+                    return;
+                }
+            }
+            Err(error) => {
+                let retryable = error.status.is_server_error()
+                    || matches!(
+                        error.status,
+                        axum::http::StatusCode::REQUEST_TIMEOUT
+                            | axum::http::StatusCode::TOO_MANY_REQUESTS
+                    );
+                if let Err(store_error) = adapter.finish_inbound(
+                    inbox_id,
+                    claim_token,
+                    false,
+                    retryable,
+                    Some(&error.to_string()),
+                ) {
+                    warn!("Weixin inbox failure state persist failed: {store_error}");
+                }
+                warn!(inbox_id, retryable, error = %error, "Weixin inbound inbox processing failed");
+                if retryable {
+                    return;
+                }
+            }
+        }
+    }
+    warn!("Weixin inbox recovery pass reached its 100 item bound");
 }
 
 fn run_feishu_websocket_runtime(

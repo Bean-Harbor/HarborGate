@@ -1,0 +1,134 @@
+#!/bin/bash
+set -euo pipefail
+
+if [ "$#" -ne 3 ]; then
+  echo "usage: build-amd64-package VERSION BINARY OUTPUT_DIR" >&2
+  exit 64
+fi
+
+version="$1"
+binary="$2"
+output_dir="$3"
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+~_-]*$ ]]; then
+  echo "invalid Debian package version" >&2
+  exit 64
+fi
+if [ -L "$binary" ] || [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+  echo "release binary must be an executable regular file" >&2
+  exit 66
+fi
+
+mkdir -p -- "$output_dir"
+output_dir="$(cd -- "$output_dir" && pwd -P)"
+work_dir="$(mktemp -d)"
+trap 'rm -rf -- "$work_dir"' EXIT
+
+package_name="harboros-im-gate_${version}_linux_amd64"
+package_dir="$work_dir/$package_name"
+deb_path="$output_dir/$package_name.deb"
+if [ -L "$deb_path" ] || [ -e "$deb_path" ]; then
+  echo "refusing to overwrite an existing Debian package" >&2
+  exit 73
+fi
+
+install -d -m 0755 \
+  "$package_dir/DEBIAN" \
+  "$package_dir/usr/bin" \
+  "$package_dir/usr/lib/harboros-im-gate" \
+  "$package_dir/etc/systemd/system"
+install -m 0755 "$binary" "$package_dir/usr/bin/harboros-im-gate"
+install -m 0755 \
+  "$repo_root/debian/ensure-harborbeacon-token-env" \
+  "$package_dir/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env"
+install -m 0644 \
+  "$repo_root/debian/harboros-im-gate.service" \
+  "$repo_root/debian/harboros-service-auth-recovery.service" \
+  "$package_dir/etc/systemd/system/"
+install -m 0644 "$repo_root/debian/control" "$package_dir/DEBIAN/control"
+sed -i "s/VERSION_PLACEHOLDER/$version/g" "$package_dir/DEBIAN/control"
+install -m 0755 "$repo_root/debian/postinst" "$package_dir/DEBIAN/postinst"
+install -m 0755 "$repo_root/debian/prerm" "$package_dir/DEBIAN/prerm"
+
+bash -n "$package_dir/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env"
+bash -n "$package_dir/DEBIAN/postinst"
+bash -n "$package_dir/DEBIAN/prerm"
+dpkg-deb --root-owner-group --build "$package_dir" "$deb_path" >&2
+
+require_field() {
+  local field="$1"
+  local expected="$2"
+  local actual
+  actual="$(dpkg-deb --field "$deb_path" "$field")"
+  if [ "$actual" != "$expected" ]; then
+    echo "unexpected $field metadata: $actual" >&2
+    return 1
+  fi
+}
+
+require_archive_entry() {
+  local listing="$1"
+  local path="$2"
+  local expected_mode="$3"
+  local expected_owner="$4"
+  local entry
+  entry="$(awk -v path="$path" '$NF == path { count += 1; value = $1 " " $2 } END { if (count != 1) exit 1; print value }' "$listing")" || {
+    echo "missing or duplicate package entry: $path" >&2
+    return 1
+  }
+  if [ "$entry" != "$expected_mode $expected_owner" ]; then
+    echo "unsafe package entry metadata for $path: $entry" >&2
+    return 1
+  fi
+}
+
+require_field Package "harboros-im-gate"
+require_field Version "$version"
+require_field Architecture "amd64"
+require_field Depends "libc6, util-linux"
+require_field Provides "harboros-service-auth-abi (= 1)"
+
+data_listing="$work_dir/data.list"
+dpkg-deb --contents "$deb_path" > "$data_listing"
+require_archive_entry "$data_listing" "./usr/bin/harboros-im-gate" "-rwxr-xr-x" "root/root"
+require_archive_entry \
+  "$data_listing" \
+  "./usr/lib/harboros-im-gate/ensure-harborbeacon-token-env" \
+  "-rwxr-xr-x" \
+  "root/root"
+require_archive_entry \
+  "$data_listing" \
+  "./etc/systemd/system/harboros-im-gate.service" \
+  "-rw-r--r--" \
+  "root/root"
+require_archive_entry \
+  "$data_listing" \
+  "./etc/systemd/system/harboros-service-auth-recovery.service" \
+  "-rw-r--r--" \
+  "root/root"
+
+control_listing="$work_dir/control.list"
+dpkg-deb --ctrl-tarfile "$deb_path" | tar --numeric-owner -tvf - > "$control_listing"
+require_archive_entry "$control_listing" "./postinst" "-rwxr-xr-x" "0/0"
+require_archive_entry "$control_listing" "./prerm" "-rwxr-xr-x" "0/0"
+
+extract_dir="$work_dir/extract"
+control_dir="$work_dir/control"
+dpkg-deb --extract "$deb_path" "$extract_dir"
+dpkg-deb --control "$deb_path" "$control_dir"
+cmp --silent "$binary" "$extract_dir/usr/bin/harboros-im-gate"
+cmp --silent \
+  "$repo_root/debian/ensure-harborbeacon-token-env" \
+  "$extract_dir/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env"
+cmp --silent \
+  "$repo_root/debian/harboros-im-gate.service" \
+  "$extract_dir/etc/systemd/system/harboros-im-gate.service"
+cmp --silent \
+  "$repo_root/debian/harboros-service-auth-recovery.service" \
+  "$extract_dir/etc/systemd/system/harboros-service-auth-recovery.service"
+bash -n "$extract_dir/usr/lib/harboros-im-gate/ensure-harborbeacon-token-env"
+bash -n "$control_dir/postinst"
+bash -n "$control_dir/prerm"
+
+printf '%s\n' "$deb_path"

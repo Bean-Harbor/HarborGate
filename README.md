@@ -88,11 +88,21 @@ Beacon-owned admin/config APIs are proxied through HarborGate:
 
 ```text
 /api/beacon/* -> HarborBeacon /api/*
+/api/harbor-gate/api/beacon/* -> HarborBeacon /api/*
 ```
 
 This proxy is not a cloud, Hub, or UI state owner. HarborDock remote home/camera
 control remains a HarborCloud + HarborLink + harbor-dock concern unless an
 approved assistant turn explicitly enters the Beacon/Gate seam.
+
+Knowledge search and conversation JSON requests require a fresh 30-second
+single-use HarborOS token in `X-HarborOS-Auth-Token`. HarborGate validates the
+token through middleware, removes all client identity and authorization input,
+and forwards a canonical HarborOS principal with the Gate-to-Beacon service
+bearer. The proxy requires `HARBOR_GATE_TO_BEACON_TOKEN`; the legacy
+`HARBORBEACON_WEB_API_TOKEN` name is accepted only during the RC migration and
+never falls back to task or Beacon-to-Gate credentials. Browser clients must
+never receive the service bearer.
 
 Rules that must not drift:
 
@@ -117,6 +127,7 @@ POST /api/notifications/deliveries
 - `GET /api/gateway/status`
 - `POST /api/gateway/turns`
 - `/api/beacon/*`
+- `/api/harbor-gate/api/beacon/*`
 - `POST /messages/webhook`
 - `POST /messages/feishu`
 - `POST /messages/weixin`
@@ -139,10 +150,16 @@ Core:
 IM_AGENT_HOST=127.0.0.1
 IM_AGENT_PORT=8787
 IM_AGENT_CONTRACT_VERSION=2.0
-IM_AGENT_SERVICE_TOKEN=<shared-service-token>
+HARBOR_BEACON_TO_GATE_TOKEN=<inbound-current-token>
+HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS=<inbound-rotation-token>
 HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
-HARBORBEACON_WEB_API_TOKEN=<shared-service-token>
+HARBOR_GATE_TO_BEACON_TOKEN=<outbound-current-token>
+HARBOR_WORKSPACE_ID=home-1
 ```
+
+Packaged services receive these values through role-scoped systemd credentials.
+See `docs/HarborGate-HarborBeacon-Service-Auth-Rotation-Runbook.md` for the
+prepare, switch, finalize, and rollback order.
 
 Feishu:
 
@@ -153,6 +170,27 @@ FEISHU_CONNECTION_MODE=websocket
 FEISHU_ENABLE_LIVE_SEND=1
 HARBORGATE_RUST_FEISHU_WEBSOCKET=1
 ```
+
+Feishu Mail delivery:
+
+```text
+FEISHU_MAIL_ENABLED=1
+FEISHU_MAIL_SENDER_MAILBOX=me
+FEISHU_MAIL_DEFAULT_FROM_NAME=HarborOps
+FEISHU_MAIL_USER_ACCESS_TOKEN=<short-lived-user-token>
+FEISHU_MAIL_USER_REFRESH_TOKEN=<rotating-user-refresh-token>
+FEISHU_MAIL_TOKEN_STATE_PATH=/var/lib/harborgate/feishu-mail-token.json
+```
+
+`FEISHU_MAIL_USER_ACCESS_TOKEN` is useful for one-off smoke delivery. For a
+longer-lived HarborOps route, configure the refresh token and token state path;
+Gate will refresh the user token through Feishu's OAuth v2 token endpoint using
+the app credentials and persist the rotated token state. Treat
+`FEISHU_MAIL_USER_REFRESH_TOKEN` as a bootstrap seed; after the first successful
+refresh, the token state file is the source of truth for rotated refresh tokens.
+Keep the state file private to the Gate host. Beacon and HarborOps must only
+reference the Gate delivery route and must not store Feishu credentials or token
+material.
 
 Weixin:
 
