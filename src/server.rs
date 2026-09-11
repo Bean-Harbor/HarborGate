@@ -45,6 +45,7 @@ pub struct AppState {
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     validate_required_service_auth(&config)?;
+    config.validate_runtime_profile()?;
     let gateway = Arc::new(GatewayService::from_config(&config)?);
     let feishu_websocket_started = Arc::new(AtomicBool::new(false));
     maybe_start_configured_feishu_runtime(
@@ -1292,6 +1293,18 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(error.code, "CONTRACT_VERSION_MISMATCH");
+    }
+
+    #[test]
+    fn service_auth_fails_closed_when_the_shared_token_is_empty() {
+        let mut config = AppConfig::from_env();
+        config.service_token.clear();
+
+        let error = require_service_auth(&config, &HeaderMap::new())
+            .expect_err("an empty shared token must never disable authentication");
+
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, "SERVICE_AUTH_FAILED");
     }
 
     #[test]

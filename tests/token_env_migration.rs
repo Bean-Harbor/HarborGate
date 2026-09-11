@@ -1204,7 +1204,20 @@ fn package_uses_role_scoped_systemd_credentials_and_prepare_only() {
     let cargo = fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let server = fs::read_to_string(root.join("src/server.rs")).unwrap();
 
-    assert!(workflow.contains("debian/build-amd64-package"));
+    assert!(ci.contains("debian/build-amd64-package"));
+    assert!(workflow.contains("scripts/build_harborgate_k3_deb.sh"));
+    let k3_builder = fs::read_to_string(root.join("scripts/build_harborgate_k3_deb.sh")).unwrap();
+    assert!(k3_builder.contains("debian/ensure-harborbeacon-token-env"));
+    assert!(k3_builder.contains("debian/harboros-service-auth-recovery.service"));
+    assert!(k3_builder.contains("debian/harbornavi-k3/postinst"));
+    let k3_postinst = fs::read_to_string(root.join("debian/harbornavi-k3/postinst")).unwrap();
+    assert!(k3_postinst.contains("ensure-harborbeacon-token-env prepare"));
+    for mode in ["switch", "finalize", "rollback"] {
+        assert!(!k3_postinst.contains(&format!("ensure-harborbeacon-token-env {mode}")));
+    }
+    let k3_control = fs::read_to_string(root.join("debian/harbornavi-k3/control")).unwrap();
+    assert!(k3_control.contains("util-linux"));
+    assert!(k3_control.contains("Provides: harboros-service-auth-abi (= 1)"));
     assert!(ci.contains("Run root-owned service-auth integration tests"));
     assert!(ci.contains("sudo --non-interactive \"$test_binary\" --ignored --test-threads=1"));
     assert!(ci.contains("Build and validate AMD64 deb package"));

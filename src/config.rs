@@ -1,10 +1,12 @@
 use serde_json::Value;
 use std::env;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    pub runtime_profile: String,
     pub host: String,
     pub port: u16,
     pub data_dir: PathBuf,
@@ -109,6 +111,7 @@ impl AppConfig {
             &["HARBOR_GATE_TO_BEACON_TOKEN", "HARBORBEACON_WEB_API_TOKEN"],
         );
         Self {
+            runtime_profile: env_or("HARBORGATE_RUNTIME_PROFILE", "standard"),
             host: env_or("IM_AGENT_HOST", "127.0.0.1"),
             port: env_or("IM_AGENT_PORT", "8787").parse().unwrap_or(8787),
             data_dir: PathBuf::from(data_dir),
@@ -142,6 +145,80 @@ impl AppConfig {
     pub fn harborbeacon_enabled(&self) -> bool {
         !self.harborbeacon_base_url.trim().is_empty()
     }
+
+    pub fn validate_runtime_profile(&self) -> anyhow::Result<()> {
+        match self.runtime_profile.as_str() {
+            "standard" => Ok(()),
+            "k3" => self.validate_k3_runtime(),
+            _ => anyhow::bail!("HARBORGATE_RUNTIME_PROFILE must be standard or k3"),
+        }
+    }
+
+    pub fn validate_k3_runtime(&self) -> anyhow::Result<()> {
+        let host: IpAddr = self
+            .host
+            .parse()
+            .map_err(|_| anyhow::anyhow!("IM_AGENT_HOST must be a numeric loopback address"))?;
+        anyhow::ensure!(host.is_loopback(), "IM_AGENT_HOST must be loopback-only");
+        anyhow::ensure!(self.port == 8787, "IM_AGENT_PORT must be 8787");
+        anyhow::ensure!(
+            self.contract_version == "2.0",
+            "IM_AGENT_CONTRACT_VERSION must be 2.0"
+        );
+        anyhow::ensure!(
+            self.data_dir == Path::new("/data/harborgate/sessions"),
+            "IM_AGENT_DATA_DIR must be /data/harborgate/sessions"
+        );
+        anyhow::ensure!(
+            self.state_dir == Path::new("/data/harborgate"),
+            "IM_AGENT_STATE_DIR must be /data/harborgate"
+        );
+        anyhow::ensure!(
+            self.device_session_state_dir == Path::new("/data/harborgate/device-sessions"),
+            "HARBORGATE_DEVICE_SESSION_STATE_DIR must be /data/harborgate/device-sessions"
+        );
+        anyhow::ensure!(
+            self.weixin.state_dir == Path::new("/data/harborgate/weixin"),
+            "WEIXIN_STATE_DIR must be /data/harborgate/weixin"
+        );
+        anyhow::ensure!(
+            self.feishu_mail.user_token_state_path == "/data/harborgate/feishu-mail-token.json",
+            "FEISHU_MAIL_TOKEN_STATE_PATH must be /data/harborgate/feishu-mail-token.json"
+        );
+        anyhow::ensure!(
+            self.harborbeacon_base_url == "http://127.0.0.1:4174",
+            "HARBORBEACON_WEB_API_URL must use the K3 loopback endpoint"
+        );
+        anyhow::ensure!(
+            self.harborbeacon_turn_endpoint == "/api/web/turns",
+            "HARBORBEACON_TURN_ENDPOINT must be /api/web/turns"
+        );
+        anyhow::ensure!(
+            is_lower_hex_credential(&self.service_token),
+            "IM_AGENT_SERVICE_TOKEN must be a 32-byte lowercase hex credential"
+        );
+        anyhow::ensure!(
+            is_lower_hex_credential(&self.harborbeacon_web_api_token),
+            "HARBORBEACON_WEB_API_TOKEN must be a 32-byte lowercase hex credential"
+        );
+        anyhow::ensure!(
+            self.harborbeacon_token == self.harborbeacon_web_api_token,
+            "HarborBeacon v2 transport must use the Web API bearer"
+        );
+        anyhow::ensure!(
+            self.service_token != self.harborbeacon_web_api_token,
+            "Gate ingress and Beacon upstream credentials must be distinct"
+        );
+        Ok(())
+    }
+}
+
+fn is_lower_hex_credential(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 impl WeixinConfig {
@@ -495,6 +572,68 @@ mod tests {
             enable_live_send: false,
             timeout_seconds: 20,
         }
+    }
+
+    fn valid_k3_config() -> AppConfig {
+        let mut config = AppConfig::from_env();
+        config.runtime_profile = "k3".into();
+        config.host = "127.0.0.1".into();
+        config.port = 8787;
+        config.contract_version = "2.0".into();
+        config.data_dir = PathBuf::from("/data/harborgate/sessions");
+        config.state_dir = PathBuf::from("/data/harborgate");
+        config.device_session_state_dir = PathBuf::from("/data/harborgate/device-sessions");
+        config.weixin.state_dir = PathBuf::from("/data/harborgate/weixin");
+        config.feishu_mail.user_token_state_path = "/data/harborgate/feishu-mail-token.json".into();
+        config.harborbeacon_base_url = "http://127.0.0.1:4174".into();
+        config.harborbeacon_turn_endpoint = "/api/web/turns".into();
+        config.service_token = "a".repeat(64);
+        config.harborbeacon_token = "b".repeat(64);
+        config.harborbeacon_web_api_token = "b".repeat(64);
+        config
+    }
+
+    #[test]
+    fn runtime_profile_preserves_standard_paths_and_enforces_k3_paths() {
+        let mut config = valid_k3_config();
+        assert!(config.validate_runtime_profile().is_ok());
+        config.state_dir = PathBuf::from("/var/lib/harboros-im-gate");
+        assert!(config.validate_runtime_profile().is_err());
+        config.runtime_profile = "standard".into();
+        assert!(config.validate_runtime_profile().is_ok());
+        config.runtime_profile = "unknown".into();
+        assert!(config.validate_runtime_profile().is_err());
+    }
+
+    #[test]
+    fn k3_runtime_config_accepts_only_the_product_boundary() {
+        assert!(valid_k3_config().validate_k3_runtime().is_ok());
+
+        let mut config = valid_k3_config();
+        config.host = "0.0.0.0".into();
+        assert!(config.validate_k3_runtime().is_err());
+
+        let mut config = valid_k3_config();
+        config.contract_version = "3.0".into();
+        assert!(config.validate_k3_runtime().is_err());
+
+        let mut config = valid_k3_config();
+        config.state_dir = PathBuf::from("/data/harboros/harborgate");
+        assert!(config.validate_k3_runtime().is_err());
+
+        let mut config = valid_k3_config();
+        config.device_session_state_dir =
+            PathBuf::from("/var/lib/harboros-im-gate/device-sessions");
+        assert!(config.validate_k3_runtime().is_err());
+
+        let mut config = valid_k3_config();
+        config.service_token.clear();
+        assert!(config.validate_k3_runtime().is_err());
+
+        let mut config = valid_k3_config();
+        config.harborbeacon_web_api_token = config.service_token.clone();
+        config.harborbeacon_token = config.service_token.clone();
+        assert!(config.validate_k3_runtime().is_err());
     }
 
     #[test]

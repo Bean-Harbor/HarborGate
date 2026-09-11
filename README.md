@@ -58,6 +58,65 @@ Portable Linux release builds are produced on the builder with:
 just build-linux
 ```
 
+The HarborNavi K3 package is built in the pinned container declared by
+`.github/workflows/k3-evt-package.yml`. A qualification build uses an exact
+Debian version and the source commit timestamp; it does not publish to a public
+release or APT channel:
+
+```bash
+export DEBIAN_VERSION=0.1.0+harbornavi.k3.evt1.riscv64
+export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+export SOURCE_COMMIT="$(git rev-parse HEAD)"
+export HARBORGATE_BUILD_CONTAINER_DIGEST=sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+export HARBORGATE_DEBIAN_SNAPSHOT=20260801T000000Z
+./scripts/verify_k3_reproducible.sh
+```
+
+The K3 service remains loopback-only and stores sessions and transport state
+under `/data/harborgate`. Its unit selects `HARBORGATE_RUNTIME_PROFILE=k3`;
+standard AMD64 packages retain the normal configurable runtime profile. K3
+package templates live in `debian/harbornavi-k3`, and both package paths include
+the directional service-credential writer and recovery unit. Installation runs
+only `prepare`; credential switch, finalize and rollback remain explicit
+operations. K3 loads its Gate-to-Beacon sender and current/previous
+Beacon-to-Gate receivers through systemd `LoadCredential` from
+`/etc/harboros/service-auth`, with recovery ordered before startup. It does not
+load the old shared `/data/harboros/secrets/beacon-gate.env` or `/etc/default`
+overrides. Startup fails closed unless its listener, data roots, v2.0 contract
+and distinct credentials satisfy the K3 profile.
+
+The earlier `scripts/build_harbornavi_k3_deb.sh` entrypoint forwards to the
+audited builder. It accepts the existing `TARGET`, `VERSION`, and `OUT_DIR`
+settings, while requiring the same explicit version and provenance environment
+as the canonical build.
+
+The repository CI proves an amd64 package install and loopback health smoke. It
+cross-builds the riscv64 package but does not claim that QEMU or real K3 runtime
+acceptance occurred. Each package therefore carries
+`k3-runtime-evidence-required.json`; HarborOS qualification/candidate assembly
+must fail closed until signed Ubuntu 26.04 riscv64 dependency-closure, install,
+systemd ordering, binary-execution, and loopback-health evidence exists. The
+HarborOS central release resolver derives `Depends`, `Pre-Depends`, and
+`Provides` closure from the real `.deb`; this repository's Debian snapshot and
+tool versions are build-material provenance, not a substitute for that Ubuntu
+closure.
+
+The bundle also records Harbor Innovations' first-party distribution approval
+inside the deb and in a byte-identical sidecar. That approval covers Gate's
+first-party source and brand materials for HarborNavi qualification only; it
+does not infer licenses for locked Cargo dependencies. The separate
+`third-party-licenses.json` evidence enumerates the target-specific normal/build
+closure from `cargo metadata`, verifies every downloaded `.crate` against its
+`Cargo.lock` checksum, and embeds the package-local license text and hashes.
+Development-only dependencies are excluded from the shipped target closure. A
+missing declaration, archive, or package-local license text keeps
+`license-review.json` and `<deb>.release-materials.json` fail-closed; a complete
+closure makes that package-material decision `approved`/`release_eligible=true`.
+This does not replace HarborOS's signed APT dependency-closure gate. The full
+`<deb>.materials.sha256` manifest covers the final deb, descriptor, SBOMs,
+provenance, rights evidence, component contract, third-party license evidence,
+and every other sidecar.
+
 ## Current Adapters
 
 - `feishu`: websocket receive, webhook callback compatibility, text send,
@@ -179,7 +238,7 @@ FEISHU_MAIL_SENDER_MAILBOX=me
 FEISHU_MAIL_DEFAULT_FROM_NAME=HarborOps
 FEISHU_MAIL_USER_ACCESS_TOKEN=<short-lived-user-token>
 FEISHU_MAIL_USER_REFRESH_TOKEN=<rotating-user-refresh-token>
-FEISHU_MAIL_TOKEN_STATE_PATH=/var/lib/harborgate/feishu-mail-token.json
+FEISHU_MAIL_TOKEN_STATE_PATH=/data/harborgate/feishu-mail-token.json
 ```
 
 `FEISHU_MAIL_USER_ACCESS_TOKEN` is useful for one-off smoke delivery. For a
