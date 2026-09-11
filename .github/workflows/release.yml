@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release"
+        description: "Debian package version / release tag"
         required: true
         default: "1.0.0"
 
@@ -42,6 +42,12 @@ jobs:
             "$VERSION" \
             ./target/x86_64-unknown-linux-gnu/release/harboros-im-gate \
             ./artifacts
+
+      - name: Verify deb package metadata
+        run: |
+          VERSION="${{ inputs.tag }}"
+          PKG_NAME="harboros-im-gate_${VERSION}_linux_amd64"
+          bash ./scripts/verify_harboros_im_gate_deb.sh "./artifacts/${PKG_NAME}.deb"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

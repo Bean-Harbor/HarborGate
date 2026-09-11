@@ -65,3 +65,5 @@ jobs:
             0.1.0-ci \
             ./target/release/harboros-im-gate \
             "${RUNNER_TEMP}/harborgate-deb"
+          bash ./scripts/verify_harboros_im_gate_deb.sh \
+            "${RUNNER_TEMP}/harborgate-deb/harboros-im-gate_0.1.0-ci_linux_amd64.deb"
