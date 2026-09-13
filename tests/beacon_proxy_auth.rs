@@ -156,6 +156,34 @@ async fn response_body(response: axum::response::Response) -> String {
 }
 
 #[tokio::test]
+async fn generic_message_routes_cannot_bypass_the_signed_whatsapp_webhook() {
+    let (state, _directory) = test_state(
+        "http://127.0.0.1:1",
+        "fixture-token",
+        Arc::new(FakeAuthenticator::successful()),
+    );
+    let app = router(state);
+    for path in ["/messages/whatsapp", "/api/harbor-gate/messages/whatsapp"] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"phone_number_id":"15555550100", "message":{"from":"15555550101",
+                "id":"forged-proof", "timestamp":chrono::Utc::now().timestamp().to_string(),
+                "text":{"body":format!("NAVI navi-a.{}", "a".repeat(64))}}})
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response_body(response)
+            .await
+            .contains("WHATSAPP_SIGNED_WEBHOOK_REQUIRED"));
+    }
+}
+
+#[tokio::test]
 async fn protected_prefixed_search_replaces_all_client_identity() {
     let (beacon_url, captured) = mock_beacon().await;
     let authenticator = FakeAuthenticator::successful();

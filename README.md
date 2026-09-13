@@ -124,9 +124,25 @@ and every other sidecar.
 - `weixin`: QR login, account/session state, private-DM long polling, duplicate
   guard, context token cache, text send, native image send, and file/video
   upload delivery path.
+- `whatsapp`: Business Platform webhook verification, durable duplicate handling,
+  text and JPEG/PNG image delivery. Camera images are downloaded through the
+  authenticated Beacon media proxy before the adapter uploads them. This is a
+  development candidate; a provisioned Meta number and real delivery are still
+  required for production qualification.
 - `webhook`: generic inbound route for controlled tests and integration probes.
 
 Weixin group chat remains outside the current ready scope.
+
+Camera delivery rechecks consent through Beacon before sending, after a new
+provider upload, and when retrying a cached or previously uploaded attachment.
+The request uses `X-Harbor-Media-Context: chat` and `Range: bytes=0-0`; the media
+proxy URL permits only the optional fixed query `media_context=chat`. Redirects,
+other queries, and foreign origins are rejected. Revocation or expired media
+ends delivery; a temporary authorization-service outage remains retryable.
+This preserves the existing artifact and turn/result envelopes. Gate does not
+decide household permissions, and cannot recall copies already sent to a provider
+or receiving chat app. One official number serving multiple Navi homes and the
+remote return channel remain separate implementation work.
 
 ## HarborBeacon Boundary
 

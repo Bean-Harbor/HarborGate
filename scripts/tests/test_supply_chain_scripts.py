@@ -313,6 +313,99 @@ def test_legacy_cargo_license_slash_is_normalized_to_spdx_or() -> None:
         generator.normalize_license_expression("MIT/(Apache-2.0 OR BSD-2-Clause)")
 
 
+@pytest.mark.parametrize("value", ["Apache-2.0 / MIT", "Apache-2.0/ MIT", "Apache-2.0\t/\tMIT"])
+def test_legacy_slash_accepts_whitespace_between_reviewed_identifiers(value: str) -> None:
+    generator = load_script("generate_third_party_licenses.py")
+    assert generator.normalize_license_expression(value) == (
+        "Apache-2.0 OR MIT", "cargo-legacy-slash-normalized-to-spdx-or"
+    )
+
+
+@pytest.mark.parametrize("value", [
+    "MIT//Apache-2.0", "/MIT", "MIT/", "MIT/Unknown-License", "MIT/AND",
+    "MIT/(Apache-2.0)", "MIT/Apache-2.0 OR MIT", "MIT AND Apache-2.0/MIT",
+    "MIT\n/Apache-2.0", "MIT /\u00a0Apache-2.0",
+])
+def test_legacy_slash_refuses_unknown_or_ambiguous_expressions(value: str) -> None:
+    generator = load_script("generate_third_party_licenses.py")
+    with pytest.raises(ValueError, match="legacy Cargo license"):
+        generator.normalize_license_expression(value)
+
+
+def supplemental_fixture(tmp_path: Path) -> tuple[Path, dict, Path, dict]:
+    generator = load_script("generate_third_party_licenses.py")
+    manifest = json.loads(generator.DEFAULT_SUPPLEMENTS.read_bytes())
+    manifest["entries"] = manifest["entries"][:1]
+    entry = manifest["entries"][0]
+    archive_path = tmp_path / "base64-simd-0.8.0.crate"
+    files = {
+        "Cargo.toml": ('[package]\nname="base64-simd"\nversion="0.8.0"\n'
+                       'license="MIT"\nrepository="https://github.com/Nugine/simd"\n').encode(),
+        ".cargo_vcs_info.json": json.dumps({"git": {"sha1": entry["commit"]},
+                                           "path_in_vcs": entry["crate_path"]}).encode(),
+        "src/lib.rs": b"// Test archive has no embedded license text.\n",
+    }
+    with tarfile.open(archive_path, mode="w:gz") as archive:
+        for relative, payload in files.items():
+            info = tarfile.TarInfo("base64-simd-0.8.0/" + relative)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    entry["archive_sha256"] = sha256(archive_path)
+    supplements_path = tmp_path / "licenses/supplemental-materials.json"
+    material_path = supplements_path.parent / entry["material"]["path"]
+    material_path.parent.mkdir(parents=True)
+    material_path.write_bytes((generator.DEFAULT_SUPPLEMENTS.parent / entry["material"]["path"]).read_bytes())
+    write_json(supplements_path, manifest)
+    package = {"name": entry["name"], "version": entry["version"], "source": entry["source"]}
+    return archive_path, package, supplements_path, manifest
+
+
+def test_supplement_uses_exact_upstream_bytes_and_preserves_crate(tmp_path: Path) -> None:
+    generator = load_script("generate_third_party_licenses.py")
+    archive, package, supplements, manifest = supplemental_fixture(tmp_path)
+    before = archive.read_bytes()
+    materials, identity = generator.crate_license_evidence(archive, package, "MIT", supplements)
+    entry = manifest["entries"][0]
+    material = materials[0]
+    assert material["content"].encode() == (supplements.parent / entry["material"]["path"]).read_bytes()
+    assert material["sha256"] == entry["material"]["sha256"]
+    assert material["basis"] == "checksum-bound-upstream-license-supplement"
+    assert material["supplement"]["commit"] == entry["commit"]
+    assert material["supplement"]["declared_license"] == "MIT"
+    assert material["supplement"]["archive_sha256"] == sha256(archive)
+    assert identity["repository"] == entry["repository"]
+    assert archive.read_bytes() == before
+
+
+@pytest.mark.parametrize("fault", [
+    "missing_material", "tampered_material", "missing_manifest", "duplicate",
+    "archive_sha256", "commit", "crate_path", "source", "repository", "declared_license",
+    "unbound_url", "unsafe_path",
+])
+def test_supplement_fails_closed_for_missing_tampered_or_unbound_material(tmp_path: Path, fault: str) -> None:
+    generator = load_script("generate_third_party_licenses.py")
+    archive, package, supplements, manifest = supplemental_fixture(tmp_path)
+    entry = manifest["entries"][0]
+    material_path = supplements.parent / entry["material"]["path"]
+    if fault == "missing_material":
+        material_path.unlink()
+    elif fault == "tampered_material":
+        material_path.write_bytes(material_path.read_bytes().replace(b"Nugine", b"Changed"))
+    elif fault == "duplicate":
+        manifest["entries"].append(entry.copy())
+    elif fault == "unbound_url":
+        entry["material"]["url"] = entry["material"]["url"].replace(entry["commit"], "main")
+    elif fault == "unsafe_path":
+        entry["material"]["path"] = "../LICENSE"
+    elif fault != "missing_manifest":
+        entry[fault] = "mismatch"
+    write_json(supplements, manifest)
+    if fault == "missing_manifest":
+        supplements.unlink()
+    with pytest.raises((ValueError, OSError)):
+        generator.crate_license_evidence(archive, package, "MIT", supplements)
+
+
 def test_complete_embedded_mit_header_is_package_local_license_evidence(
     tmp_path: Path,
 ) -> None:

@@ -1,5 +1,15 @@
 # HarborGate Rust-Only Plan
 
+> 2026-09-12 receipt candidate: durable central route updates now return to Beacon and the setup browser. Owner confirmation alone does not advance remote setup; the matching active route receipt is required. Gate 155 library tests and actual Cloud asset interoperability pass; mobile production-bundle fixtures cover waiting, reload, switch/reconnect and skip. Consumer activation, remote media/notifications and real Meta remain unfinished.
+
+> 2026-09-12 fleet candidate: [phone proof and endpoint selection](navi-whatsapp-binding-proof.md) now select the remote client for configured WhatsApp ingress. Pending switches pause old work; queue/history retain the originating selection and certificate identity. Gate 153 library and 12 HTTP tests pass. Consumer activation, browser central-selection acknowledgement, remote media/notifications and real Meta remain unfinished. All eight features precede PR/Main/IMG/OTA.
+
+> 2026-09-12 Cloud relay client candidate: [selected-Navi HTTP transport](navi-cloud-relay-client.md) now preserves v2 turns, signs requests with short-lived AWS roles and performs fresh delivery checks. Gate 146 library tests and an actual Cloud bundle integration pass. Default ingress still uses one local upstream; central binding/selection, remote media and consumer activation remain implementation work. No release or OTA.
+
+> Navi delivery follow-up (2026-09-12): [WhatsApp delivery authorization](navi-whatsapp-delivery-authorization.md) now calls Beacon before download/upload/send and restart retries, keeps the originating notification handle and rejects changed-handle idempotency conflicts. Gate 138 library tests pass. The remaining remote work is authenticated multi-Navi routing and return transport, including rechecking central device selection; local binding authorization does not implement that relay.
+
+> Navi WhatsApp increment (2026-09-12): preserve provider timestamps through inbox retries; scope opaque routes, event IDs and inbox deduplication by the official phone-number ID. Beacon owns member binding, active home selection, expiry/revocation and conversation generations. Keep v2 envelopes unchanged. The current Gate still targets one Beacon; authenticated multi-Navi routing, remote return paths and binding checks immediately before delivery remain implementation work. No Meta account or release deployment is claimed.
+
 ## Baseline
 
 HarborGate main is Rust-only. The active implementation guide is
