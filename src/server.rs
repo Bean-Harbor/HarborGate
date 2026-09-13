@@ -56,6 +56,7 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     );
     maybe_start_weixin_poll_runtime(gateway.clone(), config.enable_weixin_runtime);
     start_delivery_recovery_runtime(gateway.clone());
+    start_whatsapp_inbox(gateway.clone());
     let state = AppState {
         config: config.clone(),
         setup: Arc::new(SetupPortalService::new(config.clone(), gateway.clone())),
@@ -187,6 +188,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/harbor-gate/messages/{platform}", post(message))
         .route("/messages/{platform}", post(message))
         .route(&feishu_path, post(feishu_webhook))
+        .route(
+            "/whatsapp/webhook",
+            get(whatsapp_verify).post(whatsapp_webhook),
+        )
         .with_state(state)
 }
 
@@ -543,6 +548,13 @@ async fn message(
     Path(platform): Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, GatewayError> {
+    if platform == "whatsapp" {
+        return Err(GatewayError::new(
+            StatusCode::FORBIDDEN,
+            "WHATSAPP_SIGNED_WEBHOOK_REQUIRED",
+            "WhatsApp messages must arrive through the signed provider webhook",
+        ));
+    }
     Ok(Json(
         state.gateway.handle_inbound(&platform, payload).await?,
     ))
@@ -753,6 +765,71 @@ async fn feishu_webhook(
         return Ok(Json(adapter.build_url_verification_response(&payload)?));
     }
     Ok(Json(state.gateway.handle_inbound("feishu", payload).await?))
+}
+
+async fn whatsapp_verify(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<String, GatewayError> {
+    state.gateway.whatsapp_adapter().verification(
+        query.get("hub.mode").map(String::as_str).unwrap_or(""),
+        query
+            .get("hub.verify_token")
+            .map(String::as_str)
+            .unwrap_or(""),
+        query.get("hub.challenge").map(String::as_str).unwrap_or(""),
+    )
+}
+async fn whatsapp_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, GatewayError> {
+    let adapter = state.gateway.whatsapp_adapter();
+    let messages = adapter.verified_messages(
+        &body,
+        headers
+            .get("X-Hub-Signature-256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+    )?;
+    adapter.enqueue(messages)?;
+    Ok(Json(json!({"accepted":true})))
+}
+fn start_whatsapp_inbox(gateway: Arc<GatewayService>) {
+    let binding_gateway = gateway.clone();
+    tokio::spawn(async move {
+        loop {
+            if binding_gateway.refresh_navi_binding().await.is_err() {
+                tracing::warn!("Navi binding synchronization is temporarily unavailable");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            let adapter = gateway.whatsapp_adapter();
+            match adapter.claim_message() {
+                Ok(Some(item)) => {
+                    let result = gateway
+                        .handle_inbound("whatsapp", item["payload"].clone())
+                        .await;
+                    let retry = result.as_ref().err().is_some_and(|error| {
+                        error.status.is_server_error()
+                            || error.status == StatusCode::TOO_MANY_REQUESTS
+                    });
+                    if adapter.finish_message(item, retry).is_err() {
+                        tracing::warn!("WhatsApp inbox completion could not be saved");
+                    }
+                }
+                Ok(None) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                Err(_) => {
+                    tracing::warn!("WhatsApp inbox is unavailable");
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            }
+        }
+    });
 }
 
 fn require_service_contract(config: &AppConfig, headers: &HeaderMap) -> Result<(), GatewayError> {

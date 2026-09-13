@@ -28,8 +28,12 @@ ROOT_LICENSE_RE = re.compile(
     re.IGNORECASE,
 )
 LEGACY_SLASH_RE = re.compile(
-    r"^[A-Za-z0-9.+-]+(?:/[A-Za-z0-9.+-]+)+$"
+    r"^[A-Za-z0-9.+-]+(?:[ \t]*/[ \t]*[A-Za-z0-9.+-]+)+$"
 )
+# These are the reviewed identifiers in this target's legacy declarations.
+# Do not infer the meaning of unknown identifiers or mixed SPDX/slash syntax.
+LEGACY_LICENSE_IDS = {"MIT", "Apache-2.0"}
+DEFAULT_SUPPLEMENTS = Path(__file__).resolve().parents[1] / "licenses/supplemental-materials.json"
 MAX_EVIDENCE_FILE_SIZE = 4 * 1024 * 1024
 MIT_HEADER_MARKERS = (
     "copyright (c)",
@@ -65,7 +69,10 @@ def normalize_license_expression(value: str) -> tuple[str, str]:
         return value, "spdx-expression-from-crate-manifest"
     if not LEGACY_SLASH_RE.fullmatch(value):
         raise ValueError(f"unsupported legacy Cargo license expression: {value}")
-    return " OR ".join(value.split("/")), "cargo-legacy-slash-normalized-to-spdx-or"
+    identifiers = [item.strip(" \t") for item in value.split("/")]
+    if not set(identifiers) <= LEGACY_LICENSE_IDS:
+        raise ValueError(f"unreviewed legacy Cargo license identifier: {value}")
+    return " OR ".join(identifiers), "cargo-legacy-slash-normalized-to-spdx-or"
 
 
 def cargo_metadata(cargo_toml: Path, target: str) -> dict[str, Any]:
@@ -253,7 +260,7 @@ def read_member(archive: tarfile.TarFile, member: tarfile.TarInfo) -> bytes:
     return payload
 
 
-def material_record(path: str, payload: bytes, basis: str) -> dict[str, str]:
+def material_record(path: str, payload: bytes, basis: str) -> dict[str, Any]:
     try:
         content = payload.decode("utf-8")
         encoding = "utf-8"
@@ -269,11 +276,79 @@ def material_record(path: str, payload: bytes, basis: str) -> dict[str, str]:
     }
 
 
+def supplemental_license_evidence(
+    archive_path: Path,
+    package: dict[str, Any],
+    package_manifest: dict[str, Any],
+    vcs: dict[str, Any],
+    supplements_path: Path,
+) -> list[dict[str, Any]]:
+    """Read reviewed upstream material without altering the verified crate archive."""
+    supplements = json.loads(supplements_path.read_bytes())
+    if not isinstance(supplements, dict) or supplements.get("schema_version") != 1:
+        raise ValueError("invalid supplemental license manifest")
+    entries = supplements.get("entries")
+    if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+        raise ValueError("invalid supplemental license entries")
+    matches = [entry for entry in entries if (entry.get("name"), entry.get("version")) ==
+               (package["name"], package["version"])]
+    if len(matches) != 1:
+        raise ValueError("missing or duplicate supplemental license identity")
+    entry = matches[0]
+    identity = {
+        "name": package["name"], "version": package["version"],
+        "source": package.get("source"), "archive_sha256": sha256(archive_path),
+        "declared_license": package_manifest.get("license"),
+        "repository": package_manifest.get("repository"),
+        "commit": vcs.get("git", {}).get("sha1"),
+        "crate_path": vcs.get("path_in_vcs"),
+    }
+    if any(not isinstance(value, str) or not value for value in identity.values()) or any(
+        entry.get(key) != value for key, value in identity.items()
+    ):
+        raise ValueError("supplemental license crate identity mismatch")
+    repository, commit = identity["repository"], identity["commit"]
+    if identity["declared_license"] != "MIT" or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("unsupported supplemental license identity")
+    if not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise ValueError("unsupported supplemental repository")
+    material = entry.get("material")
+    if not isinstance(material, dict):
+        raise ValueError("missing supplemental license material")
+    paths = [material.get("path"), material.get("upstream_path"), identity["crate_path"]]
+    if any(not isinstance(path, str) or not path or "\\" in path or
+           PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts for path in paths):
+        raise ValueError("unsafe supplemental license path")
+    expected_url = ("https://raw.githubusercontent.com/" + repository.removeprefix("https://github.com/")
+                    + "/" + commit + "/" + material["upstream_path"])
+    if material.get("url") != expected_url:
+        raise ValueError("supplemental license URL is not bound to the crate commit")
+    root = supplements_path.resolve().parent
+    path = root / material["path"]
+    if path.is_symlink() or not path.resolve().is_relative_to(root):
+        raise ValueError("unsafe supplemental license material location")
+    if path.stat().st_size > MAX_EVIDENCE_FILE_SIZE:
+        raise ValueError("supplemental license material is too large")
+    payload = path.read_bytes()
+    if not SHA256_RE.fullmatch(str(material.get("sha256", ""))) or sha256_bytes(payload) != material["sha256"]:
+        raise ValueError("supplemental license material checksum mismatch")
+    if not all(marker in payload.decode("utf-8").lower() for marker in MIT_HEADER_MARKERS):
+        raise ValueError("supplemental material lacks complete MIT text")
+    record = material_record("upstream/" + material["upstream_path"], payload,
+                             "checksum-bound-upstream-license-supplement")
+    record["supplement"] = identity | {
+        "url": expected_url, "local_path": material["path"],
+        "manifest_sha256": sha256(supplements_path),
+    }
+    return [record]
+
+
 def crate_license_evidence(
     archive_path: Path,
     package: dict[str, Any],
     declared_license: str,
-) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    supplements_path: Path = DEFAULT_SUPPLEMENTS,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     name = package["name"]
     version = package["version"]
     with tarfile.open(archive_path, mode="r:*") as archive:
@@ -320,7 +395,16 @@ def crate_license_evidence(
                 if all(marker in lowered for marker in MIT_HEADER_MARKERS):
                     embedded.append(path)
             if not embedded:
-                raise ValueError(f"crate lacks complete embedded MIT text: {name} {version}")
+                vcs_member = members.get(".cargo_vcs_info.json")
+                if vcs_member is None:
+                    raise ValueError(f"crate lacks complete embedded MIT text or VCS evidence: {name} {version}")
+                vcs = json.loads(read_member(archive, vcs_member))
+                if not isinstance(vcs, dict) or not isinstance(vcs.get("git"), dict):
+                    raise ValueError("invalid crate VCS evidence")
+                materials = supplemental_license_evidence(
+                    archive_path, package, package_manifest, vcs, supplements_path
+                )
+                return materials, {key: package_manifest.get(key) for key in ("authors", "homepage", "repository")}
             candidates.update(embedded)
             basis = "complete-mit-license-header-in-package-source"
 
@@ -378,7 +462,8 @@ def generate_evidence(args: argparse.Namespace) -> dict[str, Any]:
                 declared_license
             )
             materials, manifest_identity = crate_license_evidence(
-                archive_path, package, declared_license
+                archive_path, package, declared_license,
+                getattr(args, "supplemental_materials", DEFAULT_SUPPLEMENTS),
             )
             record.update(
                 {
@@ -390,7 +475,7 @@ def generate_evidence(args: argparse.Namespace) -> dict[str, Any]:
                     "resolution_status": "resolved",
                     "review_basis": (
                         "Cargo.lock checksum-verified crate archive, crate manifest "
-                        "declaration, and embedded package-local license materials"
+                        "declaration, and package-local or commit-bound upstream license materials"
                     ),
                 }
             )
@@ -457,6 +542,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--version", required=True)
     parser.add_argument("--source-date-epoch", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--supplemental-materials", type=Path, default=DEFAULT_SUPPLEMENTS)
     return parser.parse_args()
 
 

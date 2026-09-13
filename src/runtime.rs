@@ -33,6 +33,16 @@ pub fn maybe_start_weixin_poll_runtime(gateway: Arc<GatewayService>, enabled: bo
 }
 
 pub fn start_delivery_recovery_runtime(gateway: Arc<GatewayService>) {
+    let notifications = gateway.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = notifications.poll_navi_notifications().await {
+                // Keep private event payloads and transport coordinates out of logs.
+                warn!(code=%error.code,"Navi notification poll will retry");
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
     tokio::spawn(async move {
         loop {
             match gateway.retry_pending_deliveries().await {

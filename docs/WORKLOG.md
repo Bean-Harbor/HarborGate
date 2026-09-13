@@ -1,5 +1,17 @@
 # HarborGate Work Log
 
+## 2026-09-12 · WhatsApp binding foundation
+
+- Changed `adapters/whatsapp.rs` and `harborbeacon.rs`: preserve source timestamp,
+  official-number route identity and account-scoped deduplication.
+- Gate library: 132 tests passed; five WhatsApp tests include original timestamp,
+  retry and official-number replacement checks. Existing v2 turn/result shapes
+  remain unchanged; Beacon owns all member/home binding decisions.
+- Companion Beacon/WebUI changes recover lost binding replies, isolate each
+  binding generation and guard stale disconnect requests.
+- Still pending: multi-Navi upstream routing, remote return/media paths, final
+  outgoing binding checks and actual Meta validation. No deployment or OTA.
+
 ## 2026-05-01
 
 ### Rust-Only Runtime Cutover
@@ -170,3 +182,22 @@ pytest tests/test_platform_live_gate.py tests/test_gateway.py tests/test_weixin_
   confirmation.
 - Next exact step: run the Weixin private-DM v2.0 matrix through the updated
   Gate client.
+# 2026-09-12 Navi WhatsApp delivery checks
+
+- Reproduced four outbound failures before the fix: revoked text sent, revocation during preparation ignored, uploaded media resent after restart/unbind, and unavailable authorization allowing send.
+- Added the Beacon authorization call before materialization and each provider operation; no cached allow decision. Notifications persist their original conversation handle. Changed identity with the same idempotency key returns 409 rather than an accepted/retryable provider failure.
+- Gate 138 library tests pass, including six delivery tests. Existing camera-download and notification-cache tests now exercise the new permission/profile behavior.
+- Beacon remains the authority for binding/member state; v2 envelopes and other channels' fingerprint formats remain unchanged. See [profile](navi-whatsapp-delivery-authorization.md).
+- No Meta call, `.154` operation, merge, image or OTA. Continue authenticated multi-Navi routing and remote media/text return.
+
+## 2026-09-12 · Navi Cloud relay client
+
+Implemented AWS-signed Cloud exchanges in the Beacon client, fixed request/deadline retries, fresh authorization, and refusal of unresolved remote artifacts. Added HTTP/credential tests and an actual Cloud bundle interoperability runner. See [client scope and validation](navi-cloud-relay-client.md). Fleet route selection and remote return transport remain unfinished; the eight-feature release condition is unchanged.
+
+## 2026-09-12 · Navi endpoint selection
+
+Added the durable Gate route directory, phone-proof relay and Owner-confirmation polling, device identity pinning before Cloud publication, scoped history and original-selection checks on queued delivery. Generic WhatsApp message aliases reject unsigned ingress. See [profile and remaining gates](navi-whatsapp-binding-proof.md). This is a development increment; no mainline merge, full image or OTA.
+
+## 2026-09-12 · Central route receipt
+
+Persist selection updates atomically, retry after transport failures/restart and fence late acknowledgements. New bindingRoute exchanges return activation/pause/retirement to the originating Beacon and browser. Gate tests, strict Clippy, actual Lambda asset interoperability and RISC-V compilation pass; [service profile](navi-whatsapp-binding-proof.md) records the remaining product gates. No mainline merge, full image or OTA.

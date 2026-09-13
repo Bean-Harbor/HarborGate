@@ -7,6 +7,7 @@ pub mod feishu;
 pub mod feishu_mail;
 pub mod webhook;
 pub mod weixin;
+pub mod whatsapp;
 
 #[derive(Debug, Clone)]
 pub struct PreparedOutbound {
