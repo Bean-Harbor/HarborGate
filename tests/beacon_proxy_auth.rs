@@ -586,6 +586,40 @@ async fn package_event_config_requires_harboros_principal_and_preserves_body() {
 }
 
 #[tokio::test]
+async fn person_preview_forwards_body_and_camera_scoped_lan_principal() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator),
+    );
+    let body = r#"{"image_base64":"/9j/test","frame_id":42}"#;
+    let response = router(state).oneshot(Request::post(
+        "/api/harbor-gate/api/beacon/cameras/cam-rtsp-192-168-3-252/person-detection/preview")
+        .header("content-type", "application/json").body(Body::from(body)).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, Bytes::from(body));
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("x-harbor-principal-source")
+            .unwrap(),
+        "harbornavi-lan"
+    );
+    assert_eq!(
+        requests[0].headers.get("x-harbor-principal-roles").unwrap(),
+        "CAMERA_CONTROL"
+    );
+    assert_eq!(
+        requests[0].headers.get("x-harbor-camera-scope").unwrap(),
+        "cam-rtsp-192-168-3-252"
+    );
+}
+
+#[tokio::test]
 async fn package_detection_control_allows_anonymous_lan_get_and_put_without_session() {
     let (beacon_url, captured) = mock_beacon().await;
     let authenticator = FakeAuthenticator::successful();

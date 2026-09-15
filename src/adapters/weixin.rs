@@ -12,7 +12,7 @@ use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -692,6 +692,10 @@ impl WeixinAdapter {
                 self.config.timeout_seconds,
             )
             .await?;
+        validate_send_message_response(
+            &response,
+            &[&account.account_id, &account.token, context_token],
+        )?;
         Ok(WeixinSendReceipt {
             provider_client_id: client_id,
             provider_message_id: weixin_provider_message_id(&response),
@@ -1024,12 +1028,12 @@ impl PlatformAdapter for WeixinAdapter {
         if !context_token.is_empty() {
             let account = self.account();
             if !account.account_id.is_empty() {
-                let _ = save_context_token(
+                save_context_token(
                     &self.config.state_dir,
                     &account.account_id,
                     &chat_id,
                     &context_token,
-                );
+                )?;
                 self.update_transport(json_map!({"last_context_token_at": observed_at}));
             }
         }
@@ -1059,12 +1063,11 @@ impl PlatformAdapter for WeixinAdapter {
                 "Weixin adapter is not configured. Open Weixin setup first.",
             ));
         }
-        let context_token = load_context_tokens(&self.config.state_dir, &account.account_id)
-            .get(&outbound.chat_id)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let context_token = load_or_recover_context_token(
+            &self.config.state_dir,
+            &account.account_id,
+            &outbound.chat_id,
+        )?;
         if context_token.is_empty() {
             return Err(GatewayError::validation(format!(
                 "No Weixin context_token cached for chat_id={}. Send a DM from WeChat first.",
@@ -1507,12 +1510,11 @@ impl PlatformAdapter for WeixinAdapter {
                 "Weixin adapter is not configured. Open Weixin setup first.",
             ));
         }
-        let context_token = load_context_tokens(&self.config.state_dir, &account.account_id)
-            .get(&outbound.chat_id)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let context_token = load_or_recover_context_token(
+            &self.config.state_dir,
+            &account.account_id,
+            &outbound.chat_id,
+        )?;
         if context_token.is_empty() {
             return Err(GatewayError::validation(format!(
                 "No Weixin context_token cached for chat_id={}. Send a DM from WeChat first.",
@@ -2010,13 +2012,121 @@ fn save_context_token(
     chat_id: &str,
     context_token: &str,
 ) -> Result<(), GatewayError> {
-    fs::create_dir_all(account_dir(state_dir))?;
     let mut tokens = load_context_tokens(state_dir, account_id);
     tokens.insert(chat_id.to_string(), json!(context_token));
-    fs::write(
-        context_file(state_dir, account_id),
-        serde_json::to_string_pretty(&Value::Object(tokens))?,
-    )?;
+    save_context_tokens(state_dir, account_id, tokens)
+}
+
+fn load_or_recover_context_token(
+    state_dir: &Path,
+    account_id: &str,
+    chat_id: &str,
+) -> Result<String, GatewayError> {
+    let mut tokens = load_context_tokens(state_dir, account_id);
+    let cached = tokens
+        .get(chat_id)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let recovered = match recover_context_tokens_from_inbox(state_dir, account_id) {
+        Ok(recovered) => recovered,
+        Err(_) if !cached.is_empty() => return Ok(cached),
+        Err(error) => return Err(error),
+    };
+    let latest = recovered
+        .get(chat_id)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    if latest.is_empty() || latest == cached {
+        return Ok(cached);
+    }
+
+    for (recovered_chat_id, context_token) in recovered {
+        tokens.insert(recovered_chat_id, context_token);
+    }
+    save_context_tokens(state_dir, account_id, tokens)?;
+    Ok(latest)
+}
+
+fn recover_context_tokens_from_inbox(
+    state_dir: &Path,
+    account_id: &str,
+) -> Result<serde_json::Map<String, Value>, GatewayError> {
+    let inbox = load_inbox(state_dir, account_id)?;
+    let mut latest_by_chat = HashMap::<String, (i64, String, String)>::new();
+    let Some(items) = inbox.get("items").and_then(Value::as_object) else {
+        return Ok(serde_json::Map::new());
+    };
+    for item in items.values() {
+        let Some(payload) = item.get("payload").and_then(Value::as_object) else {
+            continue;
+        };
+        if payload
+            .get("room_id")
+            .and_then(Value::as_str)
+            .is_some_and(|room_id| !room_id.trim().is_empty())
+        {
+            continue;
+        }
+        let chat_id = payload
+            .get("from_user_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let context_token = payload
+            .get("context_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if chat_id.is_empty() || context_token.is_empty() {
+            continue;
+        }
+        let created_at_ms = payload
+            .get("create_time_ms")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                item.get("created_at")
+                    .and_then(Value::as_str)
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.timestamp_millis())
+            })
+            .unwrap_or_default();
+        let provider_message_id = extract_weixin_message_id(&Value::Object(payload.clone()));
+        let candidate = (
+            created_at_ms,
+            provider_message_id,
+            context_token.to_string(),
+        );
+        if latest_by_chat.get(chat_id).is_none_or(|current| {
+            candidate.0 > current.0 || candidate.0 == current.0 && candidate.1 > current.1
+        }) {
+            latest_by_chat.insert(chat_id.to_string(), candidate);
+        }
+    }
+    Ok(latest_by_chat
+        .into_iter()
+        .map(|(chat_id, (_, _, context_token))| (chat_id, json!(context_token)))
+        .collect())
+}
+
+fn save_context_tokens(
+    state_dir: &Path,
+    account_id: &str,
+    tokens: serde_json::Map<String, Value>,
+) -> Result<(), GatewayError> {
+    fs::create_dir_all(account_dir(state_dir))?;
+    let path = context_file(state_dir, account_id);
+    let bytes = serde_json::to_vec_pretty(&Value::Object(tokens))?;
+    AtomicFile::new(&path, AllowOverwrite)
+        .write(|file| -> std::io::Result<()> {
+            use std::io::Write as _;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })
+        .map_err(std::io::Error::from)?;
     Ok(())
 }
 
@@ -2472,6 +2582,36 @@ fn weixin_headers(token: Option<&str>, body_len: Option<usize>) -> HeaderMap {
     headers
 }
 
+fn validate_send_message_response(response: &Value, secrets: &[&str]) -> Result<(), GatewayError> {
+    let Some(ret_value) = response.get("ret") else {
+        return Ok(());
+    };
+    let Some(ret) = ret_value.as_i64() else {
+        return Err(GatewayError::new(
+            StatusCode::BAD_GATEWAY,
+            "PLATFORM_UNAVAILABLE",
+            "Weixin sendmessage returned an invalid ret field",
+        ));
+    };
+    if ret == 0 {
+        return Ok(());
+    }
+    let errmsg = response
+        .get("errmsg")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown provider error");
+    Err(GatewayError::new(
+        StatusCode::BAD_GATEWAY,
+        "PLATFORM_UNAVAILABLE",
+        redact_sensitive_text(
+            &format!("Weixin sendmessage failed with ret={ret}: {errmsg}"),
+            secrets,
+        ),
+    ))
+}
+
 async fn decode_json_response(
     response: reqwest::Response,
     context: impl FnOnce() -> String,
@@ -2690,6 +2830,83 @@ mod tests {
                 .and_then(Value::as_str),
             Some("ctx-001")
         );
+    }
+
+    #[test]
+    fn context_token_recovers_from_latest_durable_inbox() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-recovery".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config);
+        adapter
+            .persist_inbound_batch(&[
+                json!({
+                    "msg_id": "provider-old",
+                    "from_user_id": "wx-user-1",
+                    "context_token": "ctx-old",
+                    "create_time_ms": 100,
+                    "item_list": [{"type": 1, "text_item": {"text": "old"}}],
+                }),
+                json!({
+                    "msg_id": "provider-new",
+                    "from_user_id": "wx-user-1",
+                    "context_token": "ctx-new",
+                    "create_time_ms": 200,
+                    "item_list": [{"type": 1, "text_item": {"text": "new"}}],
+                }),
+            ])
+            .unwrap();
+        fs::write(context_file(dir.path(), "bot-recovery"), "not-json").unwrap();
+
+        let recovered =
+            load_or_recover_context_token(dir.path(), "bot-recovery", "wx-user-1").unwrap();
+
+        assert_eq!(recovered, "ctx-new");
+        assert_eq!(
+            load_context_tokens(dir.path(), "bot-recovery")
+                .get("wx-user-1")
+                .and_then(Value::as_str),
+            Some("ctx-new")
+        );
+    }
+
+    #[test]
+    fn valid_cached_context_token_survives_corrupt_inbox() {
+        let dir = tempdir().unwrap();
+        save_context_token(dir.path(), "bot-cached", "wx-user-1", "ctx-cached").unwrap();
+        fs::write(inbox_file(dir.path(), "bot-cached"), "not-json").unwrap();
+
+        let token = load_or_recover_context_token(dir.path(), "bot-cached", "wx-user-1").unwrap();
+
+        assert_eq!(token, "ctx-cached");
+    }
+
+    #[test]
+    fn send_message_response_checks_business_return_code_and_redacts_secrets() {
+        validate_send_message_response(&json!({"ret": 0}), &[]).unwrap();
+        validate_send_message_response(&json!({}), &[]).unwrap();
+
+        let error = validate_send_message_response(
+            &json!({
+                "ret": -14,
+                "errmsg": "expired context_token=ctx-secret account=account-secret"
+            }),
+            &["ctx-secret", "account-secret"],
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("ret=-14"));
+        assert!(error.message.contains("[REDACTED]"));
+        assert!(!error.message.contains("ctx-secret"));
+        assert!(!error.message.contains("account-secret"));
     }
 
     #[test]

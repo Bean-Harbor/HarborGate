@@ -832,10 +832,11 @@ fn beacon_proxy_target_path_from_original_uri(
     Ok(fallback_target_path)
 }
 
-const DETECTION_CONTROL_SUFFIXES: [&str; 3] = [
+const DETECTION_CONTROL_SUFFIXES: [&str; 4] = [
     "/cat-detection/control",
     "/package-detection/control",
     "/package-detection/event-config",
+    "/person-detection/preview",
 ];
 
 fn detection_control_proxy_target_path(
@@ -950,6 +951,12 @@ fn is_identity_query_key(key: &str) -> bool {
 fn requires_harboros_principal(method: &Method, target_path: &str) -> bool {
     let path = target_path.split('?').next().unwrap_or(target_path);
     const DETECTION_JOBS: &str = "/api/vision/detection-jobs";
+    if method == Method::POST
+        && path.ends_with("/person-detection/preview")
+        && is_detection_control_proxy_path(path)
+    {
+        return true;
+    }
     if method == Method::GET && is_detection_observation_proxy_path(path) {
         return true;
     }
@@ -1020,7 +1027,9 @@ async fn authenticate_proxy_principal(
     if headers.contains_key(HARBOROS_AUTH_TOKEN_HEADER) {
         return authenticate_harboros_request(state, headers).await;
     }
-    if matches!(method, &Method::GET | &Method::PUT) {
+    if matches!(method, &Method::GET | &Method::PUT)
+        || (method == Method::POST && target_path.ends_with("/person-detection/preview"))
+    {
         if let Some(camera_id) = detection_control_camera_id(target_path) {
             return Ok(HarborOsPrincipal {
                 source: "harbornavi-lan".to_string(),
