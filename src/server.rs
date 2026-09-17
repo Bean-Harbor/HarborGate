@@ -742,6 +742,9 @@ fn weixin_unbind_response(
     redirect_path: &'static str,
 ) -> axum::response::Response {
     let payload = state.setup.unbind_weixin();
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(payload)).into_response();
+    }
     let accept = headers
         .get("Accept")
         .and_then(|value| value.to_str().ok())
