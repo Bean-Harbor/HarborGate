@@ -2029,11 +2029,10 @@ fn load_or_recover_context_token(
         .map(str::trim)
         .unwrap_or("")
         .to_string();
-    let recovered = match recover_context_tokens_from_inbox(state_dir, account_id) {
-        Ok(recovered) => recovered,
-        Err(_) if !cached.is_empty() => return Ok(cached),
-        Err(error) => return Err(error),
-    };
+    if !cached.is_empty() {
+        return Ok(cached);
+    }
+    let recovered = recover_context_tokens_from_inbox(state_dir, account_id)?;
     let latest = recovered
         .get(chat_id)
         .and_then(Value::as_str)
@@ -2887,6 +2886,47 @@ mod tests {
         let token = load_or_recover_context_token(dir.path(), "bot-cached", "wx-user-1").unwrap();
 
         assert_eq!(token, "ctx-cached");
+    }
+
+    #[test]
+    fn direct_inbound_token_does_not_revert_to_older_polled_inbox() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-direct".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config);
+        adapter
+            .persist_inbound_batch(&[json!({
+                "msg_id": "provider-old",
+                "from_user_id": "wx-user-1",
+                "context_token": "ctx-old",
+                "create_time_ms": 100,
+                "item_list": [{"type": 1, "text_item": {"text": "old"}}],
+            })])
+            .unwrap();
+        adapter
+            .normalize_inbound(json!({
+                "msg_id": "provider-new",
+                "from_user_id": "wx-user-1",
+                "context_token": "ctx-new",
+                "item_list": [{"type": 1, "text_item": {"text": "new"}}],
+            }))
+            .unwrap();
+        assert_eq!(
+            load_or_recover_context_token(dir.path(), "bot-direct", "wx-user-1").unwrap(),
+            "ctx-new"
+        );
+        assert_eq!(
+            load_context_tokens(dir.path(), "bot-direct")["wx-user-1"],
+            "ctx-new"
+        );
     }
 
     #[test]
