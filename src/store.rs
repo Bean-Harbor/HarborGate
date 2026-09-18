@@ -606,10 +606,19 @@ impl FileSessionStore {
             Ok(records
                 .into_iter()
                 .filter_map(|(delivery_key, record)| {
-                    let retryable = record
+                    let items = record
                         .get("items")
-                        .and_then(Value::as_object)
-                        .is_some_and(|items| {
+                        .and_then(Value::as_object);
+                    let terminal_failure = items.is_some_and(|items| {
+                        items.values().any(|item| {
+                            matches!(
+                                item.get("status").and_then(Value::as_str),
+                                Some("failed" | "terminal_failed")
+                            ) && item.get("retryable").and_then(Value::as_bool) == Some(false)
+                        })
+                    });
+                    let retryable = !terminal_failure
+                        && items.is_some_and(|items| {
                             items.values().any(|item| {
                                 matches!(
                                     item.get("status").and_then(Value::as_str),
@@ -1618,6 +1627,35 @@ mod tests {
             replay["item"]["last_error"],
             "provider authorization failed deterministically"
         );
+    }
+
+    #[test]
+    fn terminal_failed_item_blocks_recovery_of_remaining_delivery_items() {
+        let dir = tempdir().unwrap();
+        let store = FileSessionStore::new(dir.path()).unwrap();
+        fs::write(
+            dir.path().join("_delivery_items.json"),
+            serde_json::to_vec_pretty(&json!({
+                "delivery-terminal-batch": {
+                    "request_fingerprint": "fingerprint",
+                    "planned_outbound": {"platform": "weixin", "chat_id": "wx-user"},
+                    "items": {
+                        "delivery-terminal-batch:text": {
+                            "status": "failed",
+                            "retryable": false
+                        },
+                        "delivery-terminal-batch:image": {
+                            "status": "pending",
+                            "retryable": true
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(store.retryable_delivery_plans().unwrap().is_empty());
     }
 
     #[test]

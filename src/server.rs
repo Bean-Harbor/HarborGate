@@ -290,7 +290,7 @@ async fn beacon_proxy(
         state,
         method,
         headers,
-        beacon_proxy_target_path(&path, uri.query()),
+        beacon_proxy_target_path_from_original_uri(uri.path(), &path, "/api/beacon", uri.query())?,
         "/api/beacon",
         body,
     )
@@ -410,7 +410,12 @@ async fn prefixed_beacon_proxy(
         state,
         method,
         headers,
-        beacon_proxy_target_path(&path, uri.query()),
+        beacon_proxy_target_path_from_original_uri(
+            uri.path(),
+            &path,
+            "/api/harbor-gate/api/beacon",
+            uri.query(),
+        )?,
         "/api/harbor-gate/api/beacon",
         body,
     )
@@ -447,7 +452,12 @@ async fn harbor_assistant_proxy(
         state,
         method,
         headers,
-        harbor_assistant_proxy_target_path(&path, uri.query()),
+        beacon_proxy_target_path_from_original_uri(
+            uri.path(),
+            &path,
+            "/api/harbor-assistant",
+            uri.query(),
+        )?,
         "/api/harbor-assistant",
         body,
     )
@@ -746,6 +756,9 @@ fn weixin_unbind_response(
     redirect_path: &'static str,
 ) -> axum::response::Response {
     let payload = state.setup.unbind_weixin();
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(payload)).into_response();
+    }
     let accept = headers
         .get("Accept")
         .and_then(|value| value.to_str().ok())
@@ -921,6 +934,113 @@ fn beacon_proxy_target_path(path: &str, query: Option<&str>) -> String {
     }
 }
 
+fn beacon_proxy_target_path_from_original_uri(
+    request_path: &str,
+    decoded_path: &str,
+    proxy_prefix: &str,
+    query: Option<&str>,
+) -> Result<String, GatewayError> {
+    let raw_suffix = request_path
+        .strip_prefix(proxy_prefix)
+        .ok_or_else(|| GatewayError::validation("Beacon proxy path does not match its facade"))?;
+    if let Some(target_path) = detection_control_proxy_target_path(raw_suffix, query)? {
+        return Ok(target_path);
+    }
+    let fallback_target_path = beacon_proxy_target_path(decoded_path, query);
+    if is_detection_control_target_after_url_normalization(&fallback_target_path) {
+        return Err(GatewayError::validation(
+            "Detection control path is not canonical",
+        ));
+    }
+    Ok(fallback_target_path)
+}
+
+const DETECTION_CONTROL_SUFFIXES: [&str; 4] = [
+    "/cat-detection/control",
+    "/package-detection/control",
+    "/package-detection/event-config",
+    "/person-detection/preview",
+];
+
+fn detection_control_proxy_target_path(
+    raw_suffix: &str,
+    query: Option<&str>,
+) -> Result<Option<String>, GatewayError> {
+    let raw_tail_after_separator = raw_suffix.strip_prefix('/').unwrap_or(raw_suffix);
+    let decoded_tail = urlencoding::decode(raw_tail_after_separator).map_err(|_| {
+        GatewayError::validation("Detection control path contains invalid percent encoding")
+    })?;
+    let decoded_control_candidate = detection_control_suffix(&decoded_tail).is_some();
+    if !decoded_control_candidate {
+        let twice_decoded_control_candidate = urlencoding::decode(&decoded_tail)
+            .map(|twice_decoded_tail| detection_control_suffix(&twice_decoded_tail).is_some())
+            .unwrap_or(false);
+        if twice_decoded_control_candidate {
+            return Err(GatewayError::validation(
+                "Detection control path is not canonical",
+            ));
+        }
+        return Ok(None);
+    }
+
+    let raw_tail = raw_suffix
+        .strip_prefix('/')
+        .filter(|tail| !tail.starts_with('/'))
+        .ok_or_else(|| GatewayError::validation("Detection control path is not canonical"))?;
+    let control_suffix = detection_control_suffix(raw_tail)
+        .ok_or_else(|| GatewayError::validation("Detection control path is not canonical"))?;
+    let camera_id = raw_tail
+        .strip_prefix("cameras/")
+        .and_then(|suffix| suffix.strip_suffix(control_suffix))
+        .filter(|camera_id| is_safe_detection_control_camera_id(camera_id))
+        .ok_or_else(|| GatewayError::validation("Detection control path is not canonical"))?;
+    Ok(Some(beacon_proxy_target_path(
+        &format!("cameras/{camera_id}{control_suffix}"),
+        query,
+    )))
+}
+
+fn detection_control_suffix(path: &str) -> Option<&'static str> {
+    let camera_path = path.trim_start_matches('/').strip_prefix("cameras/")?;
+    DETECTION_CONTROL_SUFFIXES
+        .iter()
+        .copied()
+        .find(|suffix| camera_path.strip_suffix(suffix).is_some())
+}
+
+fn is_detection_control_target_after_url_normalization(target_path: &str) -> bool {
+    url::Url::parse(&format!("http://harborgate.invalid{target_path}"))
+        .map(|url| is_detection_control_proxy_path(url.path()))
+        .unwrap_or(false)
+}
+
+fn is_safe_detection_control_camera_id(camera_id: &str) -> bool {
+    if camera_id.is_empty()
+        || camera_id.contains('/')
+        || camera_id.contains('\\')
+        || camera_id.eq_ignore_ascii_case(".")
+        || camera_id.eq_ignore_ascii_case("..")
+    {
+        return false;
+    }
+    let decoded = match urlencoding::decode(camera_id) {
+        Ok(decoded) => decoded,
+        Err(_) => return false,
+    };
+    if is_unsafe_detection_control_camera_id(&decoded) {
+        return false;
+    }
+    true
+}
+
+fn is_unsafe_detection_control_camera_id(camera_id: &str) -> bool {
+    camera_id.contains('\\')
+        || camera_id.contains("//")
+        || camera_id
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+}
+
 fn harbor_assistant_proxy_target_path(path: &str, query: Option<&str>) -> String {
     beacon_proxy_target_path(path, query)
 }
@@ -954,7 +1074,16 @@ fn is_identity_query_key(key: &str) -> bool {
 fn requires_harboros_principal(method: &Method, target_path: &str) -> bool {
     let path = target_path.split('?').next().unwrap_or(target_path);
     const DETECTION_JOBS: &str = "/api/vision/detection-jobs";
-    if method == Method::GET && is_cat_detection_observation_proxy_path(path) {
+    if method == Method::POST
+        && path.ends_with("/person-detection/preview")
+        && is_detection_control_proxy_path(path)
+    {
+        return true;
+    }
+    if method == Method::GET && is_detection_observation_proxy_path(path) {
+        return true;
+    }
+    if matches!(method, &Method::GET | &Method::PUT) && is_detection_control_proxy_path(path) {
         return true;
     }
     if path == DETECTION_JOBS || path.starts_with(&format!("{DETECTION_JOBS}/")) {
@@ -973,18 +1102,43 @@ fn requires_harboros_principal(method: &Method, target_path: &str) -> bool {
     }
 }
 
-fn is_cat_detection_observation_proxy_path(path: &str) -> bool {
-    path.strip_prefix("/api/cameras/")
-        .and_then(|suffix| suffix.strip_suffix("/cat-detection/observation"))
-        .is_some_and(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
+fn is_detection_observation_proxy_path(path: &str) -> bool {
+    detection_observation_camera_id(path).is_some()
 }
 
-fn cat_detection_observation_camera_id(target_path: &str) -> Option<String> {
+fn is_detection_control_proxy_path(path: &str) -> bool {
+    detection_control_camera_id(path).is_some()
+}
+
+fn detection_observation_camera_id(target_path: &str) -> Option<String> {
     let path = target_path.split('?').next().unwrap_or(target_path);
-    path.strip_prefix("/api/cameras/")
-        .and_then(|suffix| suffix.strip_suffix("/cat-detection/observation"))
-        .filter(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
-        .map(str::to_string)
+    let camera_path = path.strip_prefix("/api/cameras/")?;
+    [
+        "/cat-detection/observation",
+        "/package-detection/observation",
+    ]
+    .into_iter()
+    .find_map(|suffix| camera_path.strip_suffix(suffix))
+    .filter(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
+    .map(str::to_string)
+}
+
+fn detection_control_camera_id(target_path: &str) -> Option<String> {
+    let path = target_path.split('?').next().unwrap_or(target_path);
+    let camera_path = path.strip_prefix("/api/cameras/")?;
+    let control_suffix = detection_control_suffix(&format!("cameras/{camera_path}"))?;
+    let encoded = camera_path.strip_suffix(control_suffix)?;
+    if encoded.is_empty() || encoded.contains('/') {
+        return None;
+    }
+    let camera_id = urlencoding::decode(encoded).ok()?.into_owned();
+    (!camera_id.is_empty()
+        && camera_id.len() <= 128
+        && !camera_id.chars().any(char::is_control)
+        && !camera_id
+            .chars()
+            .any(|character| matches!(character, '\\' | '?' | '#')))
+    .then_some(camera_id)
 }
 
 async fn authenticate_proxy_principal(
@@ -996,12 +1150,24 @@ async fn authenticate_proxy_principal(
     if headers.contains_key(HARBOROS_AUTH_TOKEN_HEADER) {
         return authenticate_harboros_request(state, headers).await;
     }
+    if matches!(method, &Method::GET | &Method::PUT)
+        || (method == Method::POST && target_path.ends_with("/person-detection/preview"))
+    {
+        if let Some(camera_id) = detection_control_camera_id(target_path) {
+            return Ok(HarborOsPrincipal {
+                source: "harbornavi-lan".to_string(),
+                principal_id: "harbornavi-lan:anonymous".to_string(),
+                roles: vec!["CAMERA_CONTROL".to_string()],
+                camera_scope: Some(camera_id),
+            });
+        }
+    }
     if method != Method::GET {
         return Err(harboros_auth_gateway_error(
             HarborOsAuthFailure::InvalidToken,
         ));
     }
-    let camera_id = cat_detection_observation_camera_id(target_path)
+    let camera_id = detection_observation_camera_id(target_path)
         .ok_or_else(|| harboros_auth_gateway_error(HarborOsAuthFailure::InvalidToken))?;
     Ok(HarborOsPrincipal {
         source: "harbornavi-lan".to_string(),
@@ -1295,6 +1461,14 @@ mod tests {
         assert!(requires_harboros_principal(
             &axum::http::Method::GET,
             "/api/cameras/camera-252/cat-detection/observation?stream_profile=sub"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/cameras/camera-252/package-detection/observation?stream_profile=sub"
+        ));
+        assert!(requires_harboros_principal(
+            &axum::http::Method::PUT,
+            "/api/cameras/camera-252/package-detection/event-config"
         ));
         assert!(requires_harboros_principal(
             &axum::http::Method::GET,
