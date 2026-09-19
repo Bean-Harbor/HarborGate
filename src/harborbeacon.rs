@@ -831,14 +831,29 @@ pub fn build_turn_request(
     let route_key = derive_route_key(incoming);
     let raw_payload = incoming.raw_payload.as_object();
     let mut metadata = serde_json::Map::new();
-    metadata.insert(
-        "intent".into(),
-        json!({
-            "domain": raw_lookup(raw_payload, "domain").or_else(|| metadata_lookup(&incoming.metadata, "domain")).unwrap_or_else(|| "general".to_string()),
-            "action": raw_lookup(raw_payload, "action").or_else(|| metadata_lookup(&incoming.metadata, "action")).unwrap_or_else(|| "message".to_string()),
-            "raw_text": incoming.text,
-        }),
-    );
+    let mut intent = json!({
+        "domain": raw_lookup(raw_payload, "domain")
+            .or_else(|| metadata_lookup(&incoming.metadata, "domain"))
+            .unwrap_or_else(|| "general".to_string()),
+        "action": raw_lookup(raw_payload, "action")
+            .or_else(|| metadata_lookup(&incoming.metadata, "action"))
+            .unwrap_or_else(|| "message".to_string()),
+        "raw_text": incoming.text,
+    });
+    if let Some(channel_intent) = incoming
+        .metadata
+        .get("intent")
+        .filter(|value| value.is_object())
+    {
+        if let Some(object) = intent.as_object_mut() {
+            for key in ["domain", "action", "raw_text"] {
+                if let Some(value) = channel_intent.get(key).filter(|value| value.is_string()) {
+                    object.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
+    metadata.insert("intent".into(), intent);
     if let Some(entity_refs) = raw_payload
         .and_then(|raw| raw.get("entity_refs"))
         .filter(|value| value.is_object())
@@ -850,6 +865,20 @@ pub fn build_turn_request(
         .filter(|value| value.is_object())
     {
         metadata.insert("args".into(), args.clone());
+    }
+    if let Some(args) = incoming
+        .metadata
+        .get("args")
+        .filter(|value| value.is_object())
+    {
+        metadata.insert("args".into(), args.clone());
+    }
+    if let Some(entity_refs) = incoming
+        .metadata
+        .get("entity_refs")
+        .filter(|value| value.is_object())
+    {
+        metadata.insert("entity_refs".into(), entity_refs.clone());
     }
 
     json!({
