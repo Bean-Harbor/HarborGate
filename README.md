@@ -6,6 +6,9 @@ The active IM service-to-service contract is
 [`HarborBeacon-HarborGate-Agent-Contract-v2.0.md`](./docs/HarborBeacon-HarborGate-Agent-Contract-v2.0.md).
 The northbound channel-edge upgrade is
 [`HarborBeacon-HarborGate-Agent-Contract-v3.0.md`](./docs/HarborBeacon-HarborGate-Agent-Contract-v3.0.md).
+`POST /api/gateway/turns` defaults to V3.0, accepts an explicit V2.0 contract
+header during migration, and returns the negotiated version. The internal
+Gate-to-Beacon turn call and notification delivery remain on V2.0.
 HarborGate owns IM adapters, channel-edge entrypoints, platform credentials,
 setup/admin pages, inbound normalization, route registry, outbound delivery,
 and redacted gateway status.
