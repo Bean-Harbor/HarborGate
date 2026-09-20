@@ -2,7 +2,9 @@ use crate::adapters::feishu::FeishuAdapter;
 use crate::adapters::feishu_mail::FeishuMailAdapter;
 use crate::adapters::webhook::WebhookAdapter;
 use crate::adapters::weixin::WeixinAdapter;
+use crate::adapters::whatsapp::{WhatsAppAdapter, WhatsAppConfig};
 use crate::adapters::{PlatformAdapter, PreparedOutbound};
+use crate::cloud_relay::CloudRelayClient;
 use crate::config::AppConfig;
 use crate::error::GatewayError;
 use crate::harborbeacon::{
@@ -10,6 +12,7 @@ use crate::harborbeacon::{
     HarborBeaconTaskClient,
 };
 use crate::models::{ConversationTurn, InboundMessage, OutboundMessage};
+use crate::navi_fleet::NaviFleet;
 use crate::store::{
     DeliveryItemClaimRequest, DeliveryItemCompletion, DeliveryItemUpload,
     DeliveryMaterializationCompletion, DeliveryPlanItem, DeliveryStageCompletion, FileSessionStore,
@@ -26,6 +29,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
+
+#[cfg(test)]
+#[path = "whatsapp_delivery_tests.rs"]
+mod whatsapp_delivery_tests;
+
+#[cfg(test)]
+#[path = "gateway_fleet_tests.rs"]
+mod fleet_tests;
 
 pub(crate) struct AttachmentCacheRoot {
     path: PathBuf,
@@ -205,10 +216,12 @@ fn same_directory(left: &Dir, right: &Dir) -> std::io::Result<bool> {
 pub struct GatewayService {
     store: Arc<FileSessionStore>,
     task_client: Option<HarborBeaconTaskClient>,
+    fleet: Option<NaviFleet>,
     adapters: BTreeMap<String, Arc<dyn PlatformAdapter>>,
     feishu_adapter: Arc<FeishuAdapter>,
     feishu_mail_adapter: Arc<FeishuMailAdapter>,
     weixin_adapter: Arc<WeixinAdapter>,
+    whatsapp_adapter: Arc<WhatsAppAdapter>,
     attachment_cache_root: Arc<AttachmentCacheRoot>,
     public_origin: String,
     delivery_instance_id: String,
@@ -297,13 +310,28 @@ impl GatewayService {
         adapters.insert(feishu_mail.name().to_string(), feishu_mail.clone());
         let weixin = Arc::new(WeixinAdapter::new(config.weixin.clone()));
         adapters.insert(weixin.name().to_string(), weixin.clone());
+        let whatsapp = Arc::new(WhatsAppAdapter::new(
+            WhatsAppConfig::from_env(),
+            config.state_dir.join("attachment-cache"),
+        ));
+        adapters.insert(whatsapp.name().to_string(), whatsapp.clone());
+        let fleet = if config.cloud_relay_url.is_empty() && config.cloud_relay_region.is_empty() {
+            None
+        } else {
+            Some(NaviFleet::new(
+                CloudRelayClient::from_ecs(&config.cloud_relay_url, &config.cloud_relay_region)?,
+                config.state_dir.join("navi-routes"),
+            ))
+        };
         Ok(Self {
+            fleet,
             store,
             task_client: HarborBeaconTaskClient::from_config(config),
             adapters,
             feishu_adapter: feishu,
             feishu_mail_adapter: feishu_mail,
             weixin_adapter: weixin,
+            whatsapp_adapter: whatsapp,
             attachment_cache_root,
             public_origin: config.public_origin.trim_end_matches('/').to_string(),
             delivery_instance_id: Uuid::new_v4().simple().to_string(),
@@ -324,6 +352,9 @@ impl GatewayService {
 
     pub fn weixin_adapter(&self) -> Arc<WeixinAdapter> {
         self.weixin_adapter.clone()
+    }
+    pub fn whatsapp_adapter(&self) -> Arc<WhatsAppAdapter> {
+        self.whatsapp_adapter.clone()
     }
 
     pub async fn retry_pending_deliveries(&self) -> Result<usize, GatewayError> {
@@ -385,13 +416,41 @@ impl GatewayService {
             .adapter(adapter_name)
             .ok_or_else(|| GatewayError::validation(format!("Unknown adapter: {adapter_name}")))?;
         let inbound = adapter.normalize_inbound(payload)?;
+        let selection = if inbound.platform == "whatsapp" {
+            if let Some(fleet) = &self.fleet {
+                if inbound.text.trim().starts_with("NAVI ") {
+                    fleet.begin(&inbound)?;
+                    self.store.register_route(&inbound.route_key,json!({"route_key":inbound.route_key,
+                        "platform":inbound.platform,"chat_id":inbound.chat_id,"user_id":inbound.user_id,
+                        "adapter_name":adapter_name,"session_id":inbound.session_id,"status":"active"}))
+                        .map_err(|err|GatewayError::infrastructure(err.to_string()))?;
+                    return Ok(json!({"accepted":true,"status":"awaiting_navi_confirmation"}));
+                }
+                Some(fleet.select(&inbound)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let session_key = selection
+            .as_ref()
+            .map(|selection| selection.session_key(&inbound))
+            .unwrap_or_else(|| inbound.chat_id.clone());
+        let selected_client = match (&self.fleet, &selection) {
+            (Some(fleet), Some(selection)) => Some(HarborBeaconTaskClient::from_cloud_relay(
+                fleet.relay.with_hub_identity(&selection.hub_identity)?,
+                &selection.hub_id,
+            )?),
+            _ => self.task_client.clone(),
+        };
         let history = self
             .store
-            .load_history(&inbound.platform, &inbound.chat_id)
+            .load_history(&inbound.platform, &session_key)
             .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
         let session_metadata = self
             .store
-            .load_metadata(&inbound.platform, &inbound.chat_id)
+            .load_metadata(&inbound.platform, &session_key)
             .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
         let resolved_route_key = inbound
             .route_key
@@ -413,7 +472,7 @@ impl GatewayService {
             .if_empty_then(|| derive_session_id(&inbound));
 
         let (reply_text, outbound_attachments, mut outbound_metadata, next_metadata) =
-            if let Some(task_client) = &self.task_client {
+            if let Some(task_client) = &selected_client {
                 let task_result = task_client.submit_turn(&inbound, &session_metadata).await?;
                 let attachment_candidates =
                     native_source_bound_attachments(adapter_name, &task_result.response_payload);
@@ -495,7 +554,7 @@ impl GatewayService {
             };
 
         self.store
-            .set_metadata(&inbound.platform, &inbound.chat_id, next_metadata)
+            .set_metadata(&inbound.platform, &session_key, next_metadata)
             .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
         self.store
             .register_route(
@@ -514,7 +573,7 @@ impl GatewayService {
         self.store
             .append_turns(
                 &inbound.platform,
-                &inbound.chat_id,
+                &session_key,
                 vec![
                     ConversationTurn {
                         role: "user".into(),
@@ -530,6 +589,14 @@ impl GatewayService {
             )
             .map_err(|err| GatewayError::infrastructure(err.to_string()))?;
         outbound_metadata.insert("route_key".into(), json!(resolved_route_key));
+        if let Some(selection) = selection {
+            outbound_metadata.insert(
+                "navi_selection".into(),
+                serde_json::to_value(selection).map_err(|_| {
+                    GatewayError::infrastructure("Navi routing is temporarily unavailable")
+                })?,
+            );
+        }
         let outbound = OutboundMessage {
             platform: inbound.platform,
             chat_id: inbound.chat_id,
@@ -570,6 +637,11 @@ impl GatewayService {
             ));
         };
         let inbound = gateway_turn_to_inbound(&payload)?;
+        if inbound.platform == "whatsapp" && self.fleet.is_some() {
+            return Err(GatewayError::validation(
+                "Use the official WhatsApp inbox for Navi conversations",
+            ));
+        }
         let mut session_metadata = self
             .store
             .load_metadata(&inbound.platform, &inbound.chat_id)
@@ -672,6 +744,14 @@ impl GatewayService {
         &self,
         payload: Value,
     ) -> Result<Value, GatewayError> {
+        self.handle_notification_delivery_from(payload, None).await
+    }
+
+    async fn handle_notification_delivery_from(
+        &self,
+        payload: Value,
+        selection: Option<&crate::navi_fleet::Selection>,
+    ) -> Result<Value, GatewayError> {
         let trace_id = notification_trace_id(&payload);
         let notification_id = notification_id(&payload);
         if notification_id.is_empty() {
@@ -750,7 +830,14 @@ impl GatewayService {
             .with_trace(trace_id.clone())
         })?;
 
-        let effective_request = json!({
+        if route["platform"] == "whatsapp" && self.fleet.is_some() && selection.is_none() {
+            return Err(GatewayError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "NAVI_REMOTE_NOTIFICATION_REQUIRED",
+                "Navi notifications require their originating device connection",
+            ));
+        }
+        let mut effective_request = json!({
             "notification_id": notification_id,
             "trace_id": trace_id,
             "destination": {
@@ -766,6 +853,13 @@ impl GatewayService {
                 "update_message_id": update_message_id,
             },
         });
+        if route["platform"] == "whatsapp" {
+            effective_request["conversation"] =
+                payload.get("conversation").cloned().unwrap_or(Value::Null);
+        }
+        if let Some(selection) = selection {
+            effective_request["navi_selection"] = json!(selection);
+        }
         let fingerprint = fingerprint(&effective_request);
         if let Some(record) = self
             .store
@@ -803,7 +897,7 @@ impl GatewayService {
 
         let content = delivery_content(&payload);
         let outbound_attachments = hinted_notification_attachments(&content);
-        let outbound = OutboundMessage {
+        let mut outbound = OutboundMessage {
             platform: route
                 .get("platform")
                 .and_then(Value::as_str)
@@ -830,6 +924,22 @@ impl GatewayService {
                 idempotency_key: &idempotency_key,
             }),
         };
+        // Preserve the originating Beacon handle, never substitute the latest
+        // route's handle when an old notification is retried after rebinding.
+        if outbound.platform == "whatsapp" {
+            outbound.metadata.insert(
+                "conversation_handle".into(),
+                payload
+                    .pointer("/conversation/handle")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+        if let Some(selection) = selection {
+            outbound
+                .metadata
+                .insert("navi_selection".into(), json!(selection));
+        }
         let delivery_id = stable_id("delivery_", &idempotency_key, 24);
         let response_payload = match self
             .deliver_outbound_items_guarded(adapter, outbound, &idempotency_key, &fingerprint, None)
@@ -854,6 +964,9 @@ impl GatewayService {
                     "retryable": false,
                     "error": null,
                 })
+            }
+            Err(error) if error.code == "IDEMPOTENCY_CONFLICT" => {
+                return Err(error.with_trace(trace_id))
             }
             Err(error) => {
                 let (code, retryable) = map_delivery_failure(&error.message);
@@ -897,6 +1010,160 @@ impl GatewayService {
                 })?;
         }
         Ok(response_payload)
+    }
+
+    async fn authorize_delivery_context(
+        &self,
+        outbound: &OutboundMessage,
+    ) -> Result<(), GatewayError> {
+        let result: Result<(), GatewayError> = async {
+            self.authorize_camera_delivery(outbound).await?;
+            if outbound.platform == "whatsapp" {
+                let client = self.outbound_task_client(outbound)?;
+                client.authorize_whatsapp_delivery(outbound).await?;
+                if let Some(fleet) = &self.fleet {
+                    fleet.check(outbound)?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = &result {
+            if error.code == "NAVI_IDENTITY_CHANGED" {
+                if let (Some(fleet), Some(value)) =
+                    (&self.fleet, outbound.metadata.get("navi_selection"))
+                {
+                    if let Ok(selection) = serde_json::from_value(value.clone()) {
+                        fleet.invalidate_identity(&selection)?;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    async fn authorize_camera_delivery(
+        &self,
+        outbound: &OutboundMessage,
+    ) -> Result<(), GatewayError> {
+        let cameras: Vec<_> = outbound
+            .attachments
+            .iter()
+            .filter(|artifact| {
+                artifact["url"]
+                    .as_str()
+                    .is_some_and(|url| url.contains("/api/cameras/recordings/artifacts/"))
+            })
+            .cloned()
+            .collect();
+        if cameras.is_empty() {
+            return Ok(());
+        }
+        let client = self.outbound_task_client(outbound)?;
+        client.authorize_camera_attachments(&cameras).await
+    }
+
+    fn outbound_task_client(
+        &self,
+        outbound: &OutboundMessage,
+    ) -> Result<HarborBeaconTaskClient, GatewayError> {
+        if outbound.platform == "whatsapp" {
+            if let Some(fleet) = &self.fleet {
+                let selection = fleet.check(outbound)?;
+                return HarborBeaconTaskClient::from_cloud_relay(
+                    fleet.relay.with_hub_identity(&selection.hub_identity)?,
+                    &selection.hub_id,
+                );
+            }
+            if outbound.metadata.contains_key("navi_selection") {
+                return Err(GatewayError::infrastructure(
+                    "Navi routing is temporarily unavailable",
+                ));
+            }
+        }
+        self.task_client.clone().ok_or_else(|| {
+            GatewayError::infrastructure("WhatsApp delivery check is temporarily unavailable")
+        })
+    }
+
+    pub async fn refresh_navi_binding(&self) -> Result<bool, GatewayError> {
+        let Some(fleet) = &self.fleet else {
+            return Ok(false);
+        };
+        let proof = fleet.refresh_one().await;
+        // An unavailable new proof must not prevent a persisted route update
+        // for the former home from being delivered.
+        let route = fleet.refresh_route_update().await;
+        Ok(proof? | route?)
+    }
+
+    /// Pull only from a currently selected, device-authenticated Navi. Browser
+    /// notification POSTs cannot supply the Selection authority used here.
+    pub async fn poll_navi_notifications(&self) -> Result<usize, GatewayError> {
+        let Some(fleet) = &self.fleet else {
+            return Ok(0);
+        };
+        let Some((selection, scope)) = fleet.notification_target()? else {
+            return Ok(0);
+        };
+        let relay = fleet.relay.with_hub_identity(&selection.hub_identity)?;
+        let batch = match relay.notification_outbox(&selection.hub_id, &scope).await {
+            Ok(batch) => batch,
+            Err(error) => {
+                if error.code == "NAVI_IDENTITY_CHANGED" {
+                    fleet.invalidate_identity(&selection)?;
+                }
+                return Err(error);
+            }
+        };
+        let items = batch["items"]
+            .as_array()
+            .filter(|items| items.len() <= 4)
+            .ok_or_else(|| GatewayError::infrastructure("Invalid Navi notification batch"))?;
+        let mut acknowledged = 0;
+        for item in items {
+            let payload = &item["payload"];
+            if item["queue_id"]
+                .as_str()
+                .is_none_or(|id| id.is_empty() || id.len() > 128)
+                || payload["notification"]["notification_id"] != item["queue_id"]
+                || payload["destination"]["route_key"] != scope["route_key"]
+            {
+                return Err(GatewayError::infrastructure(
+                    "Invalid Navi notification scope",
+                ));
+            }
+            let route = self
+                .store
+                .resolve_route(scope["route_key"].as_str().unwrap_or(""))
+                .map_err(|_| {
+                    GatewayError::infrastructure("Navi notification route is unavailable")
+                })?;
+            if route.as_ref().is_none_or(|route| {
+                route["platform"] != "whatsapp" || route["chat_id"] != scope["recipient"]
+            }) {
+                return Err(GatewayError::infrastructure(
+                    "Navi notification route has changed",
+                ));
+            }
+            let receipt = self
+                .handle_notification_delivery_from(payload.clone(), Some(&selection))
+                .await?;
+            let mut request = scope.clone();
+            request["queue_id"] = item["queue_id"].clone();
+            request["receipt"] = receipt;
+            if relay
+                .notification_receipt(&selection.hub_id, &request)
+                .await?["acknowledged"]
+                != true
+            {
+                return Err(GatewayError::infrastructure(
+                    "Navi did not acknowledge notification receipt",
+                ));
+            }
+            acknowledged += 1;
+        }
+        Ok(acknowledged)
     }
 
     async fn send_delivery_stage(
@@ -953,7 +1220,9 @@ impl GatewayService {
                 });
         }
 
-        let result = if prepared.is_none() {
+        let result = if let Err(error) = self.authorize_delivery_context(&outbound).await {
+            Err(error)
+        } else if prepared.is_none() {
             match adapter.prepare_outbound(&outbound).await {
                 Ok(Some(value)) => {
                     if let Err(error) = self.store.record_delivery_item_upload(DeliveryItemUpload {
@@ -971,11 +1240,19 @@ impl GatewayService {
                         );
                     }
                     prepared = Some(value);
-                    adapter
-                        .send_prepared_outbound(outbound, prepared.as_ref())
-                        .await
+                    match self.authorize_delivery_context(&outbound).await {
+                        Ok(()) => {
+                            adapter
+                                .send_prepared_outbound(outbound, prepared.as_ref())
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
-                Ok(None) => adapter.send_prepared_outbound(outbound, None).await,
+                Ok(None) => match self.authorize_delivery_context(&outbound).await {
+                    Ok(()) => adapter.send_prepared_outbound(outbound, None).await,
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             }
         } else {
@@ -1073,6 +1350,14 @@ impl GatewayService {
         mut cache_guard: Option<&mut AttachmentCacheGuard>,
     ) -> Result<Value, GatewayError> {
         if delivery_key.trim().is_empty() {
+            if outbound.platform == "whatsapp" {
+                return Err(GatewayError::new(
+                    StatusCode::FORBIDDEN,
+                    "IM_DELIVERY_NOT_ALLOWED",
+                    "WhatsApp delivery permission requires a persistent delivery reference",
+                ));
+            }
+            self.authorize_delivery_context(&outbound).await?;
             return adapter.send_outbound(outbound).await;
         }
         let planned_outbound = serde_json::to_value(&outbound)
@@ -1455,7 +1740,25 @@ impl GatewayService {
                     "delivery materialization claim is missing a fencing token",
                 )
             })?;
-        let Some(task_client) = &self.task_client else {
+        if planned_outbound.platform == "whatsapp" {
+            let authorization = self.authorize_delivery_context(&planned_outbound).await;
+            if let Err(error) = authorization {
+                self.store
+                    .finish_delivery_materialization(DeliveryMaterializationCompletion {
+                        delivery_key,
+                        item_key,
+                        claim_token,
+                        status: "failed",
+                        materialized_outbound: None,
+                        cache_path: None,
+                        retryable: map_delivery_failure(&error.message).1,
+                        last_error: Some(&error.message),
+                    })
+                    .map_err(|e| GatewayError::infrastructure(e.to_string()))?;
+                return Err(error);
+            }
+        }
+        let Some(task_client) = self.outbound_task_client(&planned_outbound).ok() else {
             let message = "HarborBeacon media proxy is not configured";
             self.store
                 .finish_delivery_materialization(DeliveryMaterializationCompletion {
@@ -1650,7 +1953,7 @@ fn attachment_item_identity(artifact_id: &str) -> String {
 }
 
 fn delivery_item_requires_materialization(adapter_name: &str, outbound: &OutboundMessage) -> bool {
-    adapter_name == "weixin"
+    matches!(adapter_name, "weixin" | "whatsapp")
         && outbound.attachments.len() == 1
         && outbound.attachments[0]
             .get("path")
@@ -1958,7 +2261,7 @@ fn fallback_reply(history: &[ConversationTurn], inbound: &InboundMessage) -> Str
 }
 
 fn native_source_bound_attachments(adapter_name: &str, response_payload: &Value) -> Vec<Value> {
-    if adapter_name != "feishu" && adapter_name != "weixin" {
+    if adapter_name != "feishu" && adapter_name != "weixin" && adapter_name != "whatsapp" {
         return vec![];
     }
     let artifacts = artifact_candidates(response_payload);
@@ -2608,6 +2911,30 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    async fn camera_authorization_fixture(
+        config: &mut AppConfig,
+    ) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let code = Arc::new(AtomicUsize::new(200));
+        let current = code.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.harborbeacon_base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.harborbeacon_token = "fixture-service-token".into();
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(axum::routing::get(
+                move |headers: axum::http::HeaderMap| {
+                    let current = current.clone();
+                    async move {
+                        assert_eq!(headers.get("range").unwrap(), "bytes=0-0");
+                        assert_eq!(headers.get("X-Harbor-Media-Context").unwrap(), "chat");
+                        StatusCode::from_u16(current.load(Ordering::SeqCst) as u16).unwrap()
+                    }
+                },
+            ));
+            axum::serve(listener, app).await.unwrap();
+        });
+        (code, server)
+    }
+
     struct RetryOnceAdapter {
         attempts: Arc<AtomicUsize>,
     }
@@ -3071,7 +3398,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut config = AppConfig::from_env();
         config.data_dir = dir.path().to_path_buf();
-        config.harborbeacon_base_url.clear();
+        let _authorization = camera_authorization_fixture(&mut config).await;
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let failed_once = Arc::new(AtomicUsize::new(0));
         let build_gateway = || {
@@ -3218,7 +3545,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut config = AppConfig::from_env();
         config.data_dir = dir.path().to_path_buf();
-        config.harborbeacon_base_url.clear();
+        let _authorization = camera_authorization_fixture(&mut config).await;
         let kinds = Arc::new(StdMutex::new(Vec::new()));
         let mut gateway = GatewayService::from_config(&config).unwrap();
         gateway.adapters.insert(
@@ -3410,7 +3737,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut config = AppConfig::from_env();
         config.data_dir = dir.path().to_path_buf();
-        config.harborbeacon_base_url.clear();
+        let _authorization = camera_authorization_fixture(&mut config).await;
         let attempts = Arc::new(AtomicUsize::new(1));
         let mut gateway = GatewayService::from_config(&config).unwrap();
         gateway.adapters.insert(
@@ -3481,6 +3808,146 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fs::read(corrupt).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn camera_revocation_after_restart_blocks_a_previously_uploaded_retry() {
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        let (authorization, server) = camera_authorization_fixture(&mut config).await;
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::new(AtomicUsize::new(1));
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(UploadThenFailAdapter {
+            uploads: uploads.clone(),
+            sends: sends.clone(),
+        });
+        let outbound = OutboundMessage {
+            platform: "upload_then_fail".into(),
+            chat_id: "fixture-home".into(),
+            text: "".into(),
+            attachments: vec![
+                json!({"artifact_id":"private-photo","kind":"image","mime_type":"image/jpeg",
+                "url":"/api/cameras/recordings/artifacts/private-photo?media_context=chat"}),
+            ],
+            metadata: serde_json::Map::new(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let gateway = GatewayService::from_config(&config).unwrap();
+        assert!(gateway
+            .deliver_outbound_items_guarded(
+                adapter.clone(),
+                outbound.clone(),
+                "camera-revocation",
+                "same-plan",
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        drop(gateway);
+        authorization.store(403, Ordering::SeqCst);
+        let restarted = GatewayService::from_config(&config).unwrap();
+        assert!(restarted
+            .deliver_outbound_items_guarded(
+                adapter,
+                outbound,
+                "camera-revocation",
+                "same-plan",
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn whatsapp_camera_attachment_is_downloaded_before_adapter_delivery() {
+        struct WhatsappFixture(Arc<AtomicUsize>);
+        #[async_trait]
+        impl PlatformAdapter for WhatsappFixture {
+            fn name(&self) -> &str {
+                "whatsapp"
+            }
+            fn normalize_inbound(&self, _: Value) -> Result<InboundMessage, GatewayError> {
+                unreachable!()
+            }
+            async fn send_outbound(
+                &self,
+                outbound: OutboundMessage,
+            ) -> Result<Value, GatewayError> {
+                let path = outbound.attachments[0]["path"]
+                    .as_str()
+                    .expect("downloaded camera attachment");
+                assert_eq!(fs::read(path).unwrap(), [255, 216, 255, 217]);
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"provider_message_id":"fixture-image"}))
+            }
+            fn profile(&self) -> Value {
+                json!({"adapter_name":"whatsapp"})
+            }
+        }
+        let dir = tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().join("state");
+        config.harborbeacon_token = "fixture-service-token".into();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.harborbeacon_base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route(
+                    "/api/cameras/recordings/artifacts/whatsapp-photo",
+                    axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                        assert_eq!(headers.get("X-Harbor-Media-Context").unwrap(), "chat");
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
+                            [255u8, 216, 255, 217],
+                        )
+                    }),
+                )
+                .route(
+                    "/api/im/whatsapp/delivery-authorization",
+                    axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                        assert_eq!(body["conversation_handle"], "fixture-binding-handle");
+                        axum::Json(json!({"allowed":true}))
+                    }),
+                );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let gateway = GatewayService::from_config(&config).unwrap();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let outbound = OutboundMessage {
+            platform: "whatsapp".into(),
+            chat_id: "fixture-home".into(),
+            text: "".into(),
+            attachments: vec![
+                json!({"artifact_id":"whatsapp-photo","kind":"image","mime_type":"image/jpeg",
+                "url":"/api/cameras/recordings/artifacts/whatsapp-photo?media_context=chat"}),
+            ],
+            metadata:
+                json!({"conversation_handle":"fixture-binding-handle","route_key":"fixture-route"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        gateway
+            .deliver_outbound_items_guarded(
+                Arc::new(WhatsappFixture(sends.clone())),
+                outbound,
+                "whatsapp-camera",
+                "same-plan",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[tokio::test]
@@ -4283,9 +4750,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let app = axum::Router::new().route(
                 "/api/cameras/recordings/artifacts/artifact-restart-retry",
-                axum::routing::get(move || {
+                axum::routing::get(move |headers: axum::http::HeaderMap| {
                     let attempts = attempts.clone();
                     async move {
+                        if headers.contains_key("range") {
+                            return StatusCode::OK.into_response();
+                        }
                         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         } else {
@@ -4499,10 +4969,16 @@ mod tests {
             _ => unreachable!("unknown notification cache failure fixture"),
         }
 
-        let response = gateway.handle_notification_delivery(payload).await.unwrap();
+        let response = gateway.handle_notification_delivery(payload).await;
         server.abort();
 
-        assert_eq!(response["ok"], false);
+        if failure == "claim_error" {
+            let error = response.unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert_eq!(error.code, "IDEMPOTENCY_CONFLICT");
+        } else {
+            assert_eq!(response.unwrap()["ok"], false);
+        }
         assert!(sent_attachments.lock().unwrap().is_empty());
         let cache_root = config.state_dir.join("attachment-cache");
         assert!(fs::read_dir(cache_root).unwrap().next().is_none());

@@ -44,6 +44,8 @@ pub struct AppState {
 }
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
+    validate_required_service_auth(&config)?;
+    config.validate_runtime_profile()?;
     let gateway = Arc::new(GatewayService::from_config(&config)?);
     let feishu_websocket_started = Arc::new(AtomicBool::new(false));
     maybe_start_configured_feishu_runtime(
@@ -54,6 +56,7 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     );
     maybe_start_weixin_poll_runtime(gateway.clone(), config.enable_weixin_runtime);
     start_delivery_recovery_runtime(gateway.clone());
+    start_whatsapp_inbox(gateway.clone());
     let state = AppState {
         config: config.clone(),
         setup: Arc::new(SetupPortalService::new(config.clone(), gateway.clone())),
@@ -185,6 +188,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/harbor-gate/messages/{platform}", post(message))
         .route("/messages/{platform}", post(message))
         .route(&feishu_path, post(feishu_webhook))
+        .route(
+            "/whatsapp/webhook",
+            get(whatsapp_verify).post(whatsapp_webhook),
+        )
         .with_state(state)
 }
 
@@ -551,6 +558,13 @@ async fn message(
     Path(platform): Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, GatewayError> {
+    if platform == "whatsapp" {
+        return Err(GatewayError::new(
+            StatusCode::FORBIDDEN,
+            "WHATSAPP_SIGNED_WEBHOOK_REQUIRED",
+            "WhatsApp messages must arrive through the signed provider webhook",
+        ));
+    }
     Ok(Json(
         state.gateway.handle_inbound(&platform, payload).await?,
     ))
@@ -766,6 +780,71 @@ async fn feishu_webhook(
     Ok(Json(state.gateway.handle_inbound("feishu", payload).await?))
 }
 
+async fn whatsapp_verify(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<String, GatewayError> {
+    state.gateway.whatsapp_adapter().verification(
+        query.get("hub.mode").map(String::as_str).unwrap_or(""),
+        query
+            .get("hub.verify_token")
+            .map(String::as_str)
+            .unwrap_or(""),
+        query.get("hub.challenge").map(String::as_str).unwrap_or(""),
+    )
+}
+async fn whatsapp_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, GatewayError> {
+    let adapter = state.gateway.whatsapp_adapter();
+    let messages = adapter.verified_messages(
+        &body,
+        headers
+            .get("X-Hub-Signature-256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+    )?;
+    adapter.enqueue(messages)?;
+    Ok(Json(json!({"accepted":true})))
+}
+fn start_whatsapp_inbox(gateway: Arc<GatewayService>) {
+    let binding_gateway = gateway.clone();
+    tokio::spawn(async move {
+        loop {
+            if binding_gateway.refresh_navi_binding().await.is_err() {
+                tracing::warn!("Navi binding synchronization is temporarily unavailable");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            let adapter = gateway.whatsapp_adapter();
+            match adapter.claim_message() {
+                Ok(Some(item)) => {
+                    let result = gateway
+                        .handle_inbound("whatsapp", item["payload"].clone())
+                        .await;
+                    let retry = result.as_ref().err().is_some_and(|error| {
+                        error.status.is_server_error()
+                            || error.status == StatusCode::TOO_MANY_REQUESTS
+                    });
+                    if adapter.finish_message(item, retry).is_err() {
+                        tracing::warn!("WhatsApp inbox completion could not be saved");
+                    }
+                }
+                Ok(None) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                Err(_) => {
+                    tracing::warn!("WhatsApp inbox is unavailable");
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            }
+        }
+    });
+}
+
 fn require_service_contract(config: &AppConfig, headers: &HeaderMap) -> Result<(), GatewayError> {
     let received = headers
         .get("X-Contract-Version")
@@ -784,14 +863,21 @@ fn require_service_contract(config: &AppConfig, headers: &HeaderMap) -> Result<(
 
 fn require_service_auth(config: &AppConfig, headers: &HeaderMap) -> Result<(), GatewayError> {
     if config.service_token.trim().is_empty() {
-        return Ok(());
+        return Err(GatewayError::new(
+            StatusCode::UNAUTHORIZED,
+            "SERVICE_AUTH_FAILED",
+            "Service authentication is not configured",
+        ));
     }
     let authorization = headers
         .get("Authorization")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .trim();
-    if authorization != format!("Bearer {}", config.service_token) {
+    let actual = authorization.strip_prefix("Bearer ").unwrap_or("").trim();
+    let current_matches = service_token_matches(actual, &config.service_token);
+    let previous_matches = service_token_matches(actual, &config.service_token_previous);
+    if !(current_matches | previous_matches) {
         return Err(GatewayError::new(
             StatusCode::UNAUTHORIZED,
             "SERVICE_AUTH_FAILED",
@@ -799,6 +885,40 @@ fn require_service_auth(config: &AppConfig, headers: &HeaderMap) -> Result<(), G
         ));
     }
     Ok(())
+}
+
+fn validate_required_service_auth(config: &AppConfig) -> anyhow::Result<()> {
+    if !valid_service_token(&config.service_token) {
+        anyhow::bail!("HARBOR_BEACON_TO_GATE_TOKEN is missing or malformed");
+    }
+    if !config.service_token_previous.is_empty()
+        && (!valid_service_token(&config.service_token_previous)
+            || config.service_token_previous == config.service_token)
+    {
+        anyhow::bail!("HARBOR_BEACON_TO_GATE_TOKEN_PREVIOUS is malformed");
+    }
+    if config.harborbeacon_enabled()
+        && (!valid_service_token(&config.harborbeacon_web_api_token)
+            || config.harborbeacon_token != config.harborbeacon_web_api_token
+            || config.harborbeacon_web_api_token == config.service_token)
+    {
+        anyhow::bail!("HARBOR_GATE_TO_BEACON_TOKEN is missing, malformed, or not isolated");
+    }
+    Ok(())
+}
+
+fn valid_service_token(token: &str) -> bool {
+    token.len() >= 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn service_token_matches(actual: &str, expected: &str) -> bool {
+    if actual.is_empty() || expected.is_empty() || actual.len() != expected.len() {
+        return false;
+    }
+    constant_time_eq::constant_time_eq(actual.as_bytes(), expected.as_bytes())
 }
 
 fn beacon_proxy_target_path(path: &str, query: Option<&str>) -> String {
@@ -1258,8 +1378,8 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     use super::{
-        beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_contract,
-        requires_harboros_principal,
+        beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_auth,
+        require_service_contract, requires_harboros_principal, validate_required_service_auth,
     };
     use crate::config::AppConfig;
 
@@ -1424,5 +1544,111 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(error.code, "CONTRACT_VERSION_MISMATCH");
+    }
+
+    #[test]
+    fn service_auth_fails_closed_when_the_shared_token_is_empty() {
+        let mut config = AppConfig::from_env();
+        config.service_token.clear();
+
+        let error = require_service_auth(&config, &HeaderMap::new())
+            .expect_err("an empty shared token must never disable authentication");
+
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, "SERVICE_AUTH_FAILED");
+    }
+
+    #[test]
+    fn notification_delivery_auth_accepts_current_and_previous_only() {
+        let mut config = AppConfig::from_env();
+        config.service_token = "beacon_to_gate_current_0123456789abcdef".to_string();
+        config.service_token_previous = "beacon_to_gate_previous_0123456789abcdef".to_string();
+
+        for token in [
+            "beacon_to_gate_current_0123456789abcdef",
+            "beacon_to_gate_previous_0123456789abcdef",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Authorization",
+                HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            require_service_auth(&config, &headers).expect("configured rotation key");
+        }
+
+        for token in [
+            "gate_to_beacon_current_0123456789abcdef",
+            "wrong_token_0123456789abcdef0123456789",
+            "",
+        ] {
+            let mut headers = HeaderMap::new();
+            if !token.is_empty() {
+                headers.insert(
+                    "Authorization",
+                    HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+                );
+            }
+            let error = require_service_auth(&config, &headers).expect_err("wrong auth domain");
+            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(error.code, "SERVICE_AUTH_FAILED");
+        }
+    }
+
+    #[test]
+    fn notification_delivery_auth_fails_closed_without_current_key() {
+        let mut config = AppConfig::from_env();
+        config.service_token.clear();
+        config.service_token_previous =
+            "previous_must_not_stand_alone_0123456789abcdef".to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer previous_must_not_stand_alone_0123456789abcdef"),
+        );
+
+        let error = require_service_auth(&config, &headers).expect_err("current key is required");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn startup_rejects_malformed_or_colliding_service_credentials() {
+        let mut config = AppConfig::from_env();
+        config.harborbeacon_base_url = "http://127.0.0.1:4174".to_string();
+        config.harborbeacon_web_api_token = "gate_to_beacon_current_0123456789abcdef".to_string();
+        config.harborbeacon_token = config.harborbeacon_web_api_token.clone();
+        config.service_token = "beacon_to_gate_current_0123456789abcdef".to_string();
+        config.service_token_previous = "beacon_to_gate_previous_0123456789abcdef".to_string();
+        validate_required_service_auth(&config).expect("directional credentials are valid");
+
+        for malformed in [
+            "too-short",
+            "contains spaces 0123456789abcdef0123456789",
+            "contains.period.0123456789abcdef0123456789",
+        ] {
+            config.service_token = malformed.to_string();
+            assert!(
+                validate_required_service_auth(&config).is_err(),
+                "accepted malformed current credential: {malformed}"
+            );
+        }
+
+        config.service_token = "beacon_to_gate_current_0123456789abcdef".to_string();
+        config.service_token_previous = "too-short".to_string();
+        assert!(validate_required_service_auth(&config).is_err());
+
+        config.service_token_previous.clear();
+        config.harborbeacon_web_api_token = config.service_token.clone();
+        config.harborbeacon_token = config.harborbeacon_web_api_token.clone();
+        assert!(
+            validate_required_service_auth(&config).is_err(),
+            "accepted the same current credential in both directions"
+        );
+
+        config.harborbeacon_web_api_token = "gate_to_beacon_current_0123456789abcdef".to_string();
+        config.harborbeacon_token = "different_gate_token_0123456789abcdef0123".to_string();
+        assert!(
+            validate_required_service_auth(&config).is_err(),
+            "accepted divergent Gate-to-Beacon caller credentials"
+        );
     }
 }

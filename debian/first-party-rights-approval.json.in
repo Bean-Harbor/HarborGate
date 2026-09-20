@@ -1,0 +1,23 @@
+{
+  "approval": {
+    "basis": "rights-holder-confirmation",
+    "confirmed_on": "2026-08-16",
+    "decision": "approved-for-distribution",
+    "organization": "Harbor Innovations",
+    "scope": [
+      "first-party-brand-materials",
+      "first-party-source-code"
+    ],
+    "use": "HarborNavi qualification"
+  },
+  "package": "harboros-im-gate",
+  "schema_version": 1,
+  "source": {
+    "commit": "SOURCE_COMMIT_PLACEHOLDER",
+    "repo": "https://github.com/Bean-Harbor/HarborGate"
+  },
+  "third_party": {
+    "decision": "separate-review-required",
+    "scope": "Locked dependencies and third-party materials remain governed by their original licenses."
+  }
+}

@@ -7,6 +7,26 @@ fn repo_root() -> PathBuf {
         .expect("repo root should resolve")
 }
 
+#[test]
+fn unix_package_entrypoints_have_lf_line_endings() {
+    for relative in [
+        "debian/build-amd64-package",
+        "debian/ensure-harborbeacon-token-env",
+        "debian/postinst",
+        "debian/prerm",
+        "debian/harbornavi-k3/postinst",
+        "debian/harbornavi-k3/prerm",
+        "scripts/ensure-data-layout",
+    ] {
+        let bytes = fs::read(repo_root().join(relative)).expect("package entrypoint should exist");
+        assert!(bytes.starts_with(b"#!"), "{relative} has no interpreter");
+        assert!(
+            !bytes.contains(&b'\r'),
+            "{relative} contains a CR that breaks Unix execution"
+        );
+    }
+}
+
 fn rust_source_files(root: &Path) -> Vec<PathBuf> {
     let source_root = if root.join("src").is_dir() {
         root.join("src")

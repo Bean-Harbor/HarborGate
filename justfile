@@ -8,7 +8,7 @@ fmt:
 
 # Run tests
 test:
-    cargo test
+    cargo test --locked
 
 # Run the HarborGate service
 start:
@@ -16,7 +16,7 @@ start:
 
 # Build the release binary
 build:
-    cargo build --release --bin harboros-im-gate
+    cargo build --locked --release --bin harboros-im-gate
 
 # Build the portable Linux release using zigbuild
 build-linux:

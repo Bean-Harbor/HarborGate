@@ -1,8 +1,10 @@
+use crate::cloud_relay::{valid_hub_id, CloudRelayClient};
 use crate::config::AppConfig;
 use crate::error::GatewayError;
 use crate::gateway::AttachmentCacheRoot;
-use crate::models::InboundMessage;
+use crate::models::{InboundMessage, OutboundMessage};
 use axum::http::StatusCode;
+use base64::Engine as _;
 use futures_util::StreamExt;
 use reqwest::{redirect::Policy, Client};
 use serde_json::{json, Value};
@@ -18,6 +20,7 @@ pub const DEFAULT_TURN_ENDPOINT: &str = "/api/web/turns";
 
 #[derive(Clone)]
 pub struct HarborBeaconTaskClient {
+    cloud_relay: Option<(CloudRelayClient, String)>,
     base_url: String,
     api_token: String,
     turn_endpoint: String,
@@ -48,6 +51,112 @@ pub struct MaterializedAttachmentBatch {
 }
 
 impl HarborBeaconTaskClient {
+    /// For the authenticated fleet router, after it has selected and pinned a
+    /// Navi. Neither inbound text nor a v2 envelope may supply this selection.
+    pub fn from_cloud_relay(relay: CloudRelayClient, hub_id: &str) -> Result<Self, GatewayError> {
+        if !valid_hub_id(hub_id) {
+            return Err(GatewayError::validation("Invalid selected Navi"));
+        }
+        Ok(Self {
+            cloud_relay: Some((relay, hub_id.into())),
+            base_url: String::new(),
+            api_token: String::new(),
+            turn_endpoint: DEFAULT_TURN_ENDPOINT.into(),
+            contract_version: DEFAULT_CONTRACT_VERSION.into(),
+            http: media_http_client(),
+        })
+    }
+
+    pub(crate) async fn authorize_whatsapp_delivery(
+        &self,
+        outbound: &OutboundMessage,
+    ) -> Result<(), GatewayError> {
+        let denied = || {
+            GatewayError::new(
+                StatusCode::FORBIDDEN,
+                "IM_DELIVERY_NOT_ALLOWED",
+                "WhatsApp binding permission no longer permits this delivery",
+            )
+        };
+        let unavailable =
+            || GatewayError::infrastructure("WhatsApp delivery check is temporarily unavailable");
+        let handle = outbound
+            .metadata
+            .get("conversation_handle")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(denied)?;
+        let route = outbound
+            .metadata
+            .get("route_key")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(denied)?;
+        let request = json!({"recipient":outbound.chat_id,"route_key":route,"conversation_handle":handle,
+            "text":outbound.text,"has_attachments":!outbound.attachments.is_empty()});
+        if let Some((relay, hub)) = &self.cloud_relay {
+            let response = relay
+                .authorize_delivery(hub, &request)
+                .await
+                .map_err(|error| {
+                    if error.code == "NAVI_IDENTITY_CHANGED" {
+                        denied()
+                    } else {
+                        unavailable()
+                    }
+                })?;
+            if matches!(response.status.as_u16(), 400 | 401 | 403 | 404 | 410 | 422) {
+                return Err(denied());
+            }
+            if response.status != StatusCode::OK
+                || serde_json::to_vec(&response.body)
+                    .map_err(|_| unavailable())?
+                    .len()
+                    > 4096
+            {
+                return Err(unavailable());
+            }
+            if response.body["allowed"] != true {
+                return Err(denied());
+            }
+            return Ok(());
+        }
+        let mut response = self
+            .http
+            .post(format!(
+                "{}/api/im/whatsapp/delivery-authorization",
+                self.base_url
+            ))
+            .bearer_auth(&self.api_token)
+            .header("X-Contract-Version", &self.contract_version)
+            .timeout(Duration::from_secs(5))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        if matches!(
+            response.status().as_u16(),
+            400 | 401 | 403 | 404 | 410 | 422
+        ) {
+            return Err(denied());
+        }
+        if response.status() != StatusCode::OK {
+            return Err(unavailable());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+            if body.len() + chunk.len() > 4096 {
+                return Err(unavailable());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let payload: Value = serde_json::from_slice(&body).map_err(|_| unavailable())?;
+        if payload["allowed"] != true {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
     pub fn from_config(config: &AppConfig) -> Option<Self> {
         let base_url = config.harborbeacon_base_url.trim_end_matches('/');
         let api_token = config.harborbeacon_token.trim();
@@ -58,6 +167,7 @@ impl HarborBeaconTaskClient {
             return None;
         }
         Some(Self {
+            cloud_relay: None,
             base_url: base_url.to_string(),
             api_token: api_token.to_string(),
             turn_endpoint: config.harborbeacon_turn_endpoint.clone(),
@@ -131,14 +241,16 @@ impl HarborBeaconTaskClient {
     ) -> MaterializedAttachmentBatch {
         let mut batch = MaterializedAttachmentBatch::default();
         for mut artifact in artifacts {
-            let Some(artifact_url) = artifact
-                .get("url")
+            let mime_type = artifact
+                .get("mime_type")
                 .and_then(Value::as_str)
-                .and_then(|raw| trusted_media_artifact_url(&self.base_url, raw))
-            else {
+                .map(str::trim)
+                .filter(|value| trusted_attachment_mime(value))
+                .unwrap_or("");
+            if mime_type.is_empty() {
                 batch.failed_count += 1;
                 continue;
-            };
+            }
             let cache_dir = batch.cache_dir.get_or_insert_with(|| {
                 cache_root.path().join(format!(
                     "turn-{}-{}",
@@ -150,25 +262,37 @@ impl HarborBeaconTaskClient {
                 batch.failed_count += 1;
                 continue;
             }
-            let mime_type = artifact
-                .get("mime_type")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| trusted_attachment_mime(value))
-                .unwrap_or("");
-            if mime_type.is_empty() {
-                batch.failed_count += 1;
-                continue;
-            }
             let extension = attachment_extension(mime_type);
             let destination = cache_dir.join(format!(
                 "attachment-{}.{extension}",
                 Uuid::new_v4().simple()
             ));
-            match self
-                .download_media_artifact(cache_root, &artifact_url, mime_type, &destination)
-                .await
-            {
+            let result = if let Some((relay, hub)) = &self.cloud_relay {
+                match artifact
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .and_then(remote_media_artifact_id)
+                {
+                    Some(id) => {
+                        self.download_remote_media_artifact(
+                            relay,
+                            hub,
+                            id,
+                            mime_type,
+                            cache_root,
+                            &destination,
+                        )
+                        .await
+                    }
+                    None => Err(GatewayError::validation(
+                        "Camera media artifact is not trusted",
+                    )),
+                }
+            } else {
+                self.download_local_media_artifact(&artifact, mime_type, cache_root, &destination)
+                    .await
+            };
+            match result {
                 Ok(()) => {
                     if let Some(object) = artifact.as_object_mut() {
                         object.insert(
@@ -182,11 +306,7 @@ impl HarborBeaconTaskClient {
                 Err(error) => {
                     if let Err(remove_error) = cache_root.remove_file(&destination) {
                         if remove_error.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!(
-                                path = %destination.display(),
-                                error = %remove_error,
-                                "HarborGate could not remove a partial media download"
-                            );
+                            tracing::warn!(error = %remove_error, "HarborGate could not remove a partial media download");
                         }
                     }
                     tracing::warn!(error = %error, "HarborGate could not materialize media artifact");
@@ -224,6 +344,145 @@ impl HarborBeaconTaskClient {
         batch
     }
 
+    /// Check current camera consent even when a provider upload or local cache
+    /// from an earlier attempt is reusable. Never follow an artifact redirect.
+    pub(crate) async fn authorize_camera_attachments(
+        &self,
+        artifacts: &[Value],
+    ) -> Result<(), GatewayError> {
+        if let Some((relay, hub)) = &self.cloud_relay {
+            for artifact in artifacts {
+                let id = artifact["url"]
+                    .as_str()
+                    .and_then(remote_media_artifact_id)
+                    .ok_or_else(|| {
+                        GatewayError::validation("Camera attachment URL is not trusted")
+                    })?;
+                let response = relay
+                    .media_artifact(hub, &json!({"artifact_id":id,"range":"bytes=0-0"}))
+                    .await?;
+                let mime_type = artifact["mime_type"]
+                    .as_str()
+                    .filter(|mime| trusted_attachment_mime(mime))
+                    .ok_or_else(|| {
+                        GatewayError::validation("Camera attachment MIME type is not trusted")
+                    })?;
+                decode_remote_media(&response, 0, 0, mime_type)?;
+            }
+            return Ok(());
+        }
+        for artifact in artifacts {
+            let Some(raw) = artifact["url"].as_str() else {
+                continue;
+            };
+            let Some(url) = trusted_media_artifact_url(&self.base_url, raw) else {
+                return Err(GatewayError::validation(
+                    "Camera attachment URL is not trusted",
+                ));
+            };
+            if self.api_token.trim().is_empty() {
+                return Err(GatewayError::infrastructure(
+                    "Beacon media authorization is unavailable",
+                ));
+            }
+            let response = self
+                .http
+                .get(url)
+                .timeout(Duration::from_secs(5))
+                .bearer_auth(&self.api_token)
+                .header("X-Harbor-Media-Context", "chat")
+                .header("Range", "bytes=0-0")
+                .send()
+                .await
+                .map_err(|_| {
+                    GatewayError::infrastructure("Camera media authorization is unavailable")
+                })?;
+            if !response.status().is_success() {
+                return if matches!(response.status().as_u16(), 401 | 403 | 404 | 410) {
+                    Err(GatewayError::new(
+                        StatusCode::FORBIDDEN,
+                        "CAMERA_MEDIA_DELIVERY_NOT_ALLOWED",
+                        "Camera media permission was revoked or the attachment expired",
+                    ))
+                } else {
+                    Err(GatewayError::infrastructure(
+                        "Camera media authorization is unavailable",
+                    ))
+                };
+            }
+        }
+        Ok(())
+    }
+
+    async fn download_local_media_artifact(
+        &self,
+        artifact: &Value,
+        mime_type: &str,
+        cache_root: &AttachmentCacheRoot,
+        destination: &Path,
+    ) -> Result<(), GatewayError> {
+        let artifact_url = artifact
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(|raw| trusted_media_artifact_url(&self.base_url, raw))
+            .ok_or_else(|| GatewayError::validation("Camera attachment URL is not trusted"))?;
+        self.download_media_artifact(cache_root, &artifact_url, mime_type, destination)
+            .await
+    }
+
+    async fn download_remote_media_artifact(
+        &self,
+        relay: &CloudRelayClient,
+        hub: &str,
+        artifact_id: &str,
+        mime_type: &str,
+        cache_root: &AttachmentCacheRoot,
+        destination: &Path,
+    ) -> Result<(), GatewayError> {
+        const CHUNK: u64 = 48 * 1024;
+        const MAX: u64 = 128 * 1024 * 1024;
+        // Use the same capability-scoped, exclusive cache creation as local media.
+        let mut file = cache_root
+            .create_new_file(destination)
+            .map(tokio::fs::File::from_std)
+            .map_err(|_| GatewayError::infrastructure("Gate media cache create failed"))?;
+        tokio::time::timeout(Duration::from_secs(120), async {
+            let (mut offset, mut total) = (0u64, None);
+            loop {
+                let end = (offset + CHUNK - 1).min(MAX - 1);
+                let response = relay
+                    .media_artifact(
+                        hub,
+                        &json!({"artifact_id":artifact_id,"range":format!("bytes={offset}-{end}")}),
+                    )
+                    .await?;
+                let (bytes, reported_total) =
+                    decode_remote_media(&response, offset, end, mime_type)?;
+                if total.is_some_and(|previous| previous != reported_total) {
+                    return Err(GatewayError::infrastructure(
+                        "Camera media changed during transfer",
+                    ));
+                }
+                total = Some(reported_total);
+                file.write_all(&bytes)
+                    .await
+                    .map_err(|_| GatewayError::infrastructure("Gate media cache write failed"))?;
+                offset += bytes.len() as u64;
+                if offset == reported_total {
+                    break;
+                }
+            }
+            file.flush()
+                .await
+                .map_err(|_| GatewayError::infrastructure("Gate media cache flush failed"))?;
+            file.sync_all()
+                .await
+                .map_err(|_| GatewayError::infrastructure("Gate media cache sync failed"))
+        })
+        .await
+        .map_err(|_| GatewayError::infrastructure("Camera media transfer timed out"))?
+    }
+
     async fn download_media_artifact(
         &self,
         cache_root: &AttachmentCacheRoot,
@@ -242,6 +501,7 @@ impl HarborBeaconTaskClient {
             .get(artifact_url.clone())
             .timeout(Duration::from_secs(45))
             .bearer_auth(&self.api_token)
+            .header("X-Harbor-Media-Context", "chat")
             .send()
             .await
             .map_err(|error| {
@@ -307,6 +567,17 @@ impl HarborBeaconTaskClient {
     }
 
     async fn post_json(&self, payload: &Value) -> Result<Value, GatewayError> {
+        if let Some((relay, hub)) = &self.cloud_relay {
+            let response = relay.turn(hub, payload).await?;
+            if !response.status.is_success() {
+                return Err(GatewayError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "UPSTREAM_TASK_API_ERROR",
+                    format!("Navi task API returned HTTP {}", response.status),
+                ));
+            }
+            return Ok(response.body);
+        }
         let url = format!(
             "{}/{}",
             self.base_url.trim_end_matches('/'),
@@ -390,7 +661,9 @@ fn trusted_media_artifact_url(base_url: &str, raw: &str) -> Option<Url> {
         || artifact.port_or_known_default() != base.port_or_known_default()
         || !artifact.username().is_empty()
         || artifact.password().is_some()
-        || artifact.query().is_some()
+        || artifact
+            .query()
+            .is_some_and(|query| query != "media_context=chat")
         || artifact.fragment().is_some()
     {
         return None;
@@ -418,6 +691,73 @@ fn trusted_media_artifact_url(base_url: &str, raw: &str) -> Option<Url> {
         return None;
     }
     Some(artifact)
+}
+
+fn remote_media_artifact_id(raw: &str) -> Option<&str> {
+    let (path, query) = raw
+        .split_once('?')
+        .map_or((raw, None), |(path, query)| (path, Some(query)));
+    if raw.contains('#') || query.is_some_and(|value| value != "media_context=chat") {
+        return None;
+    }
+    let id = path.strip_prefix("/api/cameras/recordings/artifacts/")?;
+    if id.is_empty()
+        || id.len() > 256
+        || matches!(id, "." | "..")
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'~'))
+    {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+fn decode_remote_media(
+    response: &crate::cloud_relay::RelayResponse,
+    offset: u64,
+    end: u64,
+    mime_type: &str,
+) -> Result<(Vec<u8>, u64), GatewayError> {
+    if matches!(response.status.as_u16(), 400 | 401 | 403 | 404 | 410 | 416) {
+        return Err(GatewayError::new(
+            StatusCode::FORBIDDEN,
+            "CAMERA_MEDIA_DELIVERY_NOT_ALLOWED",
+            "Camera media permission was revoked or the attachment expired",
+        ));
+    }
+    let invalid = || GatewayError::infrastructure("Navi returned invalid camera media");
+    if !matches!(response.status.as_u16(), 200 | 206) {
+        return Err(invalid());
+    }
+    let total = response.body["totalBytes"]
+        .as_u64()
+        .filter(|n| *n > offset && *n <= 128 * 1024 * 1024)
+        .ok_or_else(invalid)?;
+    if response.body["artifactOffset"].as_u64() != Some(offset)
+        || (response.status == StatusCode::OK && (offset != 0 || total > end + 1))
+        || !response.body["contentType"]
+            .as_str()
+            .is_some_and(|v| v.eq_ignore_ascii_case(mime_type))
+    {
+        return Err(invalid());
+    }
+    let encoded = response.body["dataBase64"]
+        .as_str()
+        .filter(|v| v.len() <= 65_536)
+        .ok_or_else(invalid)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid())?;
+    if bytes.len() as u64 != (end + 1).min(total) - offset
+        || response.body["bytes"].as_u64() != Some(bytes.len() as u64)
+        || response.body["sha256"].as_str()
+            != Some(format!("{:x}", Sha256::digest(&bytes)).as_str())
+    {
+        return Err(invalid());
+    }
+    Ok((bytes, total))
 }
 
 fn trusted_attachment_mime(raw: &str) -> bool {
@@ -727,6 +1067,14 @@ fn continuation_from_active_frame(
 }
 
 fn event_fingerprint(incoming: &InboundMessage) -> String {
+    if incoming.platform == "whatsapp" && !incoming.message_id.trim().is_empty() {
+        return serde_json::json!([
+            incoming.platform,
+            derive_route_key(incoming),
+            incoming.message_id
+        ])
+        .to_string();
+    }
     if !incoming.message_id.trim().is_empty() {
         return format!(
             "{}|{}|{}",
@@ -909,6 +1257,11 @@ mod tests {
     #[test]
     fn media_artifact_download_accepts_only_same_origin_single_safe_id() {
         let base_url = "https://beacon.example:8443";
+        assert!(trusted_media_artifact_url(
+            base_url,
+            "/api/cameras/recordings/artifacts/photo.jpg?media_context=chat"
+        )
+        .is_some());
         assert_eq!(
             trusted_media_artifact_url(
                 base_url,
@@ -941,6 +1294,9 @@ mod tests {
             "/api/cameras/recordings/artifacts/clip.mp4/extra",
             "/api/cameras/recordings/artifacts/.",
             "/api/cameras/recordings/artifacts/clip.mp4?token=secret",
+            "/api/cameras/recordings/artifacts/clip.mp4?media_context=local",
+            "/api/cameras/recordings/artifacts/clip.mp4?media_context=chat&token=secret",
+            "/api/cameras/recordings/artifacts/clip.mp4?media_context=chat&media_context=local",
             "/api/cameras/recordings/artifacts/clip.mp4#fragment",
             "/shared/cameras/token-252",
         ] {
@@ -966,6 +1322,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = HarborBeaconTaskClient {
+            cloud_relay: None,
             base_url: format!("http://{address}"),
             api_token: "service-token".to_string(),
             turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
@@ -995,7 +1352,8 @@ mod tests {
     async fn materialize_attachments_downloads_into_gate_owned_cache() {
         let app = Router::new().route(
             "/api/cameras/recordings/artifacts/snapshots~cam-252~frame.jpg",
-            get(|| async {
+            get(|headers: HeaderMap| async move {
+                assert_eq!(headers.get("X-Harbor-Media-Context").unwrap(), "chat");
                 (
                     [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
                     [0xFF_u8, 0xD8, 0xFF, 0xD9],
@@ -1010,6 +1368,7 @@ mod tests {
             axum::serve(listener, app).await.expect("serve mock Beacon");
         });
         let client = HarborBeaconTaskClient {
+            cloud_relay: None,
             base_url: format!("http://{address}"),
             api_token: "service-token".to_string(),
             turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
@@ -1023,7 +1382,7 @@ mod tests {
                 vec![json!({
                     "kind": "image",
                     "mime_type": "image/jpeg",
-                    "url": "/api/cameras/recordings/artifacts/snapshots~cam-252~frame.jpg"
+                    "url": "/api/cameras/recordings/artifacts/snapshots~cam-252~frame.jpg?media_context=chat"
                 })],
                 cache_root.path(),
                 "turn/camera-252",
@@ -1060,6 +1419,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = HarborBeaconTaskClient {
+            cloud_relay: None,
             base_url: format!("http://{address}"),
             api_token: "service-token".to_string(),
             turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
@@ -1147,6 +1507,7 @@ mod tests {
             .expect("write local artifact");
         let cache_root = tempdir().expect("attachment cache root");
         let client = HarborBeaconTaskClient {
+            cloud_relay: None,
             base_url: "http://127.0.0.1:9".to_string(),
             api_token: "service-secret".to_string(),
             turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
@@ -1192,6 +1553,7 @@ mod tests {
             axum::serve(listener, app).await.expect("serve mock Beacon");
         });
         let client = HarborBeaconTaskClient {
+            cloud_relay: None,
             base_url: format!("http://{address}"),
             api_token: "service-token".to_string(),
             turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
@@ -1247,6 +1609,7 @@ mod tests {
             axum::serve(listener, app).await.expect("serve mock Beacon");
         });
         let client = HarborBeaconTaskClient {
+            cloud_relay: None,
             base_url: format!("http://{address}"),
             api_token: "service-token".to_string(),
             turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
@@ -1321,6 +1684,7 @@ mod tests {
             })
         };
         let wrong_token_client = HarborBeaconTaskClient {
+            cloud_relay: None,
             base_url: format!("http://{address}"),
             api_token: "wrong-token".to_string(),
             turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
@@ -1338,6 +1702,7 @@ mod tests {
         assert!(wrong_bearer.cache_dir.is_none());
 
         let authorized_client = HarborBeaconTaskClient {
+            cloud_relay: None,
             api_token: "expected-service-token".to_string(),
             ..wrong_token_client
         };
@@ -1379,6 +1744,7 @@ mod tests {
             axum::serve(listener, app).await.expect("serve mock Beacon");
         });
         let client = HarborBeaconTaskClient {
+            cloud_relay: None,
             base_url: format!("http://{address}"),
             api_token: "service-token".to_string(),
             turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),
@@ -1433,6 +1799,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = HarborBeaconTaskClient {
+            cloud_relay: None,
             base_url: format!("http://{address}"),
             api_token: "service-token".to_string(),
             turn_endpoint: DEFAULT_TURN_ENDPOINT.to_string(),

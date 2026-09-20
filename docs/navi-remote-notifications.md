@@ -1,0 +1,11 @@
+# Remote Navi notification transport
+
+The v2.0 notification request/response contract remains unchanged. Gate obtains a business notification from a currently active Navi fleet selection via the device-authenticated `notificationOutbox` Cloud/Link exchange and submits the existing payload to its delivery pipeline. The HTTP notification endpoint cannot supply the internal fleet selection authority.
+
+Each request carries `{binding_id, generation, recipient, route_key}`. A maximum of four `{queue_id, payload}` items is returned. After delivery, Gate sends the same scope plus `queue_id` and the existing delivery response using `notificationReceipt`. The acknowledgement is `{acknowledged: true}`. Both operations require a pinned hub identity and a maximum ten-second deadline.
+
+Gate persists the original device selection and opaque Beacon conversation handle in the delivery plan. The request fingerprint includes the selection. Permission is checked before provider upload/send stages and retries. A route switch or permission revocation cannot redirect old work into the new household. The existing item ledger handles partial delivery, provider retry and recovery after restart; loss of a receipt causes the same notification to replay without resending a completed item.
+
+The binding message now registers its authenticated IM transport route, so notification delivery is available immediately after Owner confirmation. A separate background poller runs every five seconds and fairly rotates due active routes; each route has a persisted fifteen-second polling interval. Device-local event consent, media permission and business audit remain in Beacon.
+
+Beacon may attach one standard image or video artifact to an event that is finalized at first observation and explicitly permits chat media. Gate materializes it through the existing authenticated `mediaArtifact` protocol, verifies its bytes and rechecks authorization before provider stages. An event first observed as text stays text-only after recording finishes, so receipt replay cannot append a second media notification. Actual Meta delivery and messaging-window/template behavior remain production acceptance work. No Meta credentials or messages to people are used in the tests.

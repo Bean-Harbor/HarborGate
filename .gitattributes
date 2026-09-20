@@ -1,0 +1,7 @@
+# Linux package/bootstrap entrypoints must execute after a Windows checkout.
+*.sh text eol=lf
+*.py text eol=lf
+debian/* text eol=lf
+debian/harbornavi-k3/* text eol=lf
+scripts/ensure-data-layout text eol=lf
+licenses/upstream/** -text

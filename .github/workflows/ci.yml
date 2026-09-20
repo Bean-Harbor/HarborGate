@@ -16,13 +16,13 @@ jobs:
 
     steps:
       - name: Checkout HarborGate
-        uses: actions/checkout@v6
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Install Rust toolchain
         run: rustup component add rustfmt clippy
 
       - name: Cache cargo builds
-        uses: actions/cache@v5
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry
@@ -44,5 +44,26 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets
 
+      - name: Run root-owned service-auth integration tests
+        shell: bash
+        run: |
+          test_binary="$(
+            cargo test --locked --test token_env_migration --no-run --message-format=json |
+              jq -r 'select(.reason == "compiler-artifact" and .target.name == "token_env_migration" and .profile.test) | .executable // empty' |
+              tail -n 1
+          )"
+          test -n "$test_binary"
+          sudo --non-interactive "$test_binary" --ignored --test-threads=1
+
       - name: Build release binary
         run: cargo build --locked --release --bin harboros-im-gate
+
+      - name: Build and validate AMD64 deb package
+        shell: bash
+        run: |
+          bash ./debian/build-amd64-package \
+            0.1.0-ci \
+            ./target/release/harboros-im-gate \
+            "${RUNNER_TEMP}/harborgate-deb"
+          bash ./scripts/verify_harboros_im_gate_deb.sh \
+            "${RUNNER_TEMP}/harborgate-deb/harboros-im-gate_0.1.0-ci_linux_amd64.deb"

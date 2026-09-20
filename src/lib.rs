@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod cloud_relay;
 pub mod config;
 pub mod device_session;
 pub mod error;
@@ -6,6 +7,7 @@ pub mod gateway;
 pub mod harborbeacon;
 pub mod harboros_auth;
 pub mod models;
+mod navi_fleet;
 pub mod runtime;
 pub mod server;
 pub mod setup;

@@ -17,8 +17,14 @@ Authoritative v2 reference:
 ## Purpose
 
 v3.0 generalizes HarborGate from an IM-only transport edge into a northbound
-channel edge. HarborGate can accept turns from IM, Android, Web chat, and future
-client surfaces, then forward normalized turn envelopes to HarborBeacon.
+assistant/channel edge. HarborGate can accept assistant turns from IM, Android,
+Web chat, and future client surfaces, then forward normalized turn envelopes to
+HarborBeacon.
+
+This does not make HarborGate the product backend for Android remote
+home/camera control, Hub pairing, entitlement, WebRTC signaling, or WebUI
+display state. Those remain in HarborCloud, HarborLink, harbor-dock, and
+HarborNAS-webui according to the Harbor framework protocol maps.
 
 HarborBeacon remains the business core and source of truth for:
 
@@ -31,7 +37,7 @@ HarborBeacon remains the business core and source of truth for:
 HarborGate owns only channel-edge concerns:
 
 - IM adapters and platform credentials
-- Android/Web channel binding, route lifecycle, and delivery metadata
+- Android/Web assistant-channel binding, route lifecycle, and delivery metadata
 - route keys, push/channel delivery handles, and redacted gateway status
 - northbound proxying to Beacon-owned APIs
 
@@ -39,6 +45,8 @@ HarborGate owns only channel-edge concerns:
 
 - HarborGate must not own Home Device, HarborOS, knowledge, model, approval, or
   audit truth.
+- HarborGate must not own HarborCloud entitlement, HarborLink MQTT command/ack,
+  HarborDock remote home/camera intent, or WebUI display state.
 - HarborGate must not interpret `active_frame.kind` or device configuration
   semantics.
 - HarborBeacon must not own channel delivery, push tokens, route lifecycle, or

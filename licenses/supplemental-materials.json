@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "name": "base64-simd",
+      "version": "0.8.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "archive_sha256": "339abbe78e73178762e23bea9dfd08e697eb3f3301cd4be981c0f78ba5859195",
+      "declared_license": "MIT",
+      "repository": "https://github.com/Nugine/simd",
+      "commit": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+      "crate_path": "crates/base64-simd",
+      "material": {
+        "path": "upstream/nugine-simd-d74c030/LICENSE",
+        "upstream_path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+        "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+      }
+    },
+    {
+      "name": "vsimd",
+      "version": "0.8.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "archive_sha256": "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64",
+      "declared_license": "MIT",
+      "repository": "https://github.com/Nugine/simd",
+      "commit": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+      "crate_path": "crates/vsimd",
+      "material": {
+        "path": "upstream/nugine-simd-d74c030/LICENSE",
+        "upstream_path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+        "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+      }
+    }
+  ]
+}
