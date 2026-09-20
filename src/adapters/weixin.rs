@@ -8,13 +8,16 @@ use atomicwrites::{AllowOverwrite, AtomicFile};
 use axum::http::StatusCode;
 use base64::Engine as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use fs2::FileExt;
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
@@ -101,6 +104,18 @@ pub struct WeixinAdapter {
     http: Client,
     state: Mutex<WeixinState>,
     inbox_lock: Mutex<()>,
+    #[cfg(test)]
+    context_token_before_write: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    account_refresh_before_state_lock: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    inbound_batch_before_lock: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    unbind_before_account_lock: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    save_account_after_file_write: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    unbind_before_clear: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +159,18 @@ impl WeixinAdapter {
             http: Client::new(),
             state: Mutex::new(WeixinState { account, transport }),
             inbox_lock: Mutex::new(()),
+            #[cfg(test)]
+            context_token_before_write: Mutex::new(None),
+            #[cfg(test)]
+            account_refresh_before_state_lock: Mutex::new(None),
+            #[cfg(test)]
+            inbound_batch_before_lock: Mutex::new(None),
+            #[cfg(test)]
+            unbind_before_account_lock: Mutex::new(None),
+            #[cfg(test)]
+            save_account_after_file_write: Mutex::new(None),
+            #[cfg(test)]
+            unbind_before_clear: Mutex::new(None),
         }
     }
 
@@ -172,7 +199,22 @@ impl WeixinAdapter {
         let account = discover_weixin_account(&self.config.state_dir, &current_account_id)
             .or_else(|| discover_weixin_account(&self.config.state_dir, &self.config.account_id));
         if let Some(account) = account {
+            #[cfg(test)]
+            let hook = self
+                .account_refresh_before_state_lock
+                .lock()
+                .expect("account refresh test hook lock poisoned")
+                .clone();
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook();
+            }
             let mut state = self.state.lock().expect("weixin state lock poisoned");
+            if load_weixin_account(&self.config.state_dir, &account.account_id)
+                .is_none_or(|current| current.token != account.token)
+            {
+                return;
+            }
             if state.account.account_id != account.account_id
                 || state.account.token != account.token
             {
@@ -190,24 +232,76 @@ impl WeixinAdapter {
     }
 
     pub fn unbind(&self) -> Value {
+        let _inbox_guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
         let account = self.account();
+        #[cfg(test)]
+        if let Some(hook) = self
+            .unbind_before_account_lock
+            .lock()
+            .expect("unbind account lock test hook poisoned")
+            .clone()
+        {
+            hook();
+        }
         let deleted = if account.account_id.trim().is_empty() {
-            vec![]
+            let mut state = self.state.lock().expect("weixin state lock poisoned");
+            state.account = WeixinAccount::default();
+            state.transport = default_transport_state(false);
+            Ok(vec![])
         } else {
-            clear_weixin_account_state(&self.config.state_dir, &account.account_id)
+            with_account_state_lock(&self.config.state_dir, &account.account_id, || {
+                let current = load_weixin_account(&self.config.state_dir, &account.account_id);
+                if !current.as_ref().is_some_and(|current| {
+                    current.account_id == account.account_id && current.token == account.token
+                }) {
+                    return Err(GatewayError::validation(
+                        "Weixin account changed during unbind",
+                    ));
+                }
+                with_context_token_lock(&self.config.state_dir, &account.account_id, || {
+                    let mut state = self.state.lock().expect("weixin state lock poisoned");
+                    if state.account.account_id != account.account_id
+                        || state.account.token != account.token
+                    {
+                        return Err(GatewayError::validation(
+                            "Weixin account changed during unbind",
+                        ));
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = self
+                        .unbind_before_clear
+                        .lock()
+                        .expect("unbind clear test hook poisoned")
+                        .clone()
+                    {
+                        hook();
+                    }
+                    let deleted =
+                        clear_weixin_account_state(&self.config.state_dir, &account.account_id)?;
+                    state.account = WeixinAccount::default();
+                    state.transport = default_transport_state(false);
+                    Ok(deleted)
+                })
+            })
         };
-        let mut state = self.state.lock().expect("weixin state lock poisoned");
-        state.account = WeixinAccount::default();
-        state.transport = default_transport_state(false);
-        json!({
-            "ok": true,
-            "platform": "weixin",
-            "account_id_configured": !account.account_id.trim().is_empty(),
-            "account_id_masked": mask_secret(&account.account_id),
-            "deleted_state_files": deleted,
-            "configured": false,
-            "status": "waiting_for_credentials",
-        })
+        match deleted {
+            Ok(deleted) => json!({
+                "ok": true,
+                "platform": "weixin",
+                "account_id_configured": !account.account_id.trim().is_empty(),
+                "account_id_masked": mask_secret(&account.account_id),
+                "deleted_state_files": deleted,
+                "configured": false,
+                "status": "waiting_for_credentials",
+            }),
+            Err(_) => json!({
+                "ok": false,
+                "platform": "weixin",
+                "configured": true,
+                "status": "unbind_failed",
+                "message": "Weixin account could not be unbound",
+            }),
+        }
     }
 
     pub fn context_token_count(&self) -> usize {
@@ -269,11 +363,23 @@ impl WeixinAdapter {
     }
 
     pub fn save_account(&self, account: WeixinAccount) -> Result<(), GatewayError> {
-        save_weixin_account(&self.config.state_dir, &account)?;
-        let mut state = self.state.lock().expect("weixin state lock poisoned");
-        state.account = account;
-        state.transport = default_transport_state(true);
-        Ok(())
+        let account_id = account.account_id.clone();
+        with_account_state_lock(&self.config.state_dir, &account_id, || {
+            save_weixin_account(&self.config.state_dir, &account)?;
+            #[cfg(test)]
+            if let Some(hook) = self
+                .save_account_after_file_write
+                .lock()
+                .expect("save account test hook poisoned")
+                .clone()
+            {
+                hook();
+            }
+            let mut state = self.state.lock().expect("weixin state lock poisoned");
+            state.account = account;
+            state.transport = default_transport_state(true);
+            Ok(())
+        })
     }
 
     pub async fn poll_updates(&self) -> Result<WeixinPollBatch, GatewayError> {
@@ -420,7 +526,22 @@ impl WeixinAdapter {
         if account.account_id.trim().is_empty() {
             return Err(self.weixin_error("Weixin account is not configured"));
         }
+        #[cfg(test)]
+        let hook = self
+            .inbound_batch_before_lock
+            .lock()
+            .expect("inbound batch test hook lock poisoned")
+            .clone();
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook();
+        }
         let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        if !self.account_is_current(&account) {
+            return Err(GatewayError::validation(
+                "Weixin account changed before inbox commit",
+            ));
+        }
         let mut inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
         let items = inbox
             .entry("items")
@@ -471,6 +592,12 @@ impl WeixinAdapter {
         if account.account_id.trim().is_empty() {
             return Err(self.weixin_error("Weixin account is not configured"));
         }
+        let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        if !self.account_is_current(&account) {
+            return Err(GatewayError::validation(
+                "Weixin account changed before cursor commit",
+            ));
+        }
         save_sync_buf(&self.config.state_dir, &account.account_id, next_cursor)
     }
 
@@ -484,6 +611,9 @@ impl WeixinAdapter {
             return Ok(None);
         }
         let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        if !self.account_is_current(&account) {
+            return Ok(None);
+        }
         let mut inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
         let items = inbox
             .entry("items")
@@ -541,6 +671,11 @@ impl WeixinAdapter {
     ) -> Result<(), GatewayError> {
         let account = self.account();
         let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        if !self.account_is_current(&account) {
+            return Err(GatewayError::validation(
+                "Weixin account changed before inbox completion",
+            ));
+        }
         let mut inbox = load_inbox(&self.config.state_dir, &account.account_id)?;
         let item = inbox
             .get_mut("items")
@@ -610,6 +745,10 @@ impl WeixinAdapter {
         if message_id.is_empty() || account.account_id.is_empty() {
             return Ok(());
         }
+        let _guard = self.inbox_lock.lock().expect("weixin inbox lock poisoned");
+        if !self.account_is_current(&account) {
+            return Ok(());
+        }
         let mut messages = load_processed_messages(&self.config.state_dir, &account.account_id);
         messages.retain(|item| item != &message_id);
         messages.push_back(message_id);
@@ -617,6 +756,13 @@ impl WeixinAdapter {
             messages.pop_front();
         }
         save_processed_messages(&self.config.state_dir, &account.account_id, &messages)
+    }
+
+    fn account_is_current(&self, account: &WeixinAccount) -> bool {
+        let state = self.state.lock().expect("weixin state lock poisoned");
+        !account.account_id.is_empty()
+            && state.account.account_id == account.account_id
+            && state.account.token == account.token
     }
 
     fn update_transport(&self, updates: serde_json::Map<String, Value>) {
@@ -692,6 +838,10 @@ impl WeixinAdapter {
                 self.config.timeout_seconds,
             )
             .await?;
+        validate_send_message_response(
+            &response,
+            &[&account.account_id, &account.token, context_token],
+        )?;
         Ok(WeixinSendReceipt {
             provider_client_id: client_id,
             provider_message_id: weixin_provider_message_id(&response),
@@ -1024,13 +1174,35 @@ impl PlatformAdapter for WeixinAdapter {
         if !context_token.is_empty() {
             let account = self.account();
             if !account.account_id.is_empty() {
-                let _ = save_context_token(
-                    &self.config.state_dir,
-                    &account.account_id,
-                    &chat_id,
-                    &context_token,
-                );
-                self.update_transport(json_map!({"last_context_token_at": observed_at}));
+                #[cfg(test)]
+                let hook = self
+                    .context_token_before_write
+                    .lock()
+                    .expect("context token test hook lock poisoned")
+                    .clone();
+                #[cfg(test)]
+                if let Some(hook) = hook {
+                    hook();
+                }
+                with_context_token_lock(&self.config.state_dir, &account.account_id, || {
+                    let state = self.state.lock().expect("weixin state lock poisoned");
+                    if state.account.account_id != account.account_id
+                        || state.account.token != account.token
+                    {
+                        return Err(GatewayError::validation(
+                            "Weixin account changed during inbound processing",
+                        ));
+                    }
+                    drop(state);
+                    save_context_token_unlocked(
+                        &self.config.state_dir,
+                        &account.account_id,
+                        &chat_id,
+                        &context_token,
+                    )?;
+                    self.update_transport(json_map!({"last_context_token_at": observed_at}));
+                    Ok(())
+                })?;
             }
         }
 
@@ -1059,12 +1231,11 @@ impl PlatformAdapter for WeixinAdapter {
                 "Weixin adapter is not configured. Open Weixin setup first.",
             ));
         }
-        let context_token = load_context_tokens(&self.config.state_dir, &account.account_id)
-            .get(&outbound.chat_id)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let context_token = load_or_recover_context_token(
+            &self.config.state_dir,
+            &account.account_id,
+            &outbound.chat_id,
+        )?;
         if context_token.is_empty() {
             return Err(GatewayError::validation(format!(
                 "No Weixin context_token cached for chat_id={}. Send a DM from WeChat first.",
@@ -1507,12 +1678,11 @@ impl PlatformAdapter for WeixinAdapter {
                 "Weixin adapter is not configured. Open Weixin setup first.",
             ));
         }
-        let context_token = load_context_tokens(&self.config.state_dir, &account.account_id)
-            .get(&outbound.chat_id)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let context_token = load_or_recover_context_token(
+            &self.config.state_dir,
+            &account.account_id,
+            &outbound.chat_id,
+        )?;
         if context_token.is_empty() {
             return Err(GatewayError::validation(format!(
                 "No Weixin context_token cached for chat_id={}. Send a DM from WeChat first.",
@@ -1878,23 +2048,30 @@ fn load_weixin_account_path(path: &Path) -> Option<WeixinAccount> {
     })
 }
 
-fn clear_weixin_account_state(state_dir: &Path, account_id: &str) -> Vec<String> {
+fn clear_weixin_account_state(
+    state_dir: &Path,
+    account_id: &str,
+) -> Result<Vec<String>, GatewayError> {
     let mut deleted = Vec::new();
     for path in [
-        account_file(state_dir, account_id),
         sync_file(state_dir, account_id),
         context_file(state_dir, account_id),
         processed_file(state_dir, account_id),
         inbox_file(state_dir, account_id),
         transport_state_file(state_dir, account_id),
+        account_file(state_dir, account_id),
     ] {
-        if fs::remove_file(&path).is_ok() {
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                deleted.push(name.to_string());
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                    deleted.push(name.to_string());
+                }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
-    deleted
+    Ok(deleted)
 }
 
 fn load_sync_buf(state_dir: &Path, account_id: &str) -> String {
@@ -2004,19 +2181,173 @@ fn load_context_tokens(state_dir: &Path, account_id: &str) -> serde_json::Map<St
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn save_context_token(
     state_dir: &Path,
     account_id: &str,
     chat_id: &str,
     context_token: &str,
 ) -> Result<(), GatewayError> {
-    fs::create_dir_all(account_dir(state_dir))?;
+    with_context_token_lock(state_dir, account_id, || {
+        save_context_token_unlocked(state_dir, account_id, chat_id, context_token)
+    })
+}
+
+fn save_context_token_unlocked(
+    state_dir: &Path,
+    account_id: &str,
+    chat_id: &str,
+    context_token: &str,
+) -> Result<(), GatewayError> {
     let mut tokens = load_context_tokens(state_dir, account_id);
     tokens.insert(chat_id.to_string(), json!(context_token));
-    fs::write(
-        context_file(state_dir, account_id),
-        serde_json::to_string_pretty(&Value::Object(tokens))?,
-    )?;
+    save_context_tokens(state_dir, account_id, tokens)
+}
+
+fn load_or_recover_context_token(
+    state_dir: &Path,
+    account_id: &str,
+    chat_id: &str,
+) -> Result<String, GatewayError> {
+    with_context_token_lock(state_dir, account_id, || {
+        let mut tokens = load_context_tokens(state_dir, account_id);
+        let cached = tokens
+            .get(chat_id)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+        let recovered = recover_context_tokens_from_inbox(state_dir, account_id)?;
+        let latest = recovered
+            .get(chat_id)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        if latest.is_empty() || latest == cached {
+            return Ok(cached);
+        }
+
+        tokens.insert(chat_id.to_string(), json!(latest));
+        save_context_tokens(state_dir, account_id, tokens)?;
+        Ok(latest)
+    })
+}
+
+fn with_context_token_lock<T>(
+    state_dir: &Path,
+    account_id: &str,
+    operation: impl FnOnce() -> Result<T, GatewayError>,
+) -> Result<T, GatewayError> {
+    fs::create_dir_all(account_dir(state_dir))?;
+    let lock_path =
+        account_dir(state_dir).join(format!("{}.context_tokens.lock", safe_slug(account_id)));
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock_file.lock_exclusive()?;
+    operation()
+}
+
+fn with_account_state_lock<T>(
+    state_dir: &Path,
+    account_id: &str,
+    operation: impl FnOnce() -> Result<T, GatewayError>,
+) -> Result<T, GatewayError> {
+    fs::create_dir_all(account_dir(state_dir))?;
+    let lock_path = account_dir(state_dir).join(format!("{}.account.lock", safe_slug(account_id)));
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock_file.lock_exclusive()?;
+    operation()
+}
+
+fn recover_context_tokens_from_inbox(
+    state_dir: &Path,
+    account_id: &str,
+) -> Result<serde_json::Map<String, Value>, GatewayError> {
+    let inbox = load_inbox(state_dir, account_id)?;
+    let mut latest_by_chat = HashMap::<String, (i64, String, String)>::new();
+    let Some(items) = inbox.get("items").and_then(Value::as_object) else {
+        return Ok(serde_json::Map::new());
+    };
+    for item in items.values() {
+        let Some(payload) = item.get("payload").and_then(Value::as_object) else {
+            continue;
+        };
+        if payload
+            .get("room_id")
+            .and_then(Value::as_str)
+            .is_some_and(|room_id| !room_id.trim().is_empty())
+        {
+            continue;
+        }
+        let chat_id = payload
+            .get("from_user_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let context_token = payload
+            .get("context_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if chat_id.is_empty() || context_token.is_empty() {
+            continue;
+        }
+        let created_at_ms = payload
+            .get("create_time_ms")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                item.get("created_at")
+                    .and_then(Value::as_str)
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.timestamp_millis())
+            })
+            .unwrap_or_default();
+        let provider_message_id = extract_weixin_message_id(&Value::Object(payload.clone()));
+        let candidate = (
+            created_at_ms,
+            provider_message_id,
+            context_token.to_string(),
+        );
+        if latest_by_chat.get(chat_id).is_none_or(|current| {
+            candidate.0 > current.0 || candidate.0 == current.0 && candidate.1 > current.1
+        }) {
+            latest_by_chat.insert(chat_id.to_string(), candidate);
+        }
+    }
+    Ok(latest_by_chat
+        .into_iter()
+        .map(|(chat_id, (_, _, context_token))| (chat_id, json!(context_token)))
+        .collect())
+}
+
+fn save_context_tokens(
+    state_dir: &Path,
+    account_id: &str,
+    tokens: serde_json::Map<String, Value>,
+) -> Result<(), GatewayError> {
+    fs::create_dir_all(account_dir(state_dir))?;
+    let path = context_file(state_dir, account_id);
+    let bytes = serde_json::to_vec_pretty(&Value::Object(tokens))?;
+    AtomicFile::new(&path, AllowOverwrite)
+        .write(|file| -> std::io::Result<()> {
+            use std::io::Write as _;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })
+        .map_err(std::io::Error::from)?;
     Ok(())
 }
 
@@ -2472,6 +2803,36 @@ fn weixin_headers(token: Option<&str>, body_len: Option<usize>) -> HeaderMap {
     headers
 }
 
+fn validate_send_message_response(response: &Value, secrets: &[&str]) -> Result<(), GatewayError> {
+    let Some(ret_value) = response.get("ret") else {
+        return Ok(());
+    };
+    let Some(ret) = ret_value.as_i64() else {
+        return Err(GatewayError::new(
+            StatusCode::BAD_GATEWAY,
+            "PLATFORM_UNAVAILABLE",
+            "Weixin sendmessage returned an invalid ret field",
+        ));
+    };
+    if ret == 0 {
+        return Ok(());
+    }
+    let errmsg = response
+        .get("errmsg")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown provider error");
+    Err(GatewayError::new(
+        StatusCode::BAD_GATEWAY,
+        "PLATFORM_UNAVAILABLE",
+        redact_sensitive_text(
+            &format!("Weixin sendmessage failed with ret={ret}: {errmsg}"),
+            secrets,
+        ),
+    ))
+}
+
 async fn decode_json_response(
     response: reqwest::Response,
     context: impl FnOnce() -> String,
@@ -2690,6 +3051,594 @@ mod tests {
                 .and_then(Value::as_str),
             Some("ctx-001")
         );
+    }
+
+    #[test]
+    fn context_token_recovers_from_latest_durable_inbox() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-recovery".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config);
+        adapter
+            .persist_inbound_batch(&[
+                json!({
+                    "msg_id": "provider-old",
+                    "from_user_id": "wx-user-1",
+                    "context_token": "ctx-old",
+                    "create_time_ms": 100,
+                    "item_list": [{"type": 1, "text_item": {"text": "old"}}],
+                }),
+                json!({
+                    "msg_id": "provider-new",
+                    "from_user_id": "wx-user-1",
+                    "context_token": "ctx-new",
+                    "create_time_ms": 200,
+                    "item_list": [{"type": 1, "text_item": {"text": "new"}}],
+                }),
+            ])
+            .unwrap();
+        fs::write(context_file(dir.path(), "bot-recovery"), "not-json").unwrap();
+
+        let recovered =
+            load_or_recover_context_token(dir.path(), "bot-recovery", "wx-user-1").unwrap();
+
+        assert_eq!(recovered, "ctx-new");
+        assert_eq!(
+            load_context_tokens(dir.path(), "bot-recovery")
+                .get("wx-user-1")
+                .and_then(Value::as_str),
+            Some("ctx-new")
+        );
+    }
+
+    #[test]
+    fn valid_cached_context_token_survives_corrupt_inbox() {
+        let dir = tempdir().unwrap();
+        save_context_token(dir.path(), "bot-cached", "wx-user-1", "ctx-cached").unwrap();
+        fs::write(inbox_file(dir.path(), "bot-cached"), "not-json").unwrap();
+
+        let token = load_or_recover_context_token(dir.path(), "bot-cached", "wx-user-1").unwrap();
+
+        assert_eq!(token, "ctx-cached");
+    }
+
+    #[test]
+    fn direct_inbound_token_does_not_revert_to_older_polled_inbox() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-direct".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config);
+        adapter
+            .persist_inbound_batch(&[json!({
+                "msg_id": "provider-old",
+                "from_user_id": "wx-user-1",
+                "context_token": "ctx-old",
+                "create_time_ms": 100,
+                "item_list": [{"type": 1, "text_item": {"text": "old"}}],
+            })])
+            .unwrap();
+        adapter
+            .normalize_inbound(json!({
+                "msg_id": "provider-new",
+                "from_user_id": "wx-user-1",
+                "context_token": "ctx-new",
+                "item_list": [{"type": 1, "text_item": {"text": "new"}}],
+            }))
+            .unwrap();
+        assert_eq!(
+            load_or_recover_context_token(dir.path(), "bot-direct", "wx-user-1").unwrap(),
+            "ctx-new"
+        );
+        assert_eq!(
+            load_context_tokens(dir.path(), "bot-direct")["wx-user-1"],
+            "ctx-new"
+        );
+    }
+
+    #[test]
+    fn recovering_another_chat_does_not_revert_a_fresh_direct_inbound_token() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-multi-chat".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config);
+        adapter
+            .persist_inbound_batch(&[
+                json!({
+                    "msg_id": "provider-a-old",
+                    "from_user_id": "chat-a",
+                    "context_token": "ctx-a-old",
+                    "create_time_ms": 100,
+                    "item_list": [{"type": 1, "text_item": {"text": "old"}}],
+                }),
+                json!({
+                    "msg_id": "provider-b",
+                    "from_user_id": "chat-b",
+                    "context_token": "ctx-b-inbox",
+                    "create_time_ms": 200,
+                    "item_list": [{"type": 1, "text_item": {"text": "recover"}}],
+                }),
+            ])
+            .unwrap();
+        adapter
+            .normalize_inbound(json!({
+                "msg_id": "provider-a-new",
+                "from_user_id": "chat-a",
+                "context_token": "ctx-a-new",
+                "item_list": [{"type": 1, "text_item": {"text": "new"}}],
+            }))
+            .unwrap();
+
+        assert_eq!(
+            load_or_recover_context_token(dir.path(), "bot-multi-chat", "chat-b").unwrap(),
+            "ctx-b-inbox"
+        );
+        let tokens = load_context_tokens(dir.path(), "bot-multi-chat");
+        assert_eq!(tokens["chat-a"], "ctx-a-new");
+        assert_eq!(tokens["chat-b"], "ctx-b-inbox");
+    }
+
+    #[test]
+    fn concurrent_context_token_updates_preserve_each_chat() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-concurrent".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config);
+        adapter
+            .persist_inbound_batch(&[json!({
+                "msg_id": "provider-recovery",
+                "from_user_id": "chat-recovery",
+                "context_token": "ctx-recovery",
+                "create_time_ms": 100,
+                "item_list": [{"type": 1, "text_item": {"text": "recover"}}],
+            })])
+            .unwrap();
+
+        let worker_count = 24;
+        let barrier = Arc::new(Barrier::new(worker_count + 2));
+        let mut workers = Vec::new();
+        for index in 0..worker_count {
+            let path = dir.path().to_path_buf();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                save_context_token(
+                    &path,
+                    "bot-concurrent",
+                    &format!("chat-{index}"),
+                    &format!("ctx-{index}"),
+                )
+            }));
+        }
+        let path = dir.path().to_path_buf();
+        let recovery_barrier = Arc::clone(&barrier);
+        let recovery = std::thread::spawn(move || {
+            recovery_barrier.wait();
+            load_or_recover_context_token(&path, "bot-concurrent", "chat-recovery")
+        });
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        assert_eq!(recovery.join().unwrap().unwrap(), "ctx-recovery");
+
+        let tokens = load_context_tokens(dir.path(), "bot-concurrent");
+        assert_eq!(tokens["chat-recovery"], "ctx-recovery");
+        for index in 0..worker_count {
+            assert_eq!(tokens[&format!("chat-{index}")], format!("ctx-{index}"));
+        }
+    }
+
+    #[test]
+    fn unbind_does_not_allow_an_inflight_inbound_to_restore_old_context_tokens() {
+        use std::sync::{Condvar, Mutex as TestMutex};
+
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-unbind".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = Arc::new(WeixinAdapter::new(config));
+        adapter
+            .save_account(WeixinAccount {
+                account_id: "bot-unbind".into(),
+                token: "secret".into(),
+                base_url: "https://example.com".into(),
+                user_id: "self".into(),
+            })
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new((TestMutex::new(false), Condvar::new()));
+        let hook_release = Arc::clone(&release);
+        *adapter.context_token_before_write.lock().unwrap() = Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            let (lock, ready) = &*hook_release;
+            let released = lock.lock().unwrap();
+            let (released, timeout) = ready
+                .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                .unwrap();
+            assert!(*released && !timeout.timed_out());
+        }));
+        let inbound_adapter = Arc::clone(&adapter);
+        let inbound = std::thread::spawn(move || {
+            inbound_adapter.normalize_inbound(json!({
+                "msg_id": "provider-before-unbind",
+                "from_user_id": "chat-a",
+                "context_token": "ctx-stale",
+                "item_list": [{"type": 1, "text_item": {"text": "hello"}}],
+            }))
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = adapter.unbind();
+        {
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        let _ = inbound.join().unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert!(!account_file(dir.path(), "bot-unbind").exists());
+        assert!(!context_file(dir.path(), "bot-unbind").exists());
+        assert!(!adapter.configured());
+    }
+
+    #[test]
+    fn unbind_reports_failure_without_discarding_account_when_token_lock_is_unavailable() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-lock-failure".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config);
+        adapter
+            .save_account(WeixinAccount {
+                account_id: "bot-lock-failure".into(),
+                token: "secret".into(),
+                base_url: "https://example.com".into(),
+                user_id: "self".into(),
+            })
+            .unwrap();
+        let lock_path = account_dir(dir.path()).join("bot-lock-failure.context_tokens.lock");
+        fs::create_dir(&lock_path).unwrap();
+
+        let response = adapter.unbind();
+        assert_eq!(response["ok"], false);
+        assert!(account_file(dir.path(), "bot-lock-failure").exists());
+        assert!(adapter.configured());
+    }
+
+    #[test]
+    fn unbind_preserves_account_when_a_state_file_cannot_be_removed() {
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-unbind-cleanup".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = WeixinAdapter::new(config);
+        adapter
+            .save_account(WeixinAccount {
+                account_id: "bot-unbind-cleanup".into(),
+                token: "secret".into(),
+                base_url: "https://example.com".into(),
+                user_id: "self".into(),
+            })
+            .unwrap();
+        fs::create_dir(context_file(dir.path(), "bot-unbind-cleanup")).unwrap();
+
+        let response = adapter.unbind();
+        assert_eq!(response["ok"], false);
+        assert!(account_file(dir.path(), "bot-unbind-cleanup").exists());
+        assert!(adapter.configured());
+    }
+
+    #[test]
+    fn save_account_cannot_be_deleted_by_an_inflight_unbind() {
+        use std::sync::{Condvar, Mutex as TestMutex};
+
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-save-unbind-race".into(),
+            token: "token-a".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = Arc::new(WeixinAdapter::new(config));
+        adapter
+            .save_account(WeixinAccount {
+                account_id: "bot-save-unbind-race".into(),
+                token: "token-a".into(),
+                base_url: "https://example.com".into(),
+                user_id: "self".into(),
+            })
+            .unwrap();
+
+        let (unbind_entered_tx, unbind_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let unbind_release = Arc::new((TestMutex::new(false), Condvar::new()));
+        let unbind_release_hook = Arc::clone(&unbind_release);
+        *adapter.unbind_before_account_lock.lock().unwrap() = Some(Arc::new(move || {
+            unbind_entered_tx.send(()).unwrap();
+            let (lock, ready) = &*unbind_release_hook;
+            let released = lock.lock().unwrap();
+            let (released, timeout) = ready
+                .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                .unwrap();
+            assert!(*released && !timeout.timed_out());
+        }));
+
+        let (save_written_tx, save_written_rx) = std::sync::mpsc::sync_channel(1);
+        let save_release = Arc::new((TestMutex::new(false), Condvar::new()));
+        let save_release_hook = Arc::clone(&save_release);
+        *adapter.save_account_after_file_write.lock().unwrap() = Some(Arc::new(move || {
+            save_written_tx.send(()).unwrap();
+            let (lock, ready) = &*save_release_hook;
+            let released = lock.lock().unwrap();
+            let (released, timeout) = ready
+                .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                .unwrap();
+            assert!(*released && !timeout.timed_out());
+        }));
+
+        let (unbind_clear_tx, unbind_clear_rx) = std::sync::mpsc::sync_channel(1);
+        let unbind_clear_release = Arc::new((TestMutex::new(false), Condvar::new()));
+        let unbind_clear_release_hook = Arc::clone(&unbind_clear_release);
+        *adapter.unbind_before_clear.lock().unwrap() = Some(Arc::new(move || {
+            unbind_clear_tx.send(()).unwrap();
+            let (lock, ready) = &*unbind_clear_release_hook;
+            let released = lock.lock().unwrap();
+            let (released, timeout) = ready
+                .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                .unwrap();
+            assert!(*released && !timeout.timed_out());
+        }));
+
+        let unbind_adapter = Arc::clone(&adapter);
+        let unbind = std::thread::spawn(move || unbind_adapter.unbind());
+        unbind_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        let save_adapter = Arc::clone(&adapter);
+        let save = std::thread::spawn(move || {
+            save_adapter.save_account(WeixinAccount {
+                account_id: "bot-save-unbind-race".into(),
+                token: "token-b".into(),
+                base_url: "https://example.com".into(),
+                user_id: "self".into(),
+            })
+        });
+        save_written_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        {
+            let (lock, ready) = &*unbind_release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        let old_unbind_reached_clear = unbind_clear_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_ok();
+        let unbind_result = if old_unbind_reached_clear {
+            {
+                let (lock, ready) = &*unbind_clear_release;
+                *lock.lock().unwrap() = true;
+                ready.notify_all();
+            }
+            let result = unbind.join().unwrap();
+            {
+                let (lock, ready) = &*save_release;
+                *lock.lock().unwrap() = true;
+                ready.notify_all();
+            }
+            result
+        } else {
+            {
+                let (lock, ready) = &*save_release;
+                *lock.lock().unwrap() = true;
+                ready.notify_all();
+            }
+            unbind.join().unwrap()
+        };
+        save.join().unwrap().unwrap();
+
+        assert_eq!(unbind_result["ok"], false);
+        assert_eq!(
+            load_weixin_account(dir.path(), "bot-save-unbind-race")
+                .unwrap()
+                .token,
+            "token-b"
+        );
+        assert_eq!(adapter.account().token, "token-b");
+    }
+
+    #[test]
+    fn account_refresh_cannot_restore_an_account_deleted_during_unbind() {
+        use std::sync::{Condvar, Mutex as TestMutex};
+
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-refresh-race".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = Arc::new(WeixinAdapter::new(config));
+        adapter
+            .save_account(WeixinAccount {
+                account_id: "bot-refresh-race".into(),
+                token: "secret".into(),
+                base_url: "https://example.com".into(),
+                user_id: "self".into(),
+            })
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new((TestMutex::new(false), Condvar::new()));
+        let hook_release = Arc::clone(&release);
+        *adapter.account_refresh_before_state_lock.lock().unwrap() = Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            let (lock, ready) = &*hook_release;
+            let released = lock.lock().unwrap();
+            let (released, timeout) = ready
+                .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                .unwrap();
+            assert!(*released && !timeout.timed_out());
+        }));
+        let stale_adapter = Arc::clone(&adapter);
+        let refresh = std::thread::spawn(move || stale_adapter.account());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        *adapter.account_refresh_before_state_lock.lock().unwrap() = None;
+        let unbound = adapter.unbind();
+        {
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        let refreshed = refresh.join().unwrap();
+
+        assert_eq!(unbound["ok"], true);
+        assert!(refreshed.account_id.is_empty());
+        assert!(!adapter.configured());
+    }
+
+    #[test]
+    fn unbind_does_not_allow_an_inflight_poll_batch_to_recreate_the_inbox() {
+        use std::sync::{Condvar, Mutex as TestMutex};
+
+        let dir = tempdir().unwrap();
+        let config = WeixinConfig {
+            state_dir: dir.path().to_path_buf(),
+            account_id: "bot-inbox-unbind".into(),
+            token: "secret".into(),
+            base_url: "https://example.com".into(),
+            user_id: "self".into(),
+            cdn_base_url: WeixinConfig::DEFAULT_CDN_BASE_URL.into(),
+            timeout_seconds: 45,
+            poll_timeout_ms: 35000,
+        };
+        let adapter = Arc::new(WeixinAdapter::new(config));
+        adapter
+            .save_account(WeixinAccount {
+                account_id: "bot-inbox-unbind".into(),
+                token: "secret".into(),
+                base_url: "https://example.com".into(),
+                user_id: "self".into(),
+            })
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new((TestMutex::new(false), Condvar::new()));
+        let hook_release = Arc::clone(&release);
+        *adapter.inbound_batch_before_lock.lock().unwrap() = Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            let (lock, ready) = &*hook_release;
+            let released = lock.lock().unwrap();
+            let (released, timeout) = ready
+                .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                .unwrap();
+            assert!(*released && !timeout.timed_out());
+        }));
+        let poll_adapter = Arc::clone(&adapter);
+        let poll = std::thread::spawn(move || {
+            poll_adapter.persist_inbound_batch(&[json!({
+                "msg_id": "provider-before-unbind",
+                "from_user_id": "chat-a",
+                "context_token": "ctx-stale",
+                "create_time_ms": 100,
+                "item_list": [{"type": 1, "text_item": {"text": "hello"}}],
+            })])
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        *adapter.inbound_batch_before_lock.lock().unwrap() = None;
+        let unbound = adapter.unbind();
+        {
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        let _ = poll.join().unwrap();
+
+        assert_eq!(unbound["ok"], true);
+        assert!(!inbox_file(dir.path(), "bot-inbox-unbind").exists());
+        assert!(!account_file(dir.path(), "bot-inbox-unbind").exists());
+    }
+
+    #[test]
+    fn send_message_response_checks_business_return_code_and_redacts_secrets() {
+        validate_send_message_response(&json!({"ret": 0}), &[]).unwrap();
+        validate_send_message_response(&json!({}), &[]).unwrap();
+
+        let error = validate_send_message_response(
+            &json!({
+                "ret": -14,
+                "errmsg": "expired context_token=ctx-secret account=account-secret"
+            }),
+            &["ctx-secret", "account-secret"],
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("ret=-14"));
+        assert!(error.message.contains("[REDACTED]"));
+        assert!(!error.message.contains("ctx-secret"));
+        assert!(!error.message.contains("account-secret"));
     }
 
     #[test]

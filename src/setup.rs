@@ -747,7 +747,9 @@ impl SetupPortalService {
 
     pub fn unbind_weixin(&self) -> Value {
         let response = self.gateway.weixin_adapter().unbind();
-        let _ = self.store.save_weixin_login_state(json!({}));
+        if response.get("ok").and_then(Value::as_bool) == Some(true) {
+            let _ = self.store.save_weixin_login_state(json!({}));
+        }
         response
     }
 
