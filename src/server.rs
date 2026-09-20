@@ -29,6 +29,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 const HARBOR_GATE_PUBLIC_PREFIX: &str = "/api/harbor-gate";
+const GATEWAY_TURN_CONTRACT_VERSION: &str = "3.0";
+const LEGACY_GATEWAY_TURN_CONTRACT_VERSION: &str = "2.0";
 const HARBOROS_AUTH_TOKEN_HEADER: &str = "X-HarborOS-Auth-Token";
 const DEVICE_SESSION_COOKIE: &str = "harbornavi_device_session";
 const DEVICE_SESSION_TTL_SECONDS: u64 = 12 * 60 * 60;
@@ -255,9 +257,48 @@ async fn notification_delivery(
 
 async fn gateway_turn(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
-) -> Result<Json<Value>, GatewayError> {
-    Ok(Json(state.gateway.handle_gateway_turn(payload).await?))
+) -> Result<impl IntoResponse, GatewayError> {
+    let contract_version = require_gateway_turn_contract(&headers)?;
+    require_service_auth(&state.config, &headers)?;
+    Ok((
+        gateway_turn_response_headers(contract_version),
+        Json(state.gateway.handle_gateway_turn(payload).await?),
+    ))
+}
+
+fn gateway_turn_response_headers(contract_version: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "X-Contract-Version",
+        contract_version.parse().expect("negotiated header"),
+    );
+    headers
+}
+
+fn require_gateway_turn_contract(headers: &HeaderMap) -> Result<&'static str, GatewayError> {
+    let Some(received) = headers
+        .get("X-Contract-Version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(GATEWAY_TURN_CONTRACT_VERSION);
+    };
+    if received != GATEWAY_TURN_CONTRACT_VERSION && received != LEGACY_GATEWAY_TURN_CONTRACT_VERSION
+    {
+        return Err(GatewayError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "CONTRACT_VERSION_MISMATCH",
+            format!("X-Contract-Version must be {GATEWAY_TURN_CONTRACT_VERSION}"),
+        ));
+    }
+    Ok(if received == LEGACY_GATEWAY_TURN_CONTRACT_VERSION {
+        LEGACY_GATEWAY_TURN_CONTRACT_VERSION
+    } else {
+        GATEWAY_TURN_CONTRACT_VERSION
+    })
 }
 
 async fn beacon_proxy_root(
@@ -1212,7 +1253,8 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     use super::{
-        beacon_proxy_target_path, harbor_assistant_proxy_target_path, require_service_auth,
+        beacon_proxy_target_path, gateway_turn_response_headers,
+        harbor_assistant_proxy_target_path, require_gateway_turn_contract, require_service_auth,
         require_service_contract, requires_harboros_principal, validate_required_service_auth,
     };
     use crate::config::AppConfig;
@@ -1262,6 +1304,14 @@ mod tests {
         assert_eq!(
             beacon_proxy_target_path("automation/reviews/review-1/enable", None),
             "/api/automation/reviews/review-1/enable"
+        );
+        assert_eq!(
+            beacon_proxy_target_path("dlna/status", None),
+            "/api/dlna/status"
+        );
+        assert_eq!(
+            beacon_proxy_target_path("dlna/commands", None),
+            "/api/dlna/commands"
         );
     }
 
@@ -1418,6 +1468,62 @@ mod tests {
             assert_eq!(error.status, StatusCode::UNAUTHORIZED);
             assert_eq!(error.code, "SERVICE_AUTH_FAILED");
         }
+    }
+
+    #[test]
+    fn gateway_turn_accepts_optional_v30_header_and_legacy_v20() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Contract-Version", HeaderValue::from_static("3.0"));
+        assert_eq!(
+            require_gateway_turn_contract(&headers).expect("v3 gateway header"),
+            "3.0"
+        );
+        assert_eq!(
+            require_gateway_turn_contract(&HeaderMap::new()).expect("header remains optional"),
+            "3.0"
+        );
+        headers.insert("X-Contract-Version", HeaderValue::from_static("2.0"));
+        assert_eq!(
+            require_gateway_turn_contract(&headers).expect("legacy gateway header"),
+            "2.0"
+        );
+        assert_eq!(
+            gateway_turn_response_headers("3.0")
+                .get("X-Contract-Version")
+                .and_then(|value| value.to_str().ok()),
+            Some("3.0")
+        );
+        assert_eq!(
+            gateway_turn_response_headers("2.0")
+                .get("X-Contract-Version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2.0")
+        );
+    }
+
+    #[test]
+    fn gateway_turn_rejects_unknown_contract_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Contract-Version", HeaderValue::from_static("1.5"));
+        let error = require_gateway_turn_contract(&headers).expect_err("unknown version");
+        assert_eq!(error.code, "CONTRACT_VERSION_MISMATCH");
+    }
+
+    #[test]
+    fn gateway_turn_uses_configured_service_auth() {
+        let mut config = AppConfig::from_env();
+        config.service_token = "voice-gateway-token".to_string();
+        let mut headers = HeaderMap::new();
+
+        let error = super::require_service_auth(&config, &headers)
+            .expect_err("configured gateway turn auth must reject a missing token");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer voice-gateway-token"),
+        );
+        super::require_service_auth(&config, &headers).expect("matching token");
     }
 
     #[test]

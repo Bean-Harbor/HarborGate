@@ -118,6 +118,15 @@ HarborGate normalizes the request and forwards it to HarborBeacon's turn seam.
 
 - `conversation.channel` may be `weixin`, `feishu`, `android`, `webui`, or a
   future channel key.
+- The public gateway accepts an optional `X-Contract-Version: 3.0` header and
+  returns the negotiated version in the response header. During migration,
+  explicit `2.0` remains accepted and is echoed back; an omitted header uses
+  `3.0` for `/api/gateway/turns`. The HarborGate-to-Beacon internal turn call
+  remains v2.0 by default.
+- When `IM_AGENT_SERVICE_TOKEN` is configured, `/api/gateway/turns` requires
+  the matching bearer token before it accepts actor or structured intent
+  metadata. Deployments that leave the service token empty retain the existing
+  unauthenticated development behavior.
 - `conversation.handle` remains Beacon-owned and opaque to HarborGate.
 - `transport.route_key` remains HarborGate-owned and opaque to HarborBeacon.
 - If the client omits `transport.route_key`, HarborGate derives and stores one.
@@ -125,6 +134,10 @@ HarborGate normalizes the request and forwards it to HarborBeacon's turn seam.
   values returned by HarborBeacon.
 - HarborGate must not persist or forward raw Android push tokens as Beacon
   business metadata.
+- `transport.metadata.intent`, `transport.metadata.args`, and
+  `transport.metadata.entity_refs` may carry a domain action such as DLNA to
+  Beacon. They are normalized metadata only; HarborGate does not execute the
+  action, grant access, create a media session, or proxy media bytes.
 
 ## Interface 2: Beacon Admin/Core Proxy
 
@@ -207,6 +220,7 @@ v3.0 northbound readiness requires:
 
 - `POST /api/gateway/turns` can forward Android/Web turns into Beacon and return
   the Beacon turn response.
+- Configured service authentication rejects unauthenticated structured turns.
 - Continuation across Android/Web turns keeps the same Beacon conversation
   handle.
 - HarborGate stores continuation opaquely and does not route on business frame
