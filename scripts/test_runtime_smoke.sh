@@ -24,6 +24,7 @@ export HARBORGATE_DEVICE_SESSION_STATE_DIR=/data/harborgate/device-sessions
 export WEIXIN_STATE_DIR=/data/harborgate/weixin
 export FEISHU_MAIL_TOKEN_STATE_PATH=/data/harborgate/feishu-mail-token.json
 export HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
+: "${HARBOR_WORKSPACE_ID:?K3 smoke requires the HarborOS Home environment}"
 
 log="$(mktemp)"
 pid=""
@@ -36,6 +37,12 @@ cleanup() {
   rm -rf -- "$credentials_dir"
 }
 trap cleanup EXIT
+
+if env -u HARBOR_WORKSPACE_ID timeout 5 "$binary" >"$log" 2>&1; then
+  echo "error: Gate accepted a missing K3 Home" >&2
+  exit 1
+fi
+grep -Fq 'HARBOR_WORKSPACE_ID must contain the authoritative Home ID' "$log"
 
 "$binary" >"$log" 2>&1 &
 pid=$!

@@ -112,8 +112,11 @@ impl AppConfig {
             "gate-to-beacon-send",
             &["HARBOR_GATE_TO_BEACON_TOKEN", "HARBORBEACON_WEB_API_TOKEN"],
         );
+        let runtime_profile = env_or("HARBORGATE_RUNTIME_PROFILE", "standard");
+        let harbor_workspace_id =
+            workspace_id_for_profile(&runtime_profile, &env_trim("HARBOR_WORKSPACE_ID"));
         Self {
-            runtime_profile: env_or("HARBORGATE_RUNTIME_PROFILE", "standard"),
+            runtime_profile,
             host: env_or("IM_AGENT_HOST", "127.0.0.1"),
             port: env_or("IM_AGENT_PORT", "8787").parse().unwrap_or(8787),
             data_dir: PathBuf::from(data_dir),
@@ -135,7 +138,7 @@ impl AppConfig {
             harborbeacon_token: gate_to_beacon_token.clone(),
             harborbeacon_web_api_token: gate_to_beacon_token,
             harborbeacon_turn_endpoint: turn_endpoint,
-            harbor_workspace_id: env_or("HARBOR_WORKSPACE_ID", "home-1"),
+            harbor_workspace_id,
             cloud_relay_url: env_trim("HARBORCLOUD_RELAY_URL"),
             cloud_relay_region: env_trim("HARBORCLOUD_RELAY_REGION"),
             feishu,
@@ -198,6 +201,10 @@ impl AppConfig {
             "HARBORBEACON_TURN_ENDPOINT must be /api/web/turns"
         );
         anyhow::ensure!(
+            valid_home_id(&self.harbor_workspace_id),
+            "HARBOR_WORKSPACE_ID must contain the authoritative Home ID"
+        );
+        anyhow::ensure!(
             is_lower_hex_credential(&self.service_token),
             "IM_AGENT_SERVICE_TOKEN must be a 32-byte lowercase hex credential"
         );
@@ -223,6 +230,25 @@ fn is_lower_hex_credential(value: &str) -> bool {
             .as_bytes()
             .iter()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_home_id(value: &str) -> bool {
+    value.len() <= 128
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value.bytes().skip(1).all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'@' | b'-')
+        })
+}
+
+fn workspace_id_for_profile(runtime_profile: &str, configured: &str) -> String {
+    if configured.is_empty() && runtime_profile != "k3" {
+        "home-1".to_string()
+    } else {
+        configured.to_string()
+    }
 }
 
 impl WeixinConfig {
@@ -612,6 +638,19 @@ mod tests {
     #[test]
     fn k3_runtime_config_accepts_only_the_product_boundary() {
         assert!(valid_k3_config().validate_k3_runtime().is_ok());
+        assert_eq!(workspace_id_for_profile("k3", ""), "");
+        assert_eq!(workspace_id_for_profile("standard", ""), "home-1");
+        assert_eq!(workspace_id_for_profile("k3", "home-173"), "home-173");
+
+        let mut config = valid_k3_config();
+        config.harbor_workspace_id = "home-non-default".into();
+        assert!(config.validate_k3_runtime().is_ok());
+
+        for invalid_home in ["", " home-1", "other/home", "a".repeat(129).as_str()] {
+            let mut config = valid_k3_config();
+            config.harbor_workspace_id = invalid_home.into();
+            assert!(config.validate_k3_runtime().is_err());
+        }
 
         let mut config = valid_k3_config();
         config.host = "0.0.0.0".into();

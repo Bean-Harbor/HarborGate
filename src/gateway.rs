@@ -642,6 +642,7 @@ impl GatewayService {
                 "Use the official WhatsApp inbox for Navi conversations",
             ));
         }
+        reject_unbound_dlna_turn(&payload)?;
         let mut session_metadata = self
             .store
             .load_metadata(&inbound.platform, &inbound.chat_id)
@@ -2239,6 +2240,37 @@ fn gateway_turn_to_inbound(payload: &Value) -> Result<InboundMessage, GatewayErr
             .unwrap_or_else(crate::models::utc_now_iso),
         raw_payload: payload.clone(),
     })
+}
+
+fn reject_unbound_dlna_turn(payload: &Value) -> Result<(), GatewayError> {
+    let structured_dlna = [
+        "/intent/domain",
+        "/domain",
+        "/transport/metadata/intent/domain",
+        "/transport/metadata/domain",
+    ]
+    .into_iter()
+    .filter_map(|pointer| payload.pointer(pointer).and_then(Value::as_str))
+    .any(|domain| domain.trim().eq_ignore_ascii_case("dlna"));
+    let command_dlna = first_string(payload, &["/input/text", "/text", "/message/text"])
+        .is_some_and(|text| {
+            let text = text.trim_start().to_ascii_lowercase();
+            text.strip_prefix("/dlna").is_some_and(|suffix| {
+                suffix.is_empty()
+                    || suffix
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_whitespace() || ch == '/')
+            })
+        });
+    if structured_dlna || command_dlna {
+        return Err(GatewayError::new(
+            StatusCode::FORBIDDEN,
+            "DLNA_MEMBER_BINDING_REQUIRED",
+            "DLNA control requires a verified Home and member binding",
+        ));
+    }
+    Ok(())
 }
 
 fn first_string(payload: &Value, pointers: &[&str]) -> Option<String> {
@@ -4375,6 +4407,57 @@ mod tests {
         assert_eq!(turn_payload["conversation"]["channel"], "android");
         assert_eq!(turn_payload["conversation"]["handle"], "conv-android-1");
         assert!(turn_payload["transport"]["metadata"]["push_token"].is_null());
+    }
+
+    #[test]
+    fn gateway_turn_rejects_unbound_dlna_without_trusting_actor_home() {
+        for payload in [
+            json!({
+                "actor": {"user_id": "unverified", "workspace_id": "home-other"},
+                "intent": {"domain": "dlna", "action": "play"},
+                "input": {"text": "Play the video"}
+            }),
+            json!({
+                "transport": {"metadata": {"intent": {"domain": "DLNA"}}},
+                "input": {"text": "Play the video"}
+            }),
+            json!({"input": {"text": " /dlna\tplay"}}),
+        ] {
+            let error = reject_unbound_dlna_turn(&payload)
+                .expect_err("unbound DLNA channel turn must be denied");
+            assert_eq!(error.status, StatusCode::FORBIDDEN);
+            assert_eq!(error.code, "DLNA_MEMBER_BINDING_REQUIRED");
+        }
+
+        assert!(reject_unbound_dlna_turn(&json!({
+            "actor": {"workspace_id": "home-other"},
+            "input": {"text": "Ordinary message"}
+        }))
+        .is_ok());
+        assert!(reject_unbound_dlna_turn(&json!({"input": {"text": "/dlnatest"}})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn gateway_turn_handler_denies_dlna_before_beacon_forwarding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::from_env();
+        config.data_dir = dir.path().join("sessions");
+        config.state_dir = dir.path().to_path_buf();
+        config.harborbeacon_base_url = "http://127.0.0.1:4174".into();
+        config.harborbeacon_token = "local-test-token".into();
+        let gateway = GatewayService::from_config(&config).unwrap();
+
+        let error = gateway
+            .handle_gateway_turn(json!({
+                "actor": {"user_id": "unverified", "workspace_id": "home-other"},
+                "conversation": {"channel": "android", "thread_id": "device-1"},
+                "transport": {"metadata": {"intent": {"domain": "dlna", "action": "play"}}},
+                "input": {"text": "Play the video"}
+            }))
+            .await
+            .expect_err("unbound DLNA turn must stop before Beacon forwarding");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "DLNA_MEMBER_BINDING_REQUIRED");
     }
 
     #[test]
