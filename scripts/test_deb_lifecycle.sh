@@ -13,8 +13,12 @@ grep -Fq 'harboros-system (<< 0.2)' <<<"$depends"
   echo "error: lifecycle fixture requires a disposable container without service credentials" >&2
   exit 2
 }
+[[ ! -e /run/harboros/home.env ]] || {
+  echo "error: lifecycle fixture requires a disposable container without a Home environment" >&2
+  exit 2
+}
 fixture="$(mktemp -d)"
-trap 'rm -rf -- "$fixture"' EXIT
+trap 'rm -rf -- "$fixture"; rm -f -- /run/harboros/home.env' EXIT
 install -d "$fixture/system/DEBIAN" "$fixture/system/usr/lib/systemd/system"
 cat > "$fixture/system/DEBIAN/control" <<'EOF'
 Package: harboros-system
@@ -31,6 +35,9 @@ EOF
 dpkg-deb --build --root-owner-group "$fixture/system" "$fixture/harboros-system.deb" >/dev/null
 dpkg --unpack "$fixture/harboros-system.deb"
 dpkg --configure harboros-system
+install -d -m 0755 /run/harboros
+printf 'HARBOR_WORKSPACE_ID=home-ci\n' > /run/harboros/home.env
+chmod 0644 /run/harboros/home.env
 
 dpkg --unpack "$artifact"
 dpkg --configure harboros-im-gate
@@ -60,6 +67,9 @@ grep -Fq 'Environment=HARBORGATE_DEVICE_SESSION_STATE_DIR=/data/harborgate/devic
   /usr/lib/systemd/system/harboros-im-gate.service
 grep -Fq 'Requires=harboros-bootstrap.service' \
   /usr/lib/systemd/system/harboros-im-gate.service
+grep -Fxq 'EnvironmentFile=/run/harboros/home.env' \
+  /usr/lib/systemd/system/harboros-im-gate.service
+grep -Fxq 'HARBOR_WORKSPACE_ID=home-ci' /run/harboros/home.env
 grep -Fq 'LoadCredential=gate-to-beacon-send:/etc/harboros/service-auth/gate-to-beacon.send' \
   /usr/lib/systemd/system/harboros-im-gate.service
 ! grep -Fq '/etc/default/harboros-im-gate' \
@@ -70,7 +80,7 @@ python3 -m json.tool /usr/share/harboros/component-contracts/harboros-im-gate.js
 python3 -m json.tool /usr/share/doc/harboros-im-gate/k3-runtime-evidence-required.json >/dev/null
 python3 -m json.tool /usr/share/doc/harboros-im-gate/first-party-rights-approval.json >/dev/null
 python3 -m json.tool /usr/share/doc/harboros-im-gate/third-party-licenses.json >/dev/null
-bash ./scripts/test_runtime_smoke.sh
+HARBOR_WORKSPACE_ID=home-ci bash ./scripts/test_runtime_smoke.sh
 
 # Reinstalling the exact release exercises the package upgrade path without
 # inventing a second package version outside the frozen EVT package set.
