@@ -20,6 +20,7 @@ Environment=WEIXIN_STATE_DIR=/data/harborgate/weixin
 Environment=FEISHU_MAIL_TOKEN_STATE_PATH=/data/harborgate/feishu-mail-token.json
 Environment=HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
 Environment=HARBORGATE_DEVICE_SESSION_STATE_DIR=/data/harborgate/device-sessions
+EnvironmentFile=/run/harboros/home.env
 LoadCredential=gate-to-beacon-send:/etc/harboros/service-auth/gate-to-beacon.send
 LoadCredential=beacon-to-gate-accept-current:/etc/harboros/service-auth/beacon-to-gate.accept-current
 LoadCredential=beacon-to-gate-accept-previous:/etc/harboros/service-auth/beacon-to-gate.accept-previous

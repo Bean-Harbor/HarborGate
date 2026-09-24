@@ -236,6 +236,9 @@ HARBOR_WORKSPACE_ID=home-1
 ```
 
 Packaged services receive these values through role-scoped systemd credentials.
+On K3, HarborOS bootstrap supplies `HARBOR_WORKSPACE_ID` from the authoritative
+Home in `/run/harboros/home.env`; Gate refuses to start if it is missing. The
+`home-1` default applies only to the standard development profile.
 See `docs/HarborGate-HarborBeacon-Service-Auth-Rotation-Runbook.md` for the
 prepare, switch, finalize, and rollback order.
 
