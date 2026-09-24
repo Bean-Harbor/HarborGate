@@ -1114,6 +1114,9 @@ fn is_identity_query_key(key: &str) -> bool {
 
 fn requires_harboros_principal(method: &Method, target_path: &str) -> bool {
     let path = target_path.split('?').next().unwrap_or(target_path);
+    if is_dlna_proxy_path(path) {
+        return true;
+    }
     const DETECTION_JOBS: &str = "/api/vision/detection-jobs";
     if method == Method::POST
         && path.ends_with("/person-detection/preview")
@@ -1141,6 +1144,26 @@ fn requires_harboros_principal(method: &Method, target_path: &str) -> bool {
             }),
         _ => false,
     }
+}
+
+fn is_dlna_proxy_path(path: &str) -> bool {
+    let Ok(url) = url::Url::parse(&format!("http://harborgate.invalid{path}")) else {
+        return false;
+    };
+    let mut normalized = url.path().to_string();
+    for _ in 0..4 {
+        if normalized == "/api/dlna" || normalized.starts_with("/api/dlna/") {
+            return true;
+        }
+        let Ok(decoded) = urlencoding::decode(&normalized) else {
+            return false;
+        };
+        if decoded == normalized {
+            break;
+        }
+        normalized = decoded.into_owned();
+    }
+    false
 }
 
 fn is_detection_observation_proxy_path(path: &str) -> bool {
@@ -1500,6 +1523,29 @@ mod tests {
             harbor_assistant_proxy_target_path("knowledge/search", Some("limit=10")),
             "/api/knowledge/search?limit=10"
         );
+    }
+
+    #[test]
+    fn harboros_authentication_covers_dlna_even_after_path_normalization() {
+        for path in [
+            "/api/dlna",
+            "/api/dlna/status?refresh=1",
+            "/api/dlna/grants",
+            "/api/dlna/sessions/revoke",
+            "/api/dlna/catalog/object-1",
+            "/api/%64lna/commands",
+            "/api/%2564lna/commands",
+            "/api/./dlna/commands",
+        ] {
+            assert!(
+                requires_harboros_principal(&axum::http::Method::POST, path),
+                "{path}"
+            );
+        }
+        assert!(!requires_harboros_principal(
+            &axum::http::Method::GET,
+            "/api/dlna-other/status",
+        ));
     }
 
     #[test]
