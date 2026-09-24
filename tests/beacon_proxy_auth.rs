@@ -300,6 +300,82 @@ async fn every_proxy_alias_requires_authentication_for_conversation_json() {
 }
 
 #[tokio::test]
+async fn dlna_proxy_requires_authenticated_principal_on_every_alias() {
+    let (beacon_url, captured) = mock_beacon().await;
+    let authenticator = FakeAuthenticator::successful();
+    let (state, _temp_dir) = test_state(
+        &beacon_url,
+        "beacon-service-secret",
+        Arc::new(authenticator.clone()),
+    );
+    let app = router(state);
+
+    for prefix in [
+        "/api/beacon",
+        "/api/harbor-gate/api/beacon",
+        "/api/harbor-assistant",
+    ] {
+        for (method, suffix) in [
+            (Method::GET, "/dlna/status"),
+            (Method::GET, "/dlna/devices"),
+            (Method::GET, "/dlna/catalog"),
+            (Method::POST, "/dlna/grants"),
+            (Method::POST, "/dlna/sessions"),
+            (Method::POST, "/dlna/commands"),
+            (Method::DELETE, "/dlna/catalog/object-1"),
+        ] {
+            let path = format!("{prefix}{suffix}");
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(&path)
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer browser-controlled")
+                .header("x-harbor-principal-id", "attacker")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+    }
+    assert!(captured.lock().await.is_empty());
+    assert!(authenticator.tokens().await.is_empty());
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/beacon/dlna/commands")
+        .header("content-type", "application/json")
+        .header("x-harboros-auth-token", "one-time-secret")
+        .header("x-harbor-principal-id", "attacker")
+        .header("x-harbor-workspace-id", "evil-home")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    let upstream = &requests[0];
+    assert_eq!(upstream.path_and_query, "/api/dlna/commands");
+    assert_eq!(
+        upstream.headers.get("x-harbor-principal-id").unwrap(),
+        "harboros:uid:42"
+    );
+    assert_eq!(
+        upstream.headers.get("x-harbor-workspace-id").unwrap(),
+        "home-1"
+    );
+    assert_eq!(
+        upstream.headers.get("authorization").unwrap(),
+        "Bearer beacon-service-secret"
+    );
+    assert!(upstream.headers.get("x-harboros-auth-token").is_none());
+    assert_eq!(authenticator.tokens().await, vec!["one-time-secret"]);
+}
+
+#[tokio::test]
 async fn observation_is_open_while_detection_job_control_requires_authentication() {
     let (beacon_url, captured) = mock_beacon().await;
     let authenticator = FakeAuthenticator::successful();

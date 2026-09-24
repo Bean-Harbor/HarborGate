@@ -173,6 +173,8 @@ Examples:
   - `GET /knowledge/conversations/{conversation_id}`
   - `DELETE /knowledge/conversations/{conversation_id}`
   - `PATCH /knowledge/conversation-settings`
+  - every method under `/dlna/*`, including status, devices, catalog, grants,
+    sessions, and commands; encoded or normalized DLNA paths have the same gate
 - The rule applies identically through `/api/beacon/*`,
   `/api/harbor-gate/api/beacon/*`, and the deprecated
   `/api/harbor-assistant/*` alias.
@@ -201,6 +203,10 @@ Examples:
   `HARBORBEACON_TASK_API_TOKEN` as a proxy fallback. It MUST fail closed when
   the Web API service token is unavailable and MUST NOT forward a browser
   bearer as a fallback.
+- HarborBeacon remains responsible for DLNA Owner/Home, grant, media scope,
+  approval, and audit decisions after Gate authenticates the caller. The proxy
+  must never treat its service bearer alone as a user authorization or carry
+  DLNA media bytes.
 - Missing, expired, or invalid one-time tokens return `401`. Missing WebUI
   access or `FULL_ADMIN` returns `403`. Middleware connection, protocol, or
   timeout failures and unavailable Gate-to-Beacon service credentials return
