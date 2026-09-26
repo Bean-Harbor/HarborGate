@@ -14,7 +14,7 @@
   "schema_version": 1,
   "source": {
     "commit": "SOURCE_COMMIT_PLACEHOLDER",
-    "repo": "https://github.com/Bean-Harbor/HarborGate"
+    "repo": "https://github.com/Bean-Harbor-Engineering/HarborGate"
   },
   "third_party": {
     "decision": "separate-review-required",

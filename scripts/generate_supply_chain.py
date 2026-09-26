@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 
 PACKAGE_NAME = "harboros-im-gate"
-SOURCE_REPOSITORY = "https://github.com/Bean-Harbor/HarborGate"
+SOURCE_REPOSITORY = "https://github.com/Bean-Harbor-Engineering/HarborGate"
 COPYRIGHT_TEXT = "Copyright (c) 2026 Harborinno Ltd."
 
 

@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 
 PACKAGE_NAME = "harboros-im-gate"
-SOURCE_REPOSITORY = "https://github.com/Bean-Harbor/HarborGate"
+SOURCE_REPOSITORY = "https://github.com/Bean-Harbor-Engineering/HarborGate"
 COPYRIGHT_TEXT = "Copyright (c) 2026 Harborinno Ltd."
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")

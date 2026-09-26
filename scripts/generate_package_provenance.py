@@ -210,7 +210,7 @@ def main() -> None:
                 "resolvedDependencies": [
                     {
                         "uri": (
-                            "git+https://github.com/Bean-Harbor/HarborGate@"
+                            "git+https://github.com/Bean-Harbor-Engineering/HarborGate@"
                             f"{args.source_commit}"
                         ),
                         "digest": {"gitCommit": args.source_commit},

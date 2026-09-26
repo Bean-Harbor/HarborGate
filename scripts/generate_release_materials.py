@@ -12,7 +12,7 @@ from typing import Any
 
 
 PACKAGE_NAME = "harboros-im-gate"
-SOURCE_REPOSITORY = "https://github.com/Bean-Harbor/HarborGate"
+SOURCE_REPOSITORY = "https://github.com/Bean-Harbor-Engineering/HarborGate"
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 COPYRIGHT_TEXT = "Copyright (c) 2026 Harborinno Ltd."
 
