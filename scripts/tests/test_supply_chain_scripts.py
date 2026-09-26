@@ -20,7 +20,7 @@ PACKAGE = "harboros-im-gate"
 VERSION = "0.1.0-test"
 ARCH = "riscv64"
 COMMIT = "a" * 40
-SOURCE_REPO = "https://github.com/Bean-Harbor/HarborGate"
+SOURCE_REPO = "https://github.com/Bean-Harbor-Engineering/HarborGate"
 COPYRIGHT = "Copyright (c) 2026 Harborinno Ltd."
 DEPENDENCY_BLOCKER = "dependency 1.0.0: package-local license text is absent"
 
