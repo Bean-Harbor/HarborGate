@@ -178,6 +178,21 @@ def rights_payload(commit: str = COMMIT) -> dict:
     }
 
 
+def test_packaging_rights_template_binds_current_repository(tmp_path: Path) -> None:
+    template = json.loads(
+        (ROOT / "debian" / "first-party-rights-approval.json.in").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert template["source"]["commit"] == "SOURCE_COMMIT_PLACEHOLDER"
+    template["source"]["commit"] = COMMIT
+    approval = tmp_path / "first-party-rights-approval.json"
+    write_json(approval, template)
+
+    supply_chain = load_script("generate_supply_chain.py")
+    assert supply_chain.validate_first_party_rights(approval, COMMIT) == rights_payload()
+
+
 def third_party_payload(
     *,
     version: str = VERSION,
